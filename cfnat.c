@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.11"
+#define CFNAT_VERSION "0.0.12"
 
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
@@ -15,6 +15,7 @@
 #define _GNU_SOURCE
 #include <arpa/inet.h>
 #include <netdb.h>
+#include <net/if.h>
 #include <netinet/in.h>
 #include <sys/select.h>
 #include <sys/socket.h>
@@ -111,6 +112,7 @@ typedef struct {
     char colo[128], domain[256], log_name[16];
     char baidu_domain[MAX_DOMAIN_LEN], baidu_scan_target[MAX_ADDR_LEN];
     char direct_listen[MAX_ADDR_LEN], baidu_listen[MAX_ADDR_LEN];
+    char bind_if[MAX_NAME_LEN];
     int code, delay_ms, ipnum, ips_type, num, port, http_port, random_mode, task, health_log;
     int use_baidu_proxy, baidu_port, baidu_ipnum;
     LogLevel log_level;
@@ -141,6 +143,7 @@ typedef struct {
 } StringList;
 
 typedef struct BaiduProxyPool BaiduProxyPool;
+typedef struct CarrierRuntime CarrierRuntime;
 
 /* ── CidrList 惰性展开 ─────────────────────────────────────── */
 /* 只存 CIDR 范围，不展开具体 IP，支持前缀和 + 二分查找 */
@@ -453,6 +456,7 @@ typedef struct {
     size_t len;
     size_t current_index;
     char current_ip[MAX_IP_LEN];
+    int fast_fail_count;
     pthread_mutex_t mu;
     atomic_int cache_valid;  /* P0-1: 1=当前 IP 可直接使用，0=需要重新选择 */
 } CandidatePool;
@@ -461,28 +465,33 @@ typedef struct {
     socket_t client_fd;
     int tls_port, http_port, num, delay_ms;
     char ip[MAX_IP_LEN];
+    char client_addr[64];
     BaiduProxyPool *proxy_pool;
+    CarrierRuntime *runtime;
     int use_mixed; // 1 表示混合模式
+    unsigned long long conn_id;
 } ConnCtx;
 
 typedef struct {
     socket_t from, to;
 } PipeCtx;
 
-typedef struct {
+struct CarrierRuntime {
     socket_t listen_fd;
     CarrierListenSpec spec;
     CandidatePool candidates;
     BaiduProxyPool *proxy_pool;
     pthread_t health_tid;
     pthread_t accept_tid;
-} CarrierRuntime;
+};
 
 static Config g_cfg;
 static Location *g_locations = NULL;
 static size_t g_location_count = 0;
 static atomic_int g_running = 1;
 static atomic_int g_active_connections = 0;
+static unsigned long long g_conn_seq = 0;
+static pthread_mutex_t g_conn_seq_mu = PTHREAD_MUTEX_INITIALIZER;
 static socket_t g_listen_fd = INVALID_SOCKET;
 
 static BaiduProxyPool g_default_proxy_pool = {0};
@@ -726,10 +735,56 @@ static int sleep_interruptible_ms(int ms) {
     return atomic_load(&g_running) ? 0 : -1;
 }
 
+static int bind_socket_to_interface(socket_t fd, int family) {
+    if (!g_cfg.bind_if[0]) return 0;
+#ifdef _WIN32
+    (void)fd;
+    (void)family;
+    errno = ENOTSUP;
+    return -1;
+#elif defined(__APPLE__)
+    unsigned int ifindex = if_nametoindex(g_cfg.bind_if);
+    if (ifindex == 0) {
+        errno = ENODEV;
+        return -1;
+    }
+    int idx = (int)ifindex;
+    int level = family == AF_INET6 ? IPPROTO_IPV6 : IPPROTO_IP;
+    int opt = family == AF_INET6 ? IPV6_BOUND_IF : IP_BOUND_IF;
+    return setsockopt(fd, level, opt, &idx, sizeof(idx));
+#elif defined(__linux__)
+    (void)family;
+    return setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, g_cfg.bind_if, strlen(g_cfg.bind_if) + 1);
+#else
+    (void)fd;
+    (void)family;
+    errno = ENOTSUP;
+    return -1;
+#endif
+}
+
+static int validate_bind_interface(const Config *c) {
+    if (!c || !c->bind_if[0]) return 0;
+#ifdef _WIN32
+    fprintf(stderr, "-bind-if 当前不支持 Windows\n");
+    return -1;
+#elif defined(__APPLE__) || defined(__linux__)
+    if (if_nametoindex(c->bind_if) == 0) {
+        fprintf(stderr, "找不到网络接口: %s\n", c->bind_if);
+        return -1;
+    }
+    return 0;
+#else
+    fprintf(stderr, "-bind-if 当前平台不支持\n");
+    return -1;
+#endif
+}
+
 static void usage(const char *p) {
     printf("cfnat v%s - Cloudflare NAT 优选工具 (C 版)\n", CFNAT_VERSION);
     printf("Usage of %s:\n", p);
     printf("  -V, -version              显示版本号\n");
+    printf("  -bind-if=value            绑定出站物理网卡，例如 macOS: en0，Linux: eth0\n");
     printf("  -direct-listen=value      直连优选监听地址，例如 0.0.0.0:1234\n");
     printf("  -baidu-listen=value       百度前置优选监听地址，例如 0.0.0.0:1235\n");
     printf("  -colo=value               筛选数据中心例如 HKG,SJC,LAX\n");
@@ -793,6 +848,7 @@ static void parse_args(Config *c, int argc, char **argv) {
         } else if (i + 1 < argc && argv[i + 1][0] != '-') val = argv[++i];
         if (!strcmp(key, "direct-listen") && val) snprintf(c->direct_listen, sizeof(c->direct_listen), "%s", val);
         else if (!strcmp(key, "baidu-listen") && val) snprintf(c->baidu_listen, sizeof(c->baidu_listen), "%s", val);
+        else if (!strcmp(key, "bind-if") && val) snprintf(c->bind_if, sizeof(c->bind_if), "%s", val);
         else if (!strcmp(key, "code") && val) c->code = atoi(val);
         else if (!strcmp(key, "colo") && val) snprintf(c->colo, sizeof(c->colo), "%s", val);
         else if (!strcmp(key, "delay") && val) c->delay_ms = atoi(val);
@@ -998,6 +1054,46 @@ static void u32_to_ipv4(uint32_t v, char *out, size_t sz) {
     inet_ntop(AF_INET, &a, out, sz);
 }
 
+static uint64_t rand_u64(void) {
+    uint64_t v = 0;
+    for (int i = 0; i < 5; i++) {
+        v = (v << 15) ^ (uint64_t)(rand() & 0x7fff);
+    }
+    return v;
+}
+
+static int ipv6_cidr_sample(const char *base_s, int prefix, char *out, size_t outsz) {
+    if (!base_s || !out || outsz == 0 || prefix < 0 || prefix > 128) return -1;
+    unsigned char bytes[16];
+    if (inet_pton(AF_INET6, base_s, bytes) != 1) return -1;
+
+    for (int bit = prefix; bit < 128; bit++) {
+        bytes[bit / 8] &= (unsigned char)~(1u << (7 - (bit % 8)));
+    }
+    for (int bit = prefix; bit < 128; bit++) {
+        if (rand_u64() & 1u) bytes[bit / 8] |= (unsigned char)(1u << (7 - (bit % 8)));
+    }
+    return inet_ntop(AF_INET6, bytes, out, outsz) ? 0 : -1;
+}
+
+static int is_ip_literal(const char *s) {
+    struct in_addr a4;
+    struct in6_addr a6;
+    return inet_pton(AF_INET, s, &a4) == 1 || inet_pton(AF_INET6, s, &a6) == 1;
+}
+
+static void format_host_literal(const char *ip, char *out, size_t outsz) {
+    if (!out || outsz == 0) return;
+    if (ip && strchr(ip, ':')) snprintf(out, outsz, "[%s]", ip);
+    else snprintf(out, outsz, "%s", ip ? ip : "");
+}
+
+static void format_addr_port(const char *ip, int port, char *out, size_t outsz) {
+    if (!out || outsz == 0) return;
+    if (ip && strchr(ip, ':')) snprintf(out, outsz, "[%s]:%d", ip, port);
+    else snprintf(out, outsz, "%s:%d", ip ? ip : "", port);
+}
+
 static StringList load_ip_list(const char *filename, int random_mode) {
     StringList out = {0};
     FILE *f = fopen(filename, "r");
@@ -1006,32 +1102,44 @@ static StringList load_ip_list(const char *filename, int random_mode) {
     char line[MAX_LINE];
     long start_ms = now_ms();
     size_t cidr_count = 0;
+    int warned_ipv6_expand = 0;
     srand((unsigned)time(NULL));
     while (fgets(line, sizeof(line), f)) {
         trim_line(line);
         if (!line[0]) continue;
         char *slash = strchr(line, '/');
         if (!slash) {
-            strlist_add(&out, line);
+            if (is_ip_literal(line)) strlist_add(&out, line);
             continue;
         }
         cidr_count++;
         *slash = 0;
         int prefix = atoi(slash + 1);
+        if (strchr(line, ':')) {
+            char ip[MAX_IP_LEN];
+            if (!random_mode && !warned_ipv6_expand) {
+                warn_msg("IPv6 CIDR 不支持完整展开，已自动按每个 CIDR 随机抽样 1 个候选");
+                warned_ipv6_expand = 1;
+            }
+            if (ipv6_cidr_sample(line, prefix, ip, sizeof(ip)) == 0) {
+                strlist_add(&out, ip);
+            }
+            continue;
+        }
         uint32_t base = ipv4_to_u32(line);
         if (base == 0 || prefix < 0 || prefix > 32) continue;
         uint32_t mask = prefix == 0 ? 0 : (0xffffffffu << (32 - prefix));
         uint32_t start = base & mask;
-        uint32_t count = prefix == 32 ? 1u : (1u << (32 - prefix));
+        uint64_t count = prefix == 32 ? 1ULL : (1ULL << (32 - prefix));
         if (random_mode) {
-            uint32_t off = count > 1 ? (uint32_t)(rand() % count) : 0;
+            uint32_t off = count > 1 ? (uint32_t)(rand_u64() % count) : 0;
             char ip[MAX_IP_LEN];
             u32_to_ipv4(start + off, ip, sizeof(ip));
             strlist_add(&out, ip);
         } else {
-            for (uint32_t off = 0; off < count; off++) {
+            for (uint64_t off = 0; off < count; off++) {
                 char ip[MAX_IP_LEN];
-                u32_to_ipv4(start + off, ip, sizeof(ip));
+                u32_to_ipv4(start + (uint32_t)off, ip, sizeof(ip));
                 strlist_add(&out, ip);
             }
         }
@@ -1133,11 +1241,18 @@ static int set_nonblock(socket_t fd, int nb) {
 
 static socket_t tcp_connect(const char *ip, int port, int timeout_ms, int *latency_ms) {
     long start = now_ms();
-    socket_t fd = socket(strchr(ip, ':') ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
+    int family = strchr(ip, ':') ? AF_INET6 : AF_INET;
+    socket_t fd = socket(family, SOCK_STREAM, 0);
     if (cfnat_socket_invalid(fd)) return INVALID_SOCKET;
+    if (bind_socket_to_interface(fd, family) != 0) {
+        int err = errno;
+        close(fd);
+        errno = err;
+        return INVALID_SOCKET;
+    }
     set_nonblock(fd, 1);
     int rc;
-    if (strchr(ip, ':')) {
+    if (family == AF_INET6) {
         struct sockaddr_in6 sa6;
         memset(&sa6, 0, sizeof(sa6));
         sa6.sin6_family = AF_INET6;
@@ -1200,7 +1315,10 @@ static socket_t tcp_connect(const char *ip, int port, int timeout_ms, int *laten
         return INVALID_SOCKET;
     }
     set_nonblock(fd, 0);
-    if (latency_ms) * latency_ms = (int)(now_ms() - start);
+    if (latency_ms) {
+        int elapsed = (int)(now_ms() - start);
+        *latency_ms = elapsed > 0 ? elapsed : 1;
+    }
     return fd;
 }
 
@@ -1229,15 +1347,225 @@ static int recv_headers(socket_t fd, char *buf, size_t bufsz, int timeout_ms) {
     return (int)used;
 }
 
+static int send_all_timeout(socket_t fd, const void *buf, size_t len, int timeout_ms) {
+    const char *p = (const char *)buf;
+    size_t sent = 0;
+    long deadline = now_ms() + timeout_ms;
+    while (sent < len && now_ms() < deadline) {
+        fd_set wfds;
+        FD_ZERO(&wfds);
+        FD_SET(fd, &wfds);
+        int left = (int)(deadline - now_ms());
+        if (left <= 0) break;
+        struct timeval tv = { left / 1000, (left % 1000) * 1000 };
+#ifdef _WIN32
+        int rc = select(0, NULL, &wfds, NULL, &tv);
+#else
+        int rc = select(fd + 1, NULL, &wfds, NULL, &tv);
+#endif
+        if (rc <= 0) break;
+        ssize_t n = send(fd, p + sent, len - sent, 0);
+        if (n <= 0) break;
+        sent += (size_t)n;
+    }
+    return sent == len;
+}
+
+static size_t append_tls_ext_sni(unsigned char *buf, size_t pos, size_t cap, const char *host) {
+    size_t host_len = strlen(host);
+    size_t ext_len = 2 + 1 + 2 + host_len;
+    if (pos + 4 + ext_len > cap || host_len > 255) return 0;
+    buf[pos++] = 0x00; buf[pos++] = 0x00;
+    buf[pos++] = (unsigned char)(ext_len >> 8); buf[pos++] = (unsigned char)ext_len;
+    size_t list_len = 1 + 2 + host_len;
+    buf[pos++] = (unsigned char)(list_len >> 8); buf[pos++] = (unsigned char)list_len;
+    buf[pos++] = 0x00;
+    buf[pos++] = (unsigned char)(host_len >> 8); buf[pos++] = (unsigned char)host_len;
+    memcpy(buf + pos, host, host_len);
+    return pos + host_len;
+}
+
+static size_t build_tls_client_hello(unsigned char *buf, size_t cap, const char *sni_host) {
+    if (!buf || cap < 256 || !sni_host || !*sni_host) return 0;
+    unsigned char body[384];
+    size_t p = 0;
+    body[p++] = 0x03; body[p++] = 0x03;
+    for (int i = 0; i < 32; i++) body[p++] = (unsigned char)(0xa0 + i);
+    body[p++] = 0x00;
+    body[p++] = 0x00; body[p++] = 0x08;
+    body[p++] = 0x13; body[p++] = 0x01;
+    body[p++] = 0x13; body[p++] = 0x02;
+    body[p++] = 0x13; body[p++] = 0x03;
+    body[p++] = 0x00; body[p++] = 0x2f;
+    body[p++] = 0x01; body[p++] = 0x00;
+
+    unsigned char exts[256];
+    size_t e = 0;
+    e = append_tls_ext_sni(exts, e, sizeof(exts), sni_host);
+    if (e == 0) return 0;
+    if (e + 8 <= sizeof(exts)) {
+        exts[e++] = 0x00; exts[e++] = 0x0b;
+        exts[e++] = 0x00; exts[e++] = 0x02;
+        exts[e++] = 0x01; exts[e++] = 0x00;
+    }
+    if (p + 2 + e > sizeof(body)) return 0;
+    body[p++] = (unsigned char)(e >> 8); body[p++] = (unsigned char)e;
+    memcpy(body + p, exts, e);
+    p += e;
+
+    size_t hs_len = p;
+    size_t rec_len = 4 + hs_len;
+    if (5 + rec_len > cap || hs_len > 0xffffff) return 0;
+    size_t o = 0;
+    buf[o++] = 0x16;
+    buf[o++] = 0x03; buf[o++] = 0x01;
+    buf[o++] = (unsigned char)(rec_len >> 8); buf[o++] = (unsigned char)rec_len;
+    buf[o++] = 0x01;
+    buf[o++] = (unsigned char)(hs_len >> 16);
+    buf[o++] = (unsigned char)(hs_len >> 8);
+    buf[o++] = (unsigned char)hs_len;
+    memcpy(buf + o, body, hs_len);
+    return o + hs_len;
+}
+
+static int tls_probe_host(socket_t fd, int timeout_ms, const char *sni_host) {
+    unsigned char hello[512];
+    size_t hello_len = build_tls_client_hello(hello, sizeof(hello), sni_host && *sni_host ? sni_host : "cloudflaremirrors.com");
+    if (hello_len == 0) return 0;
+    if (!send_all_timeout(fd, hello, hello_len, timeout_ms)) return 0;
+
+    unsigned char first = 0;
+    long deadline = now_ms() + timeout_ms;
+    while (now_ms() < deadline) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        int left = (int)(deadline - now_ms());
+        if (left <= 0) break;
+        struct timeval tv = { left / 1000, (left % 1000) * 1000 };
+#ifdef _WIN32
+        int rc = select(0, &rfds, NULL, NULL, &tv);
+#else
+        int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
+#endif
+        if (rc <= 0) break;
+        ssize_t n = recv(fd, (char *)&first, 1, 0);
+        if (n <= 0) break;
+        return first == 0x16;
+    }
+    return 0;
+}
+
+static int tls_probe(socket_t fd, int timeout_ms) {
+    return tls_probe_host(fd, timeout_ms, "cloudflaremirrors.com");
+}
+
+static int recv_more_timeout(socket_t fd, unsigned char *buf, size_t *used, size_t need, size_t cap, int timeout_ms) {
+    long deadline = now_ms() + timeout_ms;
+    while (*used < need && *used < cap && now_ms() < deadline) {
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        int left = (int)(deadline - now_ms());
+        if (left <= 0) break;
+        struct timeval tv = { left / 1000, (left % 1000) * 1000 };
+#ifdef _WIN32
+        int rc = select(0, &rfds, NULL, NULL, &tv);
+#else
+        int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
+#endif
+        if (rc <= 0) break;
+        ssize_t n = recv(fd, (char *)buf + *used, cap - *used, 0);
+        if (n <= 0) break;
+        *used += (size_t)n;
+    }
+    return *used >= need;
+}
+
+static size_t read_tls_client_hello(socket_t client, unsigned char first, unsigned char *buf, size_t cap, int timeout_ms) {
+    if (!buf || cap < 5 || first != 0x16) return 0;
+    size_t used = 1;
+    buf[0] = first;
+    int wait_ms = timeout_ms > 0 && timeout_ms < 1500 ? timeout_ms : 1500;
+    if (!recv_more_timeout(client, buf, &used, 5, cap, wait_ms)) return used;
+    size_t record_len = ((size_t)buf[3] << 8) | buf[4];
+    size_t need = 5 + record_len;
+    if (need > cap) need = cap;
+    recv_more_timeout(client, buf, &used, need, cap, wait_ms);
+    return used;
+}
+
+static int parse_tls_sni(const unsigned char *buf, size_t len, char *out, size_t outsz) {
+    if (!buf || len < 9 || !out || outsz == 0) return 0;
+    out[0] = '\0';
+    if (buf[0] != 0x16 || buf[5] != 0x01) return 0;
+    size_t hs_len = ((size_t)buf[6] << 16) | ((size_t)buf[7] << 8) | buf[8];
+    size_t p = 9;
+    size_t end = p + hs_len;
+    if (end > len) end = len;
+    if (p + 34 > end) return 0;
+    p += 2 + 32;
+    if (p + 1 > end) return 0;
+    size_t sid_len = buf[p++];
+    if (p + sid_len + 2 > end) return 0;
+    p += sid_len;
+    size_t cipher_len = ((size_t)buf[p] << 8) | buf[p + 1];
+    p += 2;
+    if (p + cipher_len + 1 > end) return 0;
+    p += cipher_len;
+    size_t comp_len = buf[p++];
+    if (p + comp_len + 2 > end) return 0;
+    p += comp_len;
+    size_t ext_total = ((size_t)buf[p] << 8) | buf[p + 1];
+    p += 2;
+    size_t ext_end = p + ext_total;
+    if (ext_end > end) ext_end = end;
+    while (p + 4 <= ext_end) {
+        unsigned type = ((unsigned)buf[p] << 8) | buf[p + 1];
+        size_t elen = ((size_t)buf[p + 2] << 8) | buf[p + 3];
+        p += 4;
+        if (p + elen > ext_end) break;
+        if (type == 0x0000 && elen >= 5) {
+            size_t q = p;
+            size_t list_len = ((size_t)buf[q] << 8) | buf[q + 1];
+            q += 2;
+            size_t list_end = q + list_len;
+            if (list_end > p + elen) list_end = p + elen;
+            while (q + 3 <= list_end) {
+                unsigned name_type = buf[q++];
+                size_t name_len = ((size_t)buf[q] << 8) | buf[q + 1];
+                q += 2;
+                if (q + name_len > list_end) break;
+                if (name_type == 0 && name_len > 0) {
+                    size_t n = name_len < outsz ? name_len : outsz - 1;
+                    memcpy(out, buf + q, n);
+                    out[n] = '\0';
+                    return out[0] != '\0';
+                }
+                q += name_len;
+            }
+        }
+        p += elen;
+    }
+    return 0;
+}
+
 /* ── EventLoop 版 I/O 函数 ─────────────────────────────────── */
 /* 基于 EventLoop 的 TCP 连接，替代 tcp_connect 中的 select() */
 static socket_t tcp_connect_ev(const char *ip, int port, int timeout_ms, int *latency_ms, EventLoop *el) {
     long start = now_ms();
-    socket_t fd = socket(strchr(ip, ':') ? AF_INET6 : AF_INET, SOCK_STREAM, 0);
+    int family = strchr(ip, ':') ? AF_INET6 : AF_INET;
+    socket_t fd = socket(family, SOCK_STREAM, 0);
     if (cfnat_socket_invalid(fd)) return INVALID_SOCKET;
+    if (bind_socket_to_interface(fd, family) != 0) {
+        int err = errno;
+        close(fd);
+        errno = err;
+        return INVALID_SOCKET;
+    }
     set_nonblock(fd, 1);
     int rc;
-    if (strchr(ip, ':')) {
+    if (family == AF_INET6) {
         struct sockaddr_in6 sa6;
         memset(&sa6, 0, sizeof(sa6));
         sa6.sin6_family = AF_INET6;
@@ -1281,7 +1609,10 @@ static socket_t tcp_connect_ev(const char *ip, int port, int timeout_ms, int *la
         }
     }
     set_nonblock(fd, 0);
-    if (latency_ms) *latency_ms = (int)(now_ms() - start);
+    if (latency_ms) {
+        int elapsed = (int)(now_ms() - start);
+        *latency_ms = elapsed > 0 ? elapsed : 1;
+    }
     return fd;
 }
 
@@ -1470,7 +1801,7 @@ static socket_t tcp_connect_via_baidu(const char *node_addr, const char *target_
 static socket_t dial_target_with_proxy(const char *ip, int port, int timeout_ms, BaiduProxyPool *pool, int *latency_ms) {
     if (!pool || pool->len == 0) return tcp_connect(ip, port, timeout_ms, latency_ms);
     char target[MAX_ADDR_LEN];
-    snprintf(target, sizeof(target), "%s:%d", ip, port);
+    format_addr_port(ip, port, target, sizeof(target));
     BaiduProxyNode *node = baidu_pool_pick(pool);
     if (!node) return INVALID_SOCKET;
     atomic_fetch_add(&node->active, 1);
@@ -1641,11 +1972,13 @@ static void *scan_worker(void *arg) {
             char req[512];
             if ((attempt % 2) == 0) {
                 snprintf(req, sizeof(req),
-                         "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n",
-                         ip);
-            } else {
-                snprintf(req, sizeof(req),
                          "GET / HTTP/1.1\r\nHost: cloudflaremirrors.com\r\nUser-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n");
+            } else {
+                char host_value[MAX_IP_LEN + 2];
+                format_host_literal(ip, host_value, sizeof(host_value));
+                snprintf(req, sizeof(req),
+                         "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n",
+                         host_value);
             }
 
             send(fd, req, strlen(req), 0);
@@ -1779,6 +2112,9 @@ static int cmp_result(const void *a, const void *b) {
 static int health_check_ip(const char *ip, BaiduProxyPool *proxy_pool);
 static int carrier_health_check_ip(CarrierRuntime *rt, const char *ip);
 static int carrier_set_current_candidate(CarrierRuntime *rt, size_t idx);
+static int carrier_rescan_and_select_ip(CarrierRuntime *rt, const char *ipfile);
+static void carrier_note_connection_result(CarrierRuntime *rt, const char *ip, long lifetime_ms);
+static int carrier_choose_ip_for_sni(CarrierRuntime *rt, const char *sni_host, char *out, size_t sz);
 static int carrier_try_use_candidate_cache(CarrierRuntime *rt);
 
 #define CACHE_REFRESH_INTERVAL_SECONDS 3600L
@@ -2182,14 +2518,32 @@ static int relay_bidirectional(socket_t c, socket_t u) {
 static void *connection_thread(void *arg) {
     ConnCtx *cc = (ConnCtx *)arg;
     socket_t client = cc->client_fd;
+    socket_t upstream = INVALID_SOCKET;
+    long conn_start_ms = now_ms();
     unsigned char first = 0;
     /* P1-2: 首字节 recv 带 60 秒超时，防止空闲连接占用线程 */
     ssize_t n = recv_timeout(client, (char *) & first, 1, 60000);
     if (n <= 0) goto out;
     int is_tls = first == 0x16;
     int target_port = is_tls ? cc->tls_port : cc->http_port;
-    conn_msg("识别客户端协议: %s，转发到 IP: %s 端口: %d", is_tls ? "TLS" : "非 TLS", cc->ip, target_port);
-    socket_t upstream = INVALID_SOCKET;
+    unsigned char client_hello[4096];
+    size_t client_hello_len = 0;
+    char sni_host[MAX_DOMAIN_LEN] = {0};
+    if (is_tls) {
+        client_hello_len = read_tls_client_hello(client, first, client_hello, sizeof(client_hello), cc->delay_ms);
+        if (parse_tls_sni(client_hello, client_hello_len, sni_host, sizeof(sni_host))) {
+            char sni_ip[MAX_IP_LEN];
+            if (carrier_choose_ip_for_sni(cc->runtime, sni_host, sni_ip, sizeof(sni_ip))) {
+                snprintf(cc->ip, sizeof(cc->ip), "%s", sni_ip);
+            } else {
+                debug_msg("SNI %s 未找到可用候选 IP，继续使用当前 IP %s", sni_host, cc->ip);
+            }
+        }
+    }
+    conn_msg("#%llu %s 识别客户端协议: %s，转发到 IP: %s 端口: %d%s%s",
+             cc->conn_id, cc->client_addr[0] ? cc->client_addr : "unknown",
+             is_tls ? "TLS" : "非 TLS", cc->ip, target_port,
+             sni_host[0] ? "，SNI: " : "", sni_host[0] ? sni_host : "");
     int best = 0;
 
     if (cc->use_mixed) {
@@ -2200,7 +2554,7 @@ static void *connection_thread(void *arg) {
             if (cfnat_socket_valid(fd)) {
                 upstream = fd;
                 best = lat;
-                conn_msg("选择连接: 地址: %s:%d 延迟: %d ms (直连)", cc->ip, target_port, best);
+                conn_msg("#%llu 选择连接: 地址: %s:%d 延迟: %d ms (直连)", cc->conn_id, cc->ip, target_port, best);
                 break;
             }
         }
@@ -2211,7 +2565,7 @@ static void *connection_thread(void *arg) {
                 if (cfnat_socket_valid(fd)) {
                     upstream = fd;
                     best = lat;
-                    conn_msg("选择连接: 地址: %s:%d 延迟: %d ms (百度前置)", cc->ip, target_port, best);
+                    conn_msg("#%llu 选择连接: 地址: %s:%d 延迟: %d ms (百度前置)", cc->conn_id, cc->ip, target_port, best);
                     break;
                 }
             }
@@ -2224,7 +2578,7 @@ static void *connection_thread(void *arg) {
             if (cfnat_socket_valid(fd)) {
                 upstream = fd;
                 best = lat;
-                conn_msg("选择连接: 地址: %s:%d 延迟: %d ms", cc->ip, target_port, best);
+                conn_msg("#%llu 选择连接: 地址: %s:%d 延迟: %d ms", cc->conn_id, cc->ip, target_port, best);
                 break;
             }
         }
@@ -2234,12 +2588,24 @@ static void *connection_thread(void *arg) {
         debug_msg("未找到符合延迟要求的连接，关闭客户端连接");
         goto out;
     }
-    send(upstream, (const char *) & first, 1, 0);
+    if (is_tls && client_hello_len > 0) {
+        if (!send_all_timeout(upstream, client_hello, client_hello_len, cc->delay_ms > 0 ? cc->delay_ms : 1000)) {
+        debug_msg("#%llu 转发客户端 ClientHello 失败，关闭连接", cc->conn_id);
+        goto out;
+    }
+    } else {
+        if (!send_all_timeout(upstream, (const char *)&first, 1, cc->delay_ms > 0 ? cc->delay_ms : 1000)) {
+            debug_msg("转发客户端首字节失败，关闭连接");
+            goto out;
+        }
+    }
     relay_bidirectional(client, upstream);
-    close(upstream);
-    out : close(client);
+    out :
+    if (cfnat_socket_valid(upstream)) close(upstream);
+    close(client);
+    carrier_note_connection_result(cc->runtime, cc->ip, now_ms() - conn_start_ms);
     int active = atomic_fetch_sub(&g_active_connections, 1) - 1;
-    conn_msg("客户端连接关闭，当前活跃连接数: %d", active);
+    conn_msg("#%llu 客户端连接关闭，当前活跃连接数: %d", cc->conn_id, active);
     free(cc);
     return NULL;
 }
@@ -2252,8 +2618,8 @@ typedef enum {
 } HealthCheckLevel;
 
 static int carrier_probe_and_check(socket_t fd, int timeout_ms) {
-    // TCP 握手成功后做 HTTP 探测，确认数据通路正常
-    int ok = http_probe(fd, timeout_ms);
+    // TCP 握手成功后按实际 TLS 转发端口做 TLS 探测，避免 443 明文 HTTP 误判。
+    int ok = g_cfg.port == 443 ? tls_probe(fd, timeout_ms) : http_probe(fd, timeout_ms);
     close(fd);
     return ok;
 }
@@ -2275,7 +2641,8 @@ static int carrier_health_check_ip_level(CarrierRuntime *rt, const char *ip, Hea
                 debug_msg("%s 健康检查成功(直连): IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
                 return 1;
             }
-        } else if (rt->proxy_pool && rt->proxy_pool->len > 0) {
+        }
+        if (rt->proxy_pool && rt->proxy_pool->len > 0) {
             fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, rt->proxy_pool, &latency);
             if (cfnat_socket_valid(fd)) {
                 if (level == HC_LIGHT) {
@@ -2323,7 +2690,8 @@ static int carrier_health_check_ip(CarrierRuntime *rt, const char *ip) {
                 debug_msg("%s 健康检查成功(直连): IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
                 return 1;
             }
-        } else if (rt->proxy_pool && rt->proxy_pool->len > 0) {
+        }
+        if (rt->proxy_pool && rt->proxy_pool->len > 0) {
             fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, rt->proxy_pool, &latency);
             if (cfnat_socket_valid(fd)) {
                 if (carrier_probe_and_check(fd, g_cfg.delay_ms)) {
@@ -2350,11 +2718,69 @@ static int carrier_health_check_ip(CarrierRuntime *rt, const char *ip) {
     return 0;
 }
 
+static int carrier_tls_sni_check_ip(CarrierRuntime *rt, const char *ip, const char *sni_host) {
+    if (!rt || !ip || !*ip || !sni_host || !*sni_host) return 0;
+    int latency = 0;
+    socket_t fd = INVALID_SOCKET;
+    if (rt->spec.use_baidu_proxy == 2) {
+        fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, NULL, &latency);
+        if (cfnat_socket_valid(fd)) {
+            int ok = tls_probe_host(fd, g_cfg.delay_ms, sni_host);
+            close(fd);
+            if (ok) return 1;
+        }
+        if (rt->proxy_pool && rt->proxy_pool->len > 0) {
+            fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, rt->proxy_pool, &latency);
+            if (cfnat_socket_valid(fd)) {
+                int ok = tls_probe_host(fd, g_cfg.delay_ms, sni_host);
+                close(fd);
+                if (ok) return 1;
+            }
+        }
+        return 0;
+    }
+    fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, rt->proxy_pool, &latency);
+    if (cfnat_socket_invalid(fd)) return 0;
+    int ok = tls_probe_host(fd, g_cfg.delay_ms, sni_host);
+    close(fd);
+    return ok;
+}
+
+static int carrier_choose_ip_for_sni(CarrierRuntime *rt, const char *sni_host, char *out, size_t sz) {
+    if (!rt || !sni_host || !*sni_host || !out || sz == 0) return 0;
+    out[0] = '\0';
+    pthread_mutex_lock(&rt->candidates.mu);
+    size_t len = rt->candidates.len;
+    Result *items = rt->candidates.items;
+    char current[MAX_IP_LEN];
+    snprintf(current, sizeof(current), "%s", rt->candidates.current_ip);
+    pthread_mutex_unlock(&rt->candidates.mu);
+
+    if (current[0] && carrier_tls_sni_check_ip(rt, current, sni_host)) {
+        snprintf(out, sz, "%s", current);
+        atomic_store(&rt->candidates.cache_valid, 1);
+        return 1;
+    }
+    atomic_store(&rt->candidates.cache_valid, 0);
+    for (size_t i = 0; i < len; i++) {
+        if (current[0] && strcmp(items[i].ip, current) == 0) continue;
+        if (carrier_tls_sni_check_ip(rt, items[i].ip, sni_host)) {
+            snprintf(out, sz, "%s", items[i].ip);
+            carrier_set_current_candidate(rt, i);
+            atomic_store(&rt->candidates.cache_valid, 1);
+            log_msg("%s 为 SNI %s 切换到可用 IP: %s", carrier_display_name(rt->spec.mode), sni_host, items[i].ip);
+            return 1;
+        }
+    }
+    return 0;
+}
+
 static int carrier_set_current_candidate(CarrierRuntime *rt, size_t idx) {
     if (!rt || idx >= rt->candidates.len) return 0;
     pthread_mutex_lock(&rt->candidates.mu);
     snprintf(rt->candidates.current_ip, sizeof(rt->candidates.current_ip), "%s", rt->candidates.items[idx].ip);
     rt->candidates.current_index = idx;
+    rt->candidates.fast_fail_count = 0;
     pthread_mutex_unlock(&rt->candidates.mu);
     return 1;
 }
@@ -2393,6 +2819,32 @@ static int carrier_switch_next_ip(CarrierRuntime *rt) {
         }
     }
     return 0;
+}
+
+static void carrier_note_connection_result(CarrierRuntime *rt, const char *ip, long lifetime_ms) {
+    if (!rt || !ip || !*ip) return;
+    int should_switch = 0;
+    pthread_mutex_lock(&rt->candidates.mu);
+    if (strcmp(rt->candidates.current_ip, ip) == 0) {
+        if (lifetime_ms > 0 && lifetime_ms < 3000) {
+            rt->candidates.fast_fail_count++;
+            if (rt->candidates.fast_fail_count >= 2) {
+                atomic_store(&rt->candidates.cache_valid, 0);
+                should_switch = 1;
+                rt->candidates.fast_fail_count = 0;
+            }
+        } else {
+            rt->candidates.fast_fail_count = 0;
+        }
+    }
+    pthread_mutex_unlock(&rt->candidates.mu);
+    if (should_switch) {
+        log_msg("%s 当前 IP %s 连续快速断开，标记为不可用并切换", carrier_display_name(rt->spec.mode), ip);
+        if (!carrier_switch_next_ip(rt)) {
+            log_msg("%s 没有更多可用 IP，开始重新扫描", carrier_display_name(rt->spec.mode));
+            carrier_rescan_and_select_ip(rt, g_cfg.ips_type == 6 ? "ips-v6.txt" : "ips-v4.txt");
+        }
+    }
 }
 
 static int carrier_choose_ip_for_connection(CarrierRuntime *rt, char *out, size_t sz) {
@@ -2580,7 +3032,10 @@ static void *carrier_accept_thread(void *arg) {
             continue;
         }
         int active = atomic_fetch_add(&g_active_connections, 1) + 1;
-        conn_msg("%s 客户端连接建立，当前活跃连接数: %d", carrier_display_name(rt->spec.mode), active);
+        pthread_mutex_lock(&g_conn_seq_mu);
+        unsigned long long conn_id = ++g_conn_seq;
+        pthread_mutex_unlock(&g_conn_seq_mu);
+        conn_msg("#%llu %s 客户端连接建立，当前活跃连接数: %d", conn_id, carrier_display_name(rt->spec.mode), active);
         ConnCtx *cc = calloc(1, sizeof(ConnCtx));
         if (!cc) {
             close(cfd);
@@ -2594,7 +3049,20 @@ static void *carrier_accept_thread(void *arg) {
         cc->num = g_cfg.num;
         cc->delay_ms = g_cfg.delay_ms;
         cc->proxy_pool = rt->proxy_pool;
+        cc->runtime = rt;
         cc->use_mixed = (rt->spec.use_baidu_proxy == 2) ? 1 : 0;
+        cc->conn_id = conn_id;
+        if (ss.ss_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
+            char ipbuf[INET_ADDRSTRLEN] = {0};
+            inet_ntop(AF_INET, &sin->sin_addr, ipbuf, sizeof(ipbuf));
+            snprintf(cc->client_addr, sizeof(cc->client_addr), "%s:%d", ipbuf, ntohs(sin->sin_port));
+        } else if (ss.ss_family == AF_INET6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
+            char ipbuf[INET6_ADDRSTRLEN] = {0};
+            inet_ntop(AF_INET6, &sin6->sin6_addr, ipbuf, sizeof(ipbuf));
+            snprintf(cc->client_addr, sizeof(cc->client_addr), "[%s]:%d", ipbuf, ntohs(sin6->sin6_port));
+        }
         pthread_t tid;
         create_small_thread(&tid, connection_thread, cc);
         pthread_detach(tid);
@@ -2782,7 +3250,14 @@ int main(int argc, char **argv) {
     }
 #endif
     parse_args(&g_cfg, argc, argv);
+    if (validate_bind_interface(&g_cfg) != 0) {
+#ifdef _WIN32
+        WSACleanup();
+#endif
+        return 1;
+    }
     install_signals();
+    if (g_cfg.bind_if[0]) log_msg("出站连接绑定网络接口: %s", g_cfg.bind_if);
     const char *ipfile = g_cfg.ips_type == 6 ? "ips-v6.txt" : "ips-v4.txt";
     const char **urls = g_cfg.ips_type == 6 ? IPS_V6_URLS : IPS_V4_URLS;
     if (ensure_data_file(ipfile, urls) != 0) {
@@ -2915,12 +3390,7 @@ int main(int argc, char **argv) {
             }
 
             if (carrier_results.len == 0) {
-                warn_msg("%s 未扫描到可用候选 IP，3 秒后重试", carrier_display_name(rt->spec.mode));
-                strlist_free(&ips);
-                if (sleep_interruptible_ms(3000) != 0) break;
-                ips = load_ip_list(ipfile, g_cfg.random_mode);
-                if (ips.len == 0) { sleep_interruptible_ms(3000); i--; continue; }
-                i--;
+                warn_msg("%s 未扫描到可用候选 IP", carrier_display_name(rt->spec.mode));
                 continue;
             }
             rt->candidates.items = carrier_results.items;
@@ -2928,15 +3398,10 @@ int main(int argc, char **argv) {
             // 扫描完成后保存缓存，供下次启动加速
             save_candidate_cache(candidate_cache_file(rt->spec.mode), carrier_results.items, carrier_results.len);
             if (!carrier_select_valid_ip(rt)) {
-                warn_msg("%s 候选 IP 健康检查全部失败，3 秒后重试", carrier_display_name(rt->spec.mode));
+                warn_msg("%s 候选 IP 健康检查全部失败", carrier_display_name(rt->spec.mode));
                 free(rt->candidates.items);
                 rt->candidates.items = NULL;
                 rt->candidates.len = 0;
-                strlist_free(&ips);
-                if (sleep_interruptible_ms(3000) != 0) break;
-                ips = load_ip_list(ipfile, g_cfg.random_mode);
-                if (ips.len == 0) { sleep_interruptible_ms(3000); i--; continue; }
-                i--;
                 continue;
             }
             rt->listen_fd = listen_tcp(rt->spec.addr);
@@ -3018,7 +3483,7 @@ int main(int argc, char **argv) {
     }
     strlist_free(&ips);
     free(carrier_specs);
-    if (results.len > 0) {
+    if (!cache_hit) {
         printf("候选池统计\n");
         printf("候选总数: %zu\n", results.len);
         printf("IP 地址 | 数据中心 | 地区 | 城市 | 延迟 | 丢包 | 探测成功\n");
