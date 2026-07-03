@@ -23,71 +23,85 @@ jobs:
             packages: gcc libc6-dev
             cc: gcc
             cflags: ""
+            ldflags: ""
           - name: linux-386
             artifact: cfnat-linux-386
             packages: gcc-i686-linux-gnu libc6-dev-i386-cross
             cc: i686-linux-gnu-gcc
             cflags: ""
+            ldflags: "-latomic"
           - name: linux-armv5
             artifact: cfnat-linux-armv5
             packages: gcc-arm-linux-gnueabi libc6-dev-armel-cross
             cc: arm-linux-gnueabi-gcc
             cflags: "-march=armv5te"
+            ldflags: "-latomic"
           - name: linux-armv6
             artifact: cfnat-linux-armv6
             packages: gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
             cc: arm-linux-gnueabihf-gcc
             cflags: "-marm -march=armv6 -mfpu=vfp -mfloat-abi=hard"
+            ldflags: "-latomic"
           - name: linux-armv7
             artifact: cfnat-linux-armv7
             packages: gcc-arm-linux-gnueabihf libc6-dev-armhf-cross
             cc: arm-linux-gnueabihf-gcc
             cflags: "-marm -march=armv7-a -mfpu=vfpv3-d16 -mfloat-abi=hard"
+            ldflags: "-latomic"
           - name: linux-arm64
             artifact: cfnat-linux-arm64
             packages: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
             cc: aarch64-linux-gnu-gcc
             cflags: ""
+            ldflags: ""
           - name: linux-mips
             artifact: cfnat-linux-mips
             packages: gcc-mips-linux-gnu libc6-dev-mips-cross
             cc: mips-linux-gnu-gcc
             cflags: ""
+            ldflags: "-latomic"
           - name: linux-mipsel
             artifact: cfnat-linux-mipsel
             packages: gcc-mipsel-linux-gnu libc6-dev-mipsel-cross
             cc: mipsel-linux-gnu-gcc
             cflags: ""
+            ldflags: "-latomic"
           - name: linux-mips64
             artifact: cfnat-linux-mips64
             packages: gcc-mips64-linux-gnuabi64 libc6-dev-mips64-cross
             cc: mips64-linux-gnuabi64-gcc
             cflags: ""
+            ldflags: ""
           - name: linux-mips64el
             artifact: cfnat-linux-mips64el
             packages: gcc-mips64el-linux-gnuabi64 libc6-dev-mips64el-cross
             cc: mips64el-linux-gnuabi64-gcc
             cflags: ""
+            ldflags: ""
           - name: linux-ppc64
             artifact: cfnat-linux-ppc64
             packages: gcc-powerpc64-linux-gnu libc6-dev-ppc64-cross
             cc: powerpc64-linux-gnu-gcc
             cflags: ""
+            ldflags: ""
           - name: linux-ppc64le
             artifact: cfnat-linux-ppc64le
             packages: gcc-powerpc64le-linux-gnu libc6-dev-ppc64el-cross
             cc: powerpc64le-linux-gnu-gcc
             cflags: ""
+            ldflags: ""
           - name: linux-riscv64
             artifact: cfnat-linux-riscv64
             packages: gcc-riscv64-linux-gnu libc6-dev-riscv64-cross
             cc: riscv64-linux-gnu-gcc
             cflags: ""
+            ldflags: ""
           - name: linux-s390x
             artifact: cfnat-linux-s390x
             packages: gcc-s390x-linux-gnu libc6-dev-s390x-cross
             cc: s390x-linux-gnu-gcc
             cflags: ""
+            ldflags: ""
 
     env:
       SOURCE_FILE: cfnat.c
@@ -123,7 +137,7 @@ jobs:
           ${{ matrix.cc }} -O2 -pipe -std=c11 \
             -Wall -Wextra -Wno-unused-parameter ${{ matrix.cflags }} \
             "$SOURCE_FILE" -o "dist/${{ matrix.artifact }}" \
-            -pthread -s
+            -pthread -s ${{ matrix.ldflags }}
 
           file "dist/${{ matrix.artifact }}"
 

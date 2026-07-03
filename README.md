@@ -1,4 +1,4 @@
-# cfnat C 版 v0.0.12
+# cfnat C 版 v0.0.13
 
 面向低内存环境的 **Cloudflare IP 扫描 + 单端口 TCP 转发** 工具。
 
@@ -63,15 +63,15 @@ Cloudflare 优选 IP:443 或 :80
 ## 核心特性
 
 ### 核心路由与转发
-- **TLS SNI 感知路由**：解析客户端 ClientHello 中的 SNI 字段，自动选择对该域名响应的优选 IP，实现域名级细粒度分流。
 - **渐进式三级健康检查**（FULL → MEDIUM → LIGHT）：新节点 FULL 探测建立基线，连续成功即逐级降级，任意失败立即升级至 FULL，以最小开销保障候选池质量。
-- **TLS 感知健康检查**：443 端口使用完整 TLS 握手探测，80 端口使用 HTTP 探测，探测行为与转发路径完全一致，避免健康检查与真实流量路径偏差。
-- **连接生命周期追踪**：记录每条连接的建立、选择和断开全链路，检测 <3000ms 快速断开（Fast-Fail）并自动切换 IP，提升弱网环境下用户体验。
-- **单端口同时承接 TLS 与非 TLS / HTTP 流量**：客户端只需连接一个本地端口，程序根据首字节（0x16）自动分流到 443/80 目标端口。
+- **TLS 感知健康检查**：转发端口为 443 时自动使用 TLS ClientHello 探测（SNI: cloudflaremirrors.com），非 443 端口使用 HTTP 探测，避免健康检查与真实流量路径偏差。
+- **连接生命周期追踪**：记录每条连接的建立、选择和断开全链路，分配唯一连接 ID 与客户端地址，检测 <3000ms 快速断开（Fast-Fail）并自动切换 IP，提升弱网环境下用户体验。
+- **单端口同时承接 TLS 与非 TLS / HTTP 流量**：客户端只需连接一个本地端口，程序根据首字节（0x16自动分流到 443/80 目标端口。
 - **出站接口绑定**：支持 `-bind-if` 参数将连接绑定到指定网络接口（如 `eth0`、`en0`），满足多网卡 / 旁路网关场景。
 
 ### 智能选路与自适应
 - **EWMA 综合评分选优**：候选 IP 按 EWMA 平滑延迟（α=0.125）、丢包率、抖动和连续失败次数综合打分，始终使用当前 score 最低的最优 IP。
+- **SNI 感知 IP 选择**：读取客户端 TLS ClientHello 中的 SNI，为不同域名选择独立的最优 IP；连接失败时自动回退到该 SNI 对应的下一候选 IP。
 - **候选缓存与快速启动**：默认启用缓存，二次启动时先对缓存 IP 做快速健康检查，命中后立即监听，后台异步刷新，实现秒级恢复。
 - **代理模式**：支持直连优选（探测 Cloudflare 原生 IP）、百度前置优选（通过百度加速）以及两者同进程同时监听。
 - **自动切换与重试**：当前 IP 连续两次失败后自动切换到下一候选；候选池耗尽后自动重新扫描，启动失败则 3 秒后自动重试，永不退出。
@@ -80,6 +80,7 @@ Cloudflare 优选 IP:443 或 :80
 - **双栈支持**：支持 IPv4 / IPv6 扫描入口，支持 IPv4 / IPv6 监听地址。
 - **Cloudflare 数据中心过滤**：支持按 `HKG`、`SJC`、`LAX` 等三字码筛选特定数据中心。
 - **IPv6 CIDR 随机抽样**：IPv6 /64 及以上前缀范围使用 `ipv6_cidr_sample()` 随机采样，避免 IPv6 完整展开导致内存爆炸。
+- **DNS 解析系统与 Fake-IP 绕过**：内置 DoH（AliDNS、Cloudflare）与 UDP DNS（223.5.5.5、119.29.29.29、1.1.1.1、8.8.8.8）解析器，自动检测 198.18.0.0/15 Fake-IP 并回退到真实解析；支持 `-baidu-resolver` 自定义解析器（`auto`、`udp://IP`、`doh://IP/path?host=HOST`），内置 12 个百度代理备用 IP 兜底。
 
 ### 高性能实现细节
 - **事件驱动 I/O 多路复用**：Linux epoll / macOS kqueue / select 回退，避免 select 轮询开销，EventLoop 支持 HTTP 响应头事件驱动接收。
@@ -176,6 +177,7 @@ TLS 流量           → Cloudflare IP:443
 | ---------------- | --------------------------------------------------------------------------- | ------------------------------ |
 | `-direct-listen` | 直连优选监听地址；只填它时，只跑直连 Cloudflare 优选                        | 空                             |
 | `-baidu-listen`  | 百度前置优选监听地址；只填它时，只跑百度前置方案                            | 空                             |
+| `-baidu-resolver`| 百度域名解析器，系统 DNS 返回 Fake-IP(198.18.0.0/15) 时恢复真实节点；支持 `auto`（默认，内置 DoH+UDP 回退）、`udp://IP`（指定 UDP DNS）、`doh://IP/path?host=HOST`（指定 DoH） | `auto`                         |
 | `-bind-if`       | 出站连接绑定到指定网络接口，例如 `eth0`、`en0`                               | 空（不绑定）                   |
 | `-colo`          | Cloudflare 数据中心过滤，多个用逗号分隔，例如 `HKG,SJC,LAX`                 | 空                             |
 | `-delay`         | 有效延迟阈值，单位毫秒                                                      | `300`                          |
@@ -406,6 +408,11 @@ LIGHT（轻量级）  → TCP 端口连通性探测，仅检查端口是否可�
 - 任意一次失败立即升级为 `FULL`，确认节点是否彻底不可用。
 - 只有健康检查通过的 IP 才会成为当前转发 IP。
 
+**TLS 感知健康检查**：
+- 转发端口为 443 时，自动使用 TLS ClientHello 探测（SNI: `cloudflaremirrors.com`）
+- 非 443 端口继续使用 HTTP 探测
+- 避免健康检查与真实 TLS 流量路径偏差，提升 443 端口检查准确性
+
 ### 8. 自动切换
 
 运行期间会定时检查当前 IP。
@@ -439,21 +446,13 @@ TLS 流量           → Cloudflare IP:443
 非 TLS / HTTP 流量 → Cloudflare IP:80
 ```
 
-### 10. TLS SNI 感知路由
+**TLS ClientHello 完整转发**：
+- 识别为 TLS 流量后，程序会读取完整的 TLS ClientHello 报文
+- 从 ClientHello 中提取 SNI（Server Name Indication）
+- 将完整的 ClientHello 转发给上游，而非仅首字节
+- 确保 TLS 握手完整性，避免因截断 ClientHello 导致握手失败
 
-程序对 TLS 流量会额外解析 ClientHello 中的 SNI（Server Name Indication）字段：
-
-```text
-收到 TLS ClientHello
-→ 解析 SNI 域名（如 example.com）
-→ 查询当前候选池中对 example.com TLS 握手成功的 IP
-→ 如果命中，直接转发到该 IP
-→ 如果未命中，回退到通用最优 IP
-```
-
-这可以解决多域名场景下部分 IP 只对特定域名有效的问题。
-
-### 11. 出站接口绑定
+### 10. 出站接口绑定
 
 通过 `-bind-if` 参数可以将所有出站连接绑定到指定网络接口：
 
@@ -478,6 +477,53 @@ TLS 流量           → Cloudflare IP:443
 - 达到阈值后自动切换候选 IP
 - 连接日志输出统一格式，方便排错
 
+### 13. DNS 解析系统与 Fake-IP 绕过
+
+完整的 DNS 解析子系统，专门解决中国网络环境下百度前置域名解析到 Fake-IP (198.18.0.0/15) 的问题：
+
+**Fake-IP 检测**：
+- `is_fake_ipv4()` 函数检测 IPv4 地址是否落在 198.18.0.0/15 范围内
+- 系统 DNS 返回 Fake-IP 时自动识别并丢弃
+
+**多层回退解析链**：
+1. **系统 getaddrinfo()** - 首选标准解析
+2. **内置 DoH 解析器** - AliDNS (223.5.5.5)、Cloudflare (1.1.1.1)，通过 curl + `--resolve` 绕过系统 DNS
+3. **内置 UDP DNS** - 223.5.5.5、119.29.29.29、1.1.1.1、8.8.8.8，原始 UDP 查询
+4. **自定义解析器** - 通过 `-baidu-resolver` 指定 `udp://IP` 或 `doh://IP/path?host=HOST`
+5. **硬编码备用 IP** - 12 个中国百度代理节点 IPv4 地址，作为最后兜底
+
+**解析流程**：
+```text
+getaddrinfo() → 检测 Fake-IP → 是 → 尝试配置的解析器 → 成功返回真实 IP
+                    ↓ 否
+              直接返回真实 IP
+```
+
+这使得 cfnat 在 DNS 被污染的网络环境下仍能正常工作。
+
+### 14. TLS SNI 支持
+
+TLS 1.2/1.3 ClientHello 解析与构造系统：
+
+- **build_tls_client_hello()** - 构造自定义 SNI 的 TLS ClientHello 报文
+- **tls_probe_host()** - 向指定 IP:端口发送 TLS ClientHello 并验证响应
+- **read_tls_client_hello()** - 从客户端读取 TLS ClientHello
+- **parse_tls_sni()** - 从 ClientHello 中提取 SNI
+
+**应用场景**：
+- 健康检查端口为 443 时，使用真实的 TLS 握手而非明文 HTTP
+- 读取客户端 TLS ClientHello，提取 SNI 实现按域名选 IP
+- 连接失败时，针对该 SNI 重新选择最优 IP 进行故障回退
+- 将完整的 TLS ClientHello 转发给上游（而非仅首字节）
+
+### 15. SNI 感知的 IP 选择与故障回退
+
+- **carrier_tls_sni_check_ip()** - 用指定 SNI 测试 IP 可用性
+- **carrier_choose_ip_for_sni()** - 为指定 SNI 选择最优 IP
+- **connection_thread() 增强** - 读取客户端 SNI，上游连接失败时调用 `carrier_choose_ip_for_sni()` 回退
+
+不同 SNI 主名可路由到不同最优 IP，实现精细化流量调度。
+
 ---
 
 ## 百度前置代理与双方案监听
@@ -485,6 +531,18 @@ TLS 流量           → Cloudflare IP:443
 ### 百度前置代理
 
 启用 `-baidu-listen`（配合百度域名和端口）后，程序会通过百度前置节点建立 HTTP CONNECT 链路来扫描和转发。
+
+当使用 `-baidu-listen` 时，程序会先解析 `cloudnproxy.baidu.com`：
+
+- 如果系统 DNS 直接返回真实 IPv4，程序直接使用这些地址建立百度代理池。
+- 如果系统 DNS 返回 `198.18.0.0/15` Fake-IP（常见于 PassWall、SSR-Plus 等路由器 DNS 方案），程序会丢弃这些地址，并根据 `-baidu-resolver` 恢复真实节点。
+- 如果恢复出的真实地址仍无法建立百度 CONNECT 代理池，程序最后会回退到内置百度节点列表（12 个硬编码 IPv4 地址）。
+
+`-baidu-resolver` 支持以下格式：
+
+- `auto`（默认）：先尝试内置 DoH 解析器（AliDNS、Cloudflare），失败后回退到内置 UDP DNS（223.5.5.5 等）
+- `udp://IP`：直接向指定 DNS 服务器发送 UDP A 记录查询，例如 `udp://223.5.5.5`
+- `doh://IP/path?host=HOST`：通过 curl 发起 DoH 查询，例如 `doh://223.5.5.5/resolve?host=dns.alidns.com`
 
 简化链路：
 

@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.12"
+#define CFNAT_VERSION "0.0.13"
 
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
@@ -75,12 +75,49 @@ static int cfnat_socket_invalid(socket_t s) { return s < 0; }
 #define MAX_NAME_LEN 64
 #define MAX_DOMAIN_LEN 256
 #define MAX_RESOLVER_LEN 64
+#define MAX_RESOLVER_SPEC_LEN 256
 
 
 static const char *DEFAULT_BAIDU_DOMAIN = "cloudnproxy.baidu.com";
 static const int DEFAULT_BAIDU_PORT = 443;
 static const char *DEFAULT_BAIDU_SCAN_TARGET = "myip.ipip.net:80";
 static const int DEFAULT_BAIDU_IPNUM = 12;
+typedef struct {
+    const char *label;
+    const char *host;
+    const char *ip;
+    const char *path;
+} DohResolver;
+
+static const DohResolver BAIDU_DOH_RESOLVERS[] = {
+    { "AliDNS DoH", "dns.alidns.com", "223.5.5.5", "/resolve" },
+    { "Cloudflare DoH", "cloudflare-dns.com", "1.1.1.1", "/dns-query" },
+    { NULL, NULL, NULL, NULL }
+};
+static const char *BAIDU_DNS_RESOLVERS[] = {
+    "223.5.5.5",
+    "119.29.29.29",
+    "1.1.1.1",
+    "8.8.8.8",
+    NULL
+};
+static const char *BAIDU_PROXY_FALLBACK_IPS[] = {
+    "110.242.70.68",
+    "110.242.70.69",
+    "180.101.50.249",
+    "183.240.98.84",
+    "220.181.7.1",
+    "220.181.33.174",
+    "220.181.111.189",
+    "14.215.182.75",
+    "36.155.169.188",
+    "153.3.237.117",
+    "157.0.146.158",
+    "163.177.17.6",
+    "163.177.17.189",
+    "180.101.50.208",
+    NULL
+};
 static const char *IPS_V4_URLS[] = {
     "https://cdn.jsdelivr.net/gh/fscarmen/cfnat@main/ips-v4.txt",
     "https://raw.githubusercontent.com/fscarmen/cfnat/main/ips-v4.txt",
@@ -112,7 +149,7 @@ typedef struct {
     char colo[128], domain[256], log_name[16];
     char baidu_domain[MAX_DOMAIN_LEN], baidu_scan_target[MAX_ADDR_LEN];
     char direct_listen[MAX_ADDR_LEN], baidu_listen[MAX_ADDR_LEN];
-    char bind_if[MAX_NAME_LEN];
+    char bind_if[MAX_NAME_LEN], baidu_resolver[MAX_RESOLVER_SPEC_LEN];
     int code, delay_ms, ipnum, ips_type, num, port, http_port, random_mode, task, health_log;
     int use_baidu_proxy, baidu_port, baidu_ipnum;
     LogLevel log_level;
@@ -242,12 +279,10 @@ static int evloop_add(EventLoop *el, socket_t fd, int events) {
     if (el->epoll_fd >= 0) {
         struct kevent kev[2];
         int n = 0;
-        if (events & EV_READ) {
-            EV_SET(&kev[n++], fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, NULL);
-        }
-        if (events & EV_WRITE) {
-            EV_SET(&kev[n++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, NULL);
-        }
+        if (events & EV_READ)
+            EV_SET(&kev[n++], fd, EVFILT_READ, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, NULL);
+        if (events & EV_WRITE)
+            EV_SET(&kev[n++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, NULL);
         return kevent(el->epoll_fd, kev, n, NULL, 0, NULL);
     }
 #endif
@@ -309,13 +344,14 @@ static int evloop_wait(EventLoop *el, struct evloop_event *evs, int maxevents, i
         struct timespec ts;
         ts.tv_sec = timeout_ms / 1000;
         ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
-        int n = kevent(el->epoll_fd, NULL, 0, kevs, maxevents > 64 ? 64 : maxevents, timeout_ms >= 0 ? &ts : NULL);
+        int n = kevent(el->epoll_fd, NULL, 0, kevs, maxevents > 64 ? 64 : maxevents, &ts);
         if (n < 0) return -1;
         for (int i = 0; i < n && i < maxevents; i++) {
-            evs[i].fd = (socket_t)(intptr_t)kevs[i].ident;
+            evs[i].fd = (socket_t)kevs[i].ident;
             evs[i].events = 0;
-            if (kevs[i].filter == EVFILT_READ)  evs[i].events |= EV_READ;
+            if (kevs[i].filter == EVFILT_READ) evs[i].events |= EV_READ;
             if (kevs[i].filter == EVFILT_WRITE) evs[i].events |= EV_WRITE;
+            if (kevs[i].flags & (EV_EOF | EV_ERROR)) evs[i].events |= EV_READ;
         }
         return n;
     }
@@ -380,6 +416,7 @@ static int cidrlist_get_ip(CidrList *cl, size_t global_idx, char *out, size_t ou
 }
 
 /* 释放 CIDR 列表 */
+static void cidrlist_destroy(CidrList *cl) __attribute__((unused));
 static void cidrlist_destroy(CidrList *cl) {
     if (!cl) return;
     free(cl->entries);
@@ -388,6 +425,7 @@ static void cidrlist_destroy(CidrList *cl) {
 }
 
 /* 从文件加载 CIDR 列表（替换 load_ip_list） */
+static CidrList load_cidr_list(const char *filename, int random_mode) __attribute__((unused));
 static CidrList load_cidr_list(const char *filename, int random_mode) {
     CidrList cl = {0};
     cl.random_mode = random_mode;
@@ -490,8 +528,7 @@ static Location *g_locations = NULL;
 static size_t g_location_count = 0;
 static atomic_int g_running = 1;
 static atomic_int g_active_connections = 0;
-static unsigned long long g_conn_seq = 0;
-static pthread_mutex_t g_conn_seq_mu = PTHREAD_MUTEX_INITIALIZER;
+static atomic_ullong g_conn_seq = 0;
 static socket_t g_listen_fd = INVALID_SOCKET;
 
 static BaiduProxyPool g_default_proxy_pool = {0};
@@ -787,6 +824,9 @@ static void usage(const char *p) {
     printf("  -bind-if=value            绑定出站物理网卡，例如 macOS: en0，Linux: eth0\n");
     printf("  -direct-listen=value      直连优选监听地址，例如 0.0.0.0:1234\n");
     printf("  -baidu-listen=value       百度前置优选监听地址，例如 0.0.0.0:1235\n");
+    printf("  -baidu-resolver=value     Fake-IP 时百度域名解析器: auto | udp://IP | doh://IP/path?host=HOST\n");
+    printf("                              例如 doh://223.5.5.5/resolve?host=dns.alidns.com\n");
+    printf("                              或 doh://1.1.1.1/dns-query?host=cloudflare-dns.com\n");
     printf("  -colo=value               筛选数据中心例如 HKG,SJC,LAX\n");
     printf("  -delay=value              有效延迟毫秒 (default 300)\n");
     printf("  -ipnum=value              提取的有效IP数量 (default 20)\n");
@@ -809,6 +849,7 @@ static void cfg_defaults(Config *c) {
     strcpy(c->log_name, "info");
     strcpy(c->baidu_domain, DEFAULT_BAIDU_DOMAIN);
     strcpy(c->baidu_scan_target, DEFAULT_BAIDU_SCAN_TARGET);
+    strcpy(c->baidu_resolver, "auto");
     c->code = 200;
     c->delay_ms = 300;
     c->ipnum = 20;
@@ -848,6 +889,7 @@ static void parse_args(Config *c, int argc, char **argv) {
         } else if (i + 1 < argc && argv[i + 1][0] != '-') val = argv[++i];
         if (!strcmp(key, "direct-listen") && val) snprintf(c->direct_listen, sizeof(c->direct_listen), "%s", val);
         else if (!strcmp(key, "baidu-listen") && val) snprintf(c->baidu_listen, sizeof(c->baidu_listen), "%s", val);
+        else if (!strcmp(key, "baidu-resolver") && val) snprintf(c->baidu_resolver, sizeof(c->baidu_resolver), "%s", val);
         else if (!strcmp(key, "bind-if") && val) snprintf(c->bind_if, sizeof(c->bind_if), "%s", val);
         else if (!strcmp(key, "code") && val) c->code = atoi(val);
         else if (!strcmp(key, "colo") && val) snprintf(c->colo, sizeof(c->colo), "%s", val);
@@ -1046,6 +1088,12 @@ static uint32_t ipv4_to_u32(const char *s) {
     struct in_addr a;
     if (inet_pton(AF_INET, s, &a) != 1) return 0;
     return ntohl(a.s_addr);
+}
+
+static int is_fake_ipv4(const char *s) {
+    uint32_t ip = ipv4_to_u32(s);
+    if (ip == 0) return 0;
+    return (ip & 0xfffe0000u) == 0xc6120000u;  /* 198.18.0.0/15 */
 }
 
 static void u32_to_ipv4(uint32_t v, char *out, size_t sz) {
@@ -1538,9 +1586,19 @@ static int parse_tls_sni(const unsigned char *buf, size_t len, char *out, size_t
                 if (q + name_len > list_end) break;
                 if (name_type == 0 && name_len > 0) {
                     size_t n = name_len < outsz ? name_len : outsz - 1;
-                    memcpy(out, buf + q, n);
-                    out[n] = '\0';
-                    return out[0] != '\0';
+                    /* 过滤非法字符: 仅复制合法域名字符, 跳过噪声字节 */
+                    size_t o = 0;
+                    for (size_t i = 0; i < n && o < outsz - 1; i++) {
+                        unsigned char c = buf[q + i];
+                        if ((c >= 'a' && c <= 'z') ||
+                            (c >= 'A' && c <= 'Z') ||
+                            (c >= '0' && c <= '9') ||
+                            c == '-' || c == '.' || c == '_' || c == '*') {
+                            out[o++] = (char)c;
+                        }
+                    }
+                    out[o] = '\0';
+                    return o > 0;
                 }
                 q += name_len;
             }
@@ -1552,6 +1610,7 @@ static int parse_tls_sni(const unsigned char *buf, size_t len, char *out, size_t
 
 /* ── EventLoop 版 I/O 函数 ─────────────────────────────────── */
 /* 基于 EventLoop 的 TCP 连接，替代 tcp_connect 中的 select() */
+static socket_t tcp_connect_ev(const char *ip, int port, int timeout_ms, int *latency_ms, EventLoop *el) __attribute__((unused));
 static socket_t tcp_connect_ev(const char *ip, int port, int timeout_ms, int *latency_ms, EventLoop *el) {
     long start = now_ms();
     int family = strchr(ip, ':') ? AF_INET6 : AF_INET;
@@ -1790,7 +1849,18 @@ static socket_t tcp_connect_via_baidu(const char *node_addr, const char *target_
     }
     char hdr[4096];
     int n = recv_headers(fd, hdr, sizeof(hdr), timeout_ms);
-    if (n <= 0 || strstr(hdr, " 200 ") == NULL) {
+    if (n <= 0) {
+        debug_msg("百度 CONNECT 失败: 节点 %s 目标 %s 无响应", node_addr, target_addr);
+        close(fd);
+        return INVALID_SOCKET;
+    }
+    if (strstr(hdr, " 200 ") == NULL) {
+        char status[128];
+        size_t status_len = strcspn(hdr, "\r\n");
+        if (status_len >= sizeof(status)) status_len = sizeof(status) - 1;
+        memcpy(status, hdr, status_len);
+        status[status_len] = '\0';
+        debug_msg("百度 CONNECT 失败: 节点 %s 目标 %s 返回 %s", node_addr, target_addr, status);
         close(fd);
         return INVALID_SOCKET;
     }
@@ -1854,39 +1924,511 @@ static int parse_listen_modes(const Config *cfg, CarrierListenSpec **out_specs, 
     return 0;
 }
 
+static int dns_encode_name(const char *domain, unsigned char *buf, size_t bufsz, size_t *off) {
+    if (!domain || !buf || !off) return -1;
+    const char *p = domain;
+    while (*p) {
+        const char *dot = strchr(p, '.');
+        size_t len = dot ? (size_t)(dot - p) : strlen(p);
+        if (len == 0 || len > 63 || *off + 1 + len >= bufsz) return -1;
+        buf[(*off)++] = (unsigned char)len;
+        memcpy(buf + *off, p, len);
+        *off += len;
+        if (!dot) break;
+        p = dot + 1;
+    }
+    if (*off >= bufsz) return -1;
+    buf[(*off)++] = 0;
+    return 0;
+}
+
+static int dns_skip_name(const unsigned char *buf, size_t len, size_t *off) {
+    if (!buf || !off || *off >= len) return -1;
+    size_t p = *off;
+    while (p < len) {
+        unsigned char c = buf[p++];
+        if (c == 0) {
+            *off = p;
+            return 0;
+        }
+        if ((c & 0xc0) == 0xc0) {
+            if (p >= len) return -1;
+            p++;
+            *off = p;
+            return 0;
+        }
+        if ((c & 0xc0) != 0 || p + c > len) return -1;
+        p += c;
+    }
+    return -1;
+}
+
+static uint16_t dns_u16(const unsigned char *p) {
+    return (uint16_t)(((uint16_t)p[0] << 8) | p[1]);
+}
+
+static const char *bind_if_label(void) {
+    return g_cfg.bind_if[0] ? g_cfg.bind_if : "default";
+}
+
+static int shell_token_is_safe(const char *s, const char *extra_allowed) {
+    if (!s || !*s) return 0;
+    for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
+        if (isalnum(*p)) continue;
+        if (strchr("._-/:?&=%[]", *p)) continue;
+        if (extra_allowed && strchr(extra_allowed, *p)) continue;
+        return 0;
+    }
+    return 1;
+}
+
+static int parse_json_ipv4_values(const char *json, StringList *out, int *saw_fake_ip) {
+    if (!json || !out) return -1;
+    size_t before = out->len;
+    const char *p = json;
+    while ((p = strstr(p, "\"data\"")) != NULL) {
+        const char *colon = strchr(p, ':');
+        const char *q1 = colon ? strchr(colon, '"') : NULL;
+        if (!q1) {
+            p += 6;
+            continue;
+        }
+        q1++;
+        const char *q2 = strchr(q1, '"');
+        if (!q2) break;
+        size_t n = (size_t)(q2 - q1);
+        if (n > 0 && n < INET_ADDRSTRLEN) {
+            char value[INET_ADDRSTRLEN];
+            memcpy(value, q1, n);
+            value[n] = '\0';
+            struct in_addr a4;
+            if (inet_pton(AF_INET, value, &a4) == 1) {
+                if (is_fake_ipv4(value)) {
+                    if (saw_fake_ip) *saw_fake_ip = 1;
+                } else {
+                    append_unique_addr(out, value);
+                }
+            }
+        }
+        p = q2 + 1;
+    }
+    return out->len > before ? 0 : -1;
+}
+
+static int extract_query_param_value(const char *query, const char *key, char *out, size_t outsz) {
+    if (!query || !key || !out || outsz == 0) return -1;
+    size_t keylen = strlen(key);
+    const char *p = query;
+    while (p && *p) {
+        if (!strncmp(p, key, keylen) && p[keylen] == '=') {
+            p += keylen + 1;
+            const char *end = strchr(p, '&');
+            size_t n = end ? (size_t)(end - p) : strlen(p);
+            if (n == 0 || n >= outsz) return -1;
+            memcpy(out, p, n);
+            out[n] = '\0';
+            return 0;
+        }
+        p = strchr(p, '&');
+        if (p) p++;
+    }
+    return -1;
+}
+
+static int strip_query_param(const char *query, const char *key, char *out, size_t outsz) {
+    if (!query || !out || outsz == 0) return -1;
+    size_t keylen = strlen(key);
+    size_t used = 0;
+    const char *p = query;
+    int first = 1;
+    while (p && *p) {
+        const char *end = strchr(p, '&');
+        size_t n = end ? (size_t)(end - p) : strlen(p);
+        if (!(n > keylen + 1 && !strncmp(p, key, keylen) && p[keylen] == '=')) {
+            if (!first) {
+                if (used + 1 >= outsz) return -1;
+                out[used++] = '&';
+            }
+            if (used + n >= outsz) return -1;
+            memcpy(out + used, p, n);
+            used += n;
+            first = 0;
+        }
+        p = end ? end + 1 : NULL;
+    }
+    out[used] = '\0';
+    return 0;
+}
+
+static int parse_custom_doh_resolver(const char *spec, DohResolver *out, char *label, size_t labelsz) {
+    if (!spec || !out) return -1;
+    const char *rest = spec + 6;  /* skip doh:// */
+    const char *slash = strchr(rest, '/');
+    if (!slash) return -1;
+    size_t ip_len = (size_t)(slash - rest);
+    if (ip_len == 0 || ip_len >= MAX_RESOLVER_LEN) return -1;
+    static char ipbuf[MAX_RESOLVER_LEN];
+    static char hostbuf[MAX_DOMAIN_LEN];
+    static char pathbuf[MAX_RESOLVER_SPEC_LEN];
+    memcpy(ipbuf, rest, ip_len);
+    ipbuf[ip_len] = '\0';
+    const char *query = strchr(slash, '?');
+    if (query) {
+        size_t base_len = (size_t)(query - slash);
+        char filtered[MAX_RESOLVER_SPEC_LEN] = {0};
+        if (extract_query_param_value(query + 1, "host", hostbuf, sizeof(hostbuf)) != 0) return -1;
+        if (strip_query_param(query + 1, "host", filtered, sizeof(filtered)) != 0) return -1;
+        if (filtered[0]) snprintf(pathbuf, sizeof(pathbuf), "%.*s?%s", (int)base_len, slash, filtered);
+        else snprintf(pathbuf, sizeof(pathbuf), "%.*s", (int)base_len, slash);
+    } else {
+        return -1;
+    }
+    if (!ipbuf[0] || !hostbuf[0] || !pathbuf[0]) return -1;
+    out->label = label ? label : "custom DoH";
+    out->host = hostbuf;
+    out->ip = ipbuf;
+    out->path = pathbuf;
+    if (label && labelsz > 0) snprintf(label, labelsz, "DoH(%.50s)", hostbuf);
+    return 0;
+}
+
+static int doh_query_a_once(const DohResolver *resolver, const char *domain, int timeout_ms, StringList *out, int *saw_fake_ip) {
+    if (!resolver || !resolver->host || !resolver->ip || !resolver->path || !domain || !out) return -1;
+#ifdef _WIN32
+    (void)timeout_ms;
+    (void)saw_fake_ip;
+    return -1;
+#else
+    if ((!g_cfg.bind_if[0] || shell_token_is_safe(g_cfg.bind_if, "")) &&
+        shell_token_is_safe(domain, "") &&
+        shell_token_is_safe(resolver->host, "") &&
+        shell_token_is_safe(resolver->ip, "") &&
+        shell_token_is_safe(resolver->path, "")) {
+        int secs = timeout_ms > 0 ? (timeout_ms + 999) / 1000 : 2;
+        if (secs < 2) secs = 2;
+        if (secs > 8) secs = 8;
+        char cmd[1024];
+        if (g_cfg.bind_if[0]) {
+            snprintf(cmd, sizeof(cmd),
+                     "curl --interface %s --max-time %d -fsSL --resolve %s:443:%s -H 'accept: application/dns-json' 'https://%s%s%cname=%s&type=A' 2>/dev/null",
+                     g_cfg.bind_if, secs, resolver->host, resolver->ip, resolver->host, resolver->path,
+                     strchr(resolver->path, '?') ? '&' : '?', domain);
+        } else {
+            snprintf(cmd, sizeof(cmd),
+                     "curl --max-time %d -fsSL --resolve %s:443:%s -H 'accept: application/dns-json' 'https://%s%s%cname=%s&type=A' 2>/dev/null",
+                     secs, resolver->host, resolver->ip, resolver->host, resolver->path,
+                     strchr(resolver->path, '?') ? '&' : '?', domain);
+        }
+        FILE *fp = popen(cmd, "r");
+        if (!fp) return -1;
+        char *json = NULL;
+        size_t cap = 0, len = 0;
+        char buf[512];
+        while (fgets(buf, sizeof(buf), fp)) {
+            size_t chunk = strlen(buf);
+            if (len + chunk + 1 > cap) {
+                size_t nc = cap ? cap * 2 : 1024;
+                while (nc < len + chunk + 1) nc *= 2;
+                char *nn = realloc(json, nc);
+                if (!nn) {
+                    free(json);
+                    pclose(fp);
+                    return -1;
+                }
+                json = nn;
+                cap = nc;
+            }
+            memcpy(json + len, buf, chunk);
+            len += chunk;
+            json[len] = '\0';
+        }
+        int rc = pclose(fp);
+        if (rc != 0 || !json || len == 0) {
+            free(json);
+            return -1;
+        }
+        int ret = parse_json_ipv4_values(json, out, saw_fake_ip);
+        free(json);
+        return ret;
+    }
+    return -1;
+#endif
+}
+
+static int dns_query_a_once(const char *resolver, const char *domain, int timeout_ms, StringList *out, int *saw_fake_ip) {
+    if (!resolver || !domain || !out) return -1;
+    unsigned char query[512];
+    memset(query, 0, sizeof(query));
+    uint16_t id = (uint16_t)(rand_u64() & 0xffffu);
+    query[0] = (unsigned char)(id >> 8);
+    query[1] = (unsigned char)(id & 0xff);
+    query[2] = 0x01;  /* recursion desired */
+    query[5] = 0x01;  /* qdcount */
+    size_t qlen = 12;
+    if (dns_encode_name(domain, query, sizeof(query), &qlen) != 0 || qlen + 4 > sizeof(query)) return -1;
+    query[qlen++] = 0x00;
+    query[qlen++] = 0x01;  /* A */
+    query[qlen++] = 0x00;
+    query[qlen++] = 0x01;  /* IN */
+
+    socket_t fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (cfnat_socket_invalid(fd)) return -1;
+    if (bind_socket_to_interface(fd, AF_INET) != 0) {
+        int err = errno;
+        close(fd);
+        errno = err;
+        return -1;
+    }
+
+    struct sockaddr_in sa;
+    memset(&sa, 0, sizeof(sa));
+    sa.sin_family = AF_INET;
+    sa.sin_port = htons(53);
+    if (inet_pton(AF_INET, resolver, &sa.sin_addr) != 1) {
+        close(fd);
+        return -1;
+    }
+    if (sendto(fd, query, qlen, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        close(fd);
+        return -1;
+    }
+
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(fd, &rfds);
+    struct timeval tv = {
+        timeout_ms / 1000,
+        (timeout_ms % 1000) * 1000
+    };
+    int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
+    if (rc <= 0) {
+        close(fd);
+        return -1;
+    }
+
+    unsigned char resp[1500];
+    ssize_t n = recv(fd, resp, sizeof(resp), 0);
+    close(fd);
+    if (n < 12) return -1;
+    size_t rlen = (size_t)n;
+    if (dns_u16(resp) != id) return -1;
+    if ((resp[3] & 0x0f) != 0) return -1;
+    uint16_t qd = dns_u16(resp + 4);
+    uint16_t an = dns_u16(resp + 6);
+    size_t off = 12;
+    for (uint16_t i = 0; i < qd; i++) {
+        if (dns_skip_name(resp, rlen, &off) != 0 || off + 4 > rlen) return -1;
+        off += 4;
+    }
+    size_t before = out->len;
+    for (uint16_t i = 0; i < an; i++) {
+        if (dns_skip_name(resp, rlen, &off) != 0 || off + 10 > rlen) return -1;
+        uint16_t type = dns_u16(resp + off);
+        uint16_t klass = dns_u16(resp + off + 2);
+        uint16_t rdlen = dns_u16(resp + off + 8);
+        off += 10;
+        if (off + rdlen > rlen) return -1;
+        if (type == 1 && klass == 1 && rdlen == 4) {
+            char ip[INET_ADDRSTRLEN] = {0};
+            if (inet_ntop(AF_INET, resp + off, ip, sizeof(ip))) {
+                if (is_fake_ipv4(ip)) {
+                    if (saw_fake_ip) *saw_fake_ip = 1;
+                } else {
+                    append_unique_addr(out, ip);
+                }
+            }
+        }
+        off += rdlen;
+    }
+    return out->len > before ? 0 : -1;
+}
+
+static int resolve_host_ips_via_default_doh(const char *domain, StringList *out) {
+    if (!domain || !out) return -1;
+    int timeout_ms = g_cfg.delay_ms > 0 ? g_cfg.delay_ms : 1000;
+    if (timeout_ms < 1000) timeout_ms = 1000;
+    int saw_fake_ip = 0;
+    size_t before = out->len;
+    for (size_t i = 0; BAIDU_DOH_RESOLVERS[i].label; i++) {
+        if (doh_query_a_once(&BAIDU_DOH_RESOLVERS[i], domain, timeout_ms, out, &saw_fake_ip) == 0) {
+            log_msg("百度前置域名通过 %s 绑定 %s 解析到 %zu 个真实 IP",
+                    BAIDU_DOH_RESOLVERS[i].label, bind_if_label(), out->len - before);
+            return 0;
+        }
+    }
+    if (saw_fake_ip) {
+        warn_msg("绑定 %s 的 DoH 查询百度前置域名仍返回 Fake-IP", bind_if_label());
+    }
+    return -1;
+}
+
+static int resolve_host_ips_via_default_udp_dns(const char *domain, StringList *out) {
+    if (!domain || !out) return -1;
+    int timeout_ms = g_cfg.delay_ms > 0 ? g_cfg.delay_ms : 1000;
+    if (timeout_ms < 1000) timeout_ms = 1000;
+    int saw_fake_ip = 0;
+    size_t before = out->len;
+    for (size_t i = 0; BAIDU_DNS_RESOLVERS[i]; i++) {
+        if (dns_query_a_once(BAIDU_DNS_RESOLVERS[i], domain, timeout_ms, out, &saw_fake_ip) == 0) {
+            log_msg("百度前置域名通过 %s 绑定 %s 解析到 %zu 个真实 IP",
+                    BAIDU_DNS_RESOLVERS[i], bind_if_label(), out->len - before);
+            return 0;
+        }
+    }
+    if (saw_fake_ip) {
+        warn_msg("绑定 %s 查询百度前置域名仍返回 Fake-IP", bind_if_label());
+    }
+    return -1;
+}
+
+static int resolve_host_ips_via_configured_resolver(const char *domain, StringList *out) {
+    if (!domain || !out) return -1;
+    const char *spec = g_cfg.baidu_resolver[0] ? g_cfg.baidu_resolver : "auto";
+    if (!strcasecmp(spec, "auto")) {
+        warn_msg("百度前置域名恢复解析使用默认 auto 策略");
+        if (resolve_host_ips_via_default_doh(domain, out) == 0) return 0;
+        warn_msg("默认 DoH 查询百度前置域名失败，回退到 UDP DNS");
+        return resolve_host_ips_via_default_udp_dns(domain, out);
+    }
+    if (!strncasecmp(spec, "udp://", 6)) {
+        int timeout_ms = g_cfg.delay_ms > 0 ? g_cfg.delay_ms : 1000;
+        if (timeout_ms < 1000) timeout_ms = 1000;
+        int saw_fake_ip = 0;
+        size_t before = out->len;
+        const char *resolver = spec + 6;
+        if (dns_query_a_once(resolver, domain, timeout_ms, out, &saw_fake_ip) == 0) {
+            log_msg("百度前置域名通过配置的 UDP DNS %s 绑定 %s 解析到 %zu 个真实 IP",
+                    resolver, bind_if_label(), out->len - before);
+            return 0;
+        }
+        if (saw_fake_ip) warn_msg("配置的 UDP DNS %s 返回 Fake-IP", resolver);
+        return -1;
+    }
+    if (!strncasecmp(spec, "doh://", 6)) {
+        int timeout_ms = g_cfg.delay_ms > 0 ? g_cfg.delay_ms : 1000;
+        if (timeout_ms < 1000) timeout_ms = 1000;
+        int saw_fake_ip = 0;
+        size_t before = out->len;
+        DohResolver resolver = {0};
+        char label[64] = {0};
+        if (parse_custom_doh_resolver(spec, &resolver, label, sizeof(label)) != 0) {
+            warn_msg("非法 -baidu-resolver=%s，期望格式 doh://IP/path?host=HOST", spec);
+            return -1;
+        }
+        if (doh_query_a_once(&resolver, domain, timeout_ms, out, &saw_fake_ip) == 0) {
+            log_msg("百度前置域名通过配置的 %s 绑定 %s 解析到 %zu 个真实 IP",
+                    label[0] ? label : "DoH", bind_if_label(), out->len - before);
+            return 0;
+        }
+        if (saw_fake_ip) warn_msg("配置的 %s 返回 Fake-IP", label[0] ? label : "DoH");
+        return -1;
+    }
+    warn_msg("不支持的 -baidu-resolver=%s，支持 auto / udp://IP / doh://IP/path?host=HOST", spec);
+    return -1;
+}
+
 static int resolve_host_ips(const char *domain, StringList *out) {
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
     struct addrinfo * res = NULL;
-    if (getaddrinfo(domain, NULL, &hints, &res) != 0) return -1;
-    for (struct addrinfo * ai = res; ai; ai = ai->ai_next) {
-        char ip[INET_ADDRSTRLEN] = {0};
-        struct sockaddr_in * sin = (struct sockaddr_in *) ai->ai_addr;
-        if (inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip))) append_unique_addr(out, ip);
+    int saw_fake_ip = 0;
+    if (getaddrinfo(domain, NULL, &hints, &res) == 0) {
+        for (struct addrinfo * ai = res; ai; ai = ai->ai_next) {
+            char ip[INET_ADDRSTRLEN] = {0};
+            struct sockaddr_in * sin = (struct sockaddr_in *) ai->ai_addr;
+            if (!inet_ntop(AF_INET, &sin->sin_addr, ip, sizeof(ip))) continue;
+            if (is_fake_ipv4(ip)) {
+                saw_fake_ip = 1;
+                continue;
+            }
+            append_unique_addr(out, ip);
+        }
+        freeaddrinfo(res);
     }
-    freeaddrinfo(res);
+    if (out->len > 0) return 0;
+    if (out->len == 0) {
+        if (saw_fake_ip) {
+            warn_msg("百度前置域名解析到 Fake-IP(198.18.0.0/15)，改用 -baidu-resolver=%s 恢复真实节点",
+                    g_cfg.baidu_resolver[0] ? g_cfg.baidu_resolver : "auto");
+            if (resolve_host_ips_via_configured_resolver(domain, out) == 0) return 0;
+            warn_msg("配置的百度前置域名恢复解析失败");
+        } else {
+            warn_msg("百度前置域名解析失败，尝试 -baidu-resolver=%s",
+                    g_cfg.baidu_resolver[0] ? g_cfg.baidu_resolver : "auto");
+            if (resolve_host_ips_via_configured_resolver(domain, out) == 0) return 0;
+        }
+    }
     return out->len > 0 ? 0 : -1;
 }
 
-static int build_baidu_pool_for_carrier(BaiduProxyPool *pool, const char *name) {
-    memset(pool, 0, sizeof(*pool));
-    snprintf(pool->name, sizeof(pool->name), "%s", name ? name : "default");
-    StringList ips = {0};
-    if (resolve_host_ips(g_cfg.baidu_domain, &ips) != 0) return -1;
-    for (size_t i = 0; i < ips.len; i++) {
+static void add_baidu_fallback_ips(StringList *ips) {
+    if (!ips) return;
+    for (size_t i = 0; BAIDU_PROXY_FALLBACK_IPS[i]; i++) {
+        append_unique_addr(ips, BAIDU_PROXY_FALLBACK_IPS[i]);
+    }
+}
+
+static void build_baidu_pool_from_ips(BaiduProxyPool *pool, StringList *ips) {
+    if (!pool || !ips) return;
+    for (size_t i = 0; i < ips->len; i++) {
         char addr[MAX_ADDR_LEN];
-        snprintf(addr, sizeof(addr), "%s:%d", ips.items[i], g_cfg.baidu_port);
+        snprintf(addr, sizeof(addr), "%s:%d", ips->items[i], g_cfg.baidu_port);
         int latency = 0;
-        socket_t fd = tcp_connect_via_baidu(addr, g_cfg.baidu_scan_target, g_cfg.delay_ms > 0 ? g_cfg.delay_ms : 1000, &latency);
+        socket_t fd = tcp_connect_via_baidu(addr, g_cfg.baidu_scan_target,
+                                            g_cfg.delay_ms > 0 ? g_cfg.delay_ms : 1000, &latency);
         if (cfnat_socket_valid(fd)) {
             close(fd);
             baidu_pool_add(pool, addr);
             if ((int)pool->len >= g_cfg.baidu_ipnum) break;
         }
     }
+}
+
+static int build_baidu_pool_for_carrier(BaiduProxyPool *pool, const char *name) {
+    memset(pool, 0, sizeof(*pool));
+    snprintf(pool->name, sizeof(pool->name), "%s", name ? name : "default");
+    StringList ips = {0};
+    if (resolve_host_ips(g_cfg.baidu_domain, &ips) == 0) {
+        build_baidu_pool_from_ips(pool, &ips);
+    }
+    if (pool->len == 0) {
+        warn_msg("百度前置解析节点无法建立 CONNECT，改用内置真实节点候选");
+        add_baidu_fallback_ips(&ips);
+        build_baidu_pool_from_ips(pool, &ips);
+    }
     strlist_free(&ips);
     return pool->len > 0 ? 0 : -1;
+}
+
+static int carrier_init_baidu_pool(CarrierRuntime *rt) {
+    if (!rt || !rt->spec.use_baidu_proxy) return 0;
+    rt->proxy_pool = calloc(1, sizeof(BaiduProxyPool));
+    if (rt->proxy_pool && build_baidu_pool_for_carrier(rt->proxy_pool, rt->spec.mode) == 0) {
+        log_msg("%s 百度代理池已建立，节点数: %zu", carrier_display_name(rt->spec.mode), rt->proxy_pool->len);
+        return 1;
+    }
+    if (rt->proxy_pool) {
+        baidu_pool_free(rt->proxy_pool);
+        free(rt->proxy_pool);
+        rt->proxy_pool = NULL;
+    }
+    warn_msg("%s 百度代理池建立失败，无法启动百度前置监听", carrier_display_name(rt->spec.mode));
+    return 0;
+}
+
+static int carrier_check_baidu_ipv6_support(CarrierRuntime *rt) {
+    if (!rt || !rt->proxy_pool || rt->proxy_pool->len == 0) return 0;
+    int latency = 0;
+    socket_t fd = dial_target_with_proxy("2606:4700:4700::1111", 443,
+                                         g_cfg.delay_ms > 0 ? g_cfg.delay_ms : 1000,
+                                         rt->proxy_pool, &latency);
+    if (cfnat_socket_valid(fd)) {
+        close(fd);
+        return 1;
+    }
+    warn_msg("%s 百度前置节点无法 CONNECT IPv6 目标，-ips=6 不支持百度前置监听", carrier_display_name(rt->spec.mode));
+    return 0;
 }
 
 static void resultlist_add(ResultList *rl, const Result *r) {
@@ -2531,14 +3073,7 @@ static void *connection_thread(void *arg) {
     char sni_host[MAX_DOMAIN_LEN] = {0};
     if (is_tls) {
         client_hello_len = read_tls_client_hello(client, first, client_hello, sizeof(client_hello), cc->delay_ms);
-        if (parse_tls_sni(client_hello, client_hello_len, sni_host, sizeof(sni_host))) {
-            char sni_ip[MAX_IP_LEN];
-            if (carrier_choose_ip_for_sni(cc->runtime, sni_host, sni_ip, sizeof(sni_ip))) {
-                snprintf(cc->ip, sizeof(cc->ip), "%s", sni_ip);
-            } else {
-                debug_msg("SNI %s 未找到可用候选 IP，继续使用当前 IP %s", sni_host, cc->ip);
-            }
-        }
+        parse_tls_sni(client_hello, client_hello_len, sni_host, sizeof(sni_host));
     }
     conn_msg("#%llu %s 识别客户端协议: %s，转发到 IP: %s 端口: %d%s%s",
              cc->conn_id, cc->client_addr[0] ? cc->client_addr : "unknown",
@@ -2585,8 +3120,26 @@ static void *connection_thread(void *arg) {
     }
 
     if (cfnat_socket_invalid(upstream)) {
-        debug_msg("未找到符合延迟要求的连接，关闭客户端连接");
-        goto out;
+        // 连接失败时尝试 SNI 级别的故障转移
+        if (sni_host[0]) {
+            char sni_ip[MAX_IP_LEN];
+            if (carrier_choose_ip_for_sni(cc->runtime, sni_host, sni_ip, sizeof(sni_ip))) {
+                snprintf(cc->ip, sizeof(cc->ip), "%s", sni_ip);
+                conn_msg("#%llu SNI 故障转移：为 %s 切换到备用 IP %s", cc->conn_id, sni_host, sni_ip);
+                // 使用新 IP 重试一次
+                int lat = 0;
+                socket_t fd = dial_target_with_proxy(cc->ip, target_port, cc->delay_ms, cc->proxy_pool, &lat);
+                if (cfnat_socket_valid(fd)) {
+                    upstream = fd;
+                    best = lat;
+                    conn_msg("#%llu SNI 故障转移成功: 地址: %s:%d 延迟: %d ms", cc->conn_id, cc->ip, target_port, best);
+                }
+            }
+        }
+        if (cfnat_socket_invalid(upstream)) {
+            debug_msg("#%llu 未找到符合延迟要求的连接，关闭客户端连接", cc->conn_id);
+            goto out;
+        }
     }
     if (is_tls && client_hello_len > 0) {
         if (!send_all_timeout(upstream, client_hello, client_hello_len, cc->delay_ms > 0 ? cc->delay_ms : 1000)) {
@@ -3032,9 +3585,7 @@ static void *carrier_accept_thread(void *arg) {
             continue;
         }
         int active = atomic_fetch_add(&g_active_connections, 1) + 1;
-        pthread_mutex_lock(&g_conn_seq_mu);
-        unsigned long long conn_id = ++g_conn_seq;
-        pthread_mutex_unlock(&g_conn_seq_mu);
+        unsigned long long conn_id = atomic_fetch_add(&g_conn_seq, 1) + 1;
         conn_msg("#%llu %s 客户端连接建立，当前活跃连接数: %d", conn_id, carrier_display_name(rt->spec.mode), active);
         ConnCtx *cc = calloc(1, sizeof(ConnCtx));
         if (!cc) {
@@ -3303,6 +3854,46 @@ int main(int argc, char **argv) {
             rt->spec = carrier_specs[i];
             pthread_mutex_init(&rt->candidates.mu, NULL);
             atomic_init(&rt->candidates.cache_valid, 0);  /* P0-1: 初始时缓存无效 */
+        }
+        int baidu_pool_ok = 1;
+        for (size_t i = 0; i < carrier_spec_len; i++) {
+            CarrierRuntime *rt = &g_carrier_runtimes[i];
+            if (rt->spec.use_baidu_proxy) {
+                if (!carrier_init_baidu_pool(rt)) {
+                    baidu_pool_ok = 0;
+                    break;
+                }
+                if (g_cfg.ips_type == 6 && !carrier_check_baidu_ipv6_support(rt)) {
+                    baidu_pool_ok = 0;
+                    break;
+                }
+            }
+        }
+        if (!baidu_pool_ok) {
+            strlist_free(&ips);
+            free(carrier_specs);
+            for (size_t i = 0; i < g_carrier_runtime_count; i++) {
+                CarrierRuntime *rt = &g_carrier_runtimes[i];
+                pthread_mutex_destroy(&rt->candidates.mu);
+                if (rt->proxy_pool) {
+                    baidu_pool_free(rt->proxy_pool);
+                    free(rt->proxy_pool);
+                }
+            }
+            free(g_carrier_runtimes);
+            g_carrier_runtimes = NULL;
+            g_carrier_runtime_count = 0;
+            baidu_pool_free(&g_default_proxy_pool);
+            free(g_locations);
+            g_locations = NULL;
+            g_location_count = 0;
+#ifdef _WIN32
+            WSACleanup();
+#endif
+            return 1;
+        }
+        for (size_t i = 0; i < carrier_spec_len; i++) {
+            CarrierRuntime *rt = &g_carrier_runtimes[i];
 
             ResultList carrier_results = {0};
             // 先尝试读取候选缓存
@@ -3323,18 +3914,6 @@ int main(int argc, char **argv) {
             }
             if (rt->spec.use_baidu_proxy == 2) {
                 // 混合模式：同时用直连和百度扫描，合并结果
-                rt->proxy_pool = calloc(1, sizeof(BaiduProxyPool));
-                if (rt->proxy_pool && build_baidu_pool_for_carrier(rt->proxy_pool, rt->spec.mode) == 0) {
-                    log_msg("%s 百度代理池已建立，节点数: %zu", carrier_display_name(rt->spec.mode), rt->proxy_pool->len);
-                } else {
-                    if (rt->proxy_pool) {
-                        baidu_pool_free(rt->proxy_pool);
-                        free(rt->proxy_pool);
-                    }
-                    rt->proxy_pool = NULL;
-                    warn_msg("%s 百度代理池建立失败，只使用直连扫描", carrier_display_name(rt->spec.mode));
-                }
-
                 // 先直连扫描
                 ResultList results_direct = scan_ips(&ips, NULL, &g_cfg, NULL);
                 // 再百度前置扫描（如果有百度代理池的话）
@@ -3372,20 +3951,6 @@ int main(int argc, char **argv) {
                 }
             } else {
                 // 普通模式
-                if (rt->spec.use_baidu_proxy) {
-                    rt->proxy_pool = calloc(1, sizeof(BaiduProxyPool));
-                    if (rt->proxy_pool && build_baidu_pool_for_carrier(rt->proxy_pool, rt->spec.mode) == 0) {
-                        log_msg("%s 百度代理池已建立，节点数: %zu", carrier_display_name(rt->spec.mode), rt->proxy_pool->len);
-                    } else {
-                        if (rt->proxy_pool) {
-                            baidu_pool_free(rt->proxy_pool);
-                            free(rt->proxy_pool);
-                        }
-                        rt->proxy_pool = NULL;
-                        warn_msg("%s 百度代理池建立失败，跳过此监听", carrier_display_name(rt->spec.mode));
-                        continue;
-                    }
-                }
                 carrier_results = scan_ips(&ips, NULL, &g_cfg, rt->proxy_pool);
             }
 
