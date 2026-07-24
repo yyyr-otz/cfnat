@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.13"
+#define CFNAT_VERSION "0.0.14"
 
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
@@ -3787,6 +3787,7 @@ static void install_signals(void) {
     sigaction(SIGINT, &sa, NULL);
     sigaction(SIGTERM, &sa, NULL);
     signal(SIGPIPE, SIG_IGN);
+    signal(SIGHUP, SIG_IGN);
 #endif
 }
 
