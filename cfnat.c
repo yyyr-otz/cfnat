@@ -865,7 +865,7 @@ static void usage(const char *p) {
     printf("  -port=value               TLS 转发目标端口 (default 443)\n");
     printf("  -http-port=value          非TLS/HTTP 转发目标端口 (default 80)\n");
     printf("  -random=value             是否随机生成IP (default true)\n");
-    printf("  -task=value               扫描线程数 (default 100)\n");
+    printf("  -task=value               扫描线程数 (default 200)\n");
 }
 
 static int parse_bool(const char *v) {
@@ -887,7 +887,7 @@ static void cfg_defaults(Config *c) {
     c->port = 443;
     c->http_port = 80;
     c->random_mode = 1;
-    c->task = 100;
+    c->task = 200;
     c->health_log = 60;
     c->use_baidu_proxy = 0;
     c->baidu_port = DEFAULT_BAIDU_PORT;
