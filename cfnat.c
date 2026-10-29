@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.14"
+#define CFNAT_VERSION "0.0.1"
 
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
@@ -229,12 +229,16 @@ struct evloop_event {
 
 typedef struct {
     int epoll_fd;   /* Linux: epoll fd; macOS: kqueue fd; <0 = select fallback */
+    socket_t watched_fd;
+    int watched_events;
 } EventLoop;
 
 /* 创建事件循环实例 */
 static EventLoop evloop_create(void) {
     EventLoop el;
     el.epoll_fd = -1;
+    el.watched_fd = INVALID_SOCKET;
+    el.watched_events = 0;
 #if defined(__linux__)
     el.epoll_fd = epoll_create1(0);
     if (el.epoll_fd < 0) {
@@ -260,11 +264,15 @@ static void evloop_destroy(EventLoop *el) {
 #else
     (void)el;
 #endif
+    el->watched_fd = INVALID_SOCKET;
+    el->watched_events = 0;
 }
 
 /* 注册 fd 的可读/可写事件 */
 static int evloop_add(EventLoop *el, socket_t fd, int events) {
     if (!el) return -1;
+    el->watched_fd = fd;
+    el->watched_events = events;
 #if defined(__linux__)
     if (el->epoll_fd >= 0) {
         struct epoll_event ev;
@@ -295,6 +303,10 @@ static int evloop_add(EventLoop *el, socket_t fd, int events) {
 /* 从事件循环中移除 fd */
 static int evloop_del(EventLoop *el, socket_t fd) {
     if (!el) return -1;
+    if (el->watched_fd == fd) {
+        el->watched_fd = INVALID_SOCKET;
+        el->watched_events = 0;
+    }
 #if defined(__linux__)
     if (el->epoll_fd >= 0) {
         struct epoll_event ev;
@@ -314,12 +326,28 @@ static int evloop_del(EventLoop *el, socket_t fd) {
     return 0;
 }
 
-/* select() 回退实现 */
-static int evloop_wait_select(struct evloop_event *evs, int maxevents, int timeout_ms) {
-    (void)evs;
-    (void)maxevents;
-    (void)timeout_ms;
-    return -1;
+/* select() 回退实现，支持 Windows/非 epoll 平台事件等待 */
+static int evloop_wait_select(EventLoop *el, struct evloop_event *evs, int maxevents, int timeout_ms) {
+    if (!el || !evs || maxevents <= 0 || cfnat_socket_invalid(el->watched_fd)) return -1;
+    fd_set rfds, wfds;
+    FD_ZERO(&rfds);
+    FD_ZERO(&wfds);
+    if (el->watched_events & EV_READ)  FD_SET(el->watched_fd, &rfds);
+    if (el->watched_events & EV_WRITE) FD_SET(el->watched_fd, &wfds);
+    struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
+#ifdef _WIN32
+    int rc = select(0, (el->watched_events & EV_READ) ? &rfds : NULL,
+                       (el->watched_events & EV_WRITE) ? &wfds : NULL, NULL, &tv);
+#else
+    int rc = select(el->watched_fd + 1, (el->watched_events & EV_READ) ? &rfds : NULL,
+                                         (el->watched_events & EV_WRITE) ? &wfds : NULL, NULL, &tv);
+#endif
+    if (rc <= 0) return rc;
+    evs[0].fd = el->watched_fd;
+    evs[0].events = 0;
+    if ((el->watched_events & EV_READ) && FD_ISSET(el->watched_fd, &rfds)) evs[0].events |= EV_READ;
+    if ((el->watched_events & EV_WRITE) && FD_ISSET(el->watched_fd, &wfds)) evs[0].events |= EV_WRITE;
+    return 1;
 }
 
 /* 等待事件，返回就绪 fd 数量和具体事件 */
@@ -356,8 +384,8 @@ static int evloop_wait(EventLoop *el, struct evloop_event *evs, int maxevents, i
         return n;
     }
 #endif
-    /* select fallback: 返回 -1 让调用方使用自己的 select 逻辑 */
-    return evloop_wait_select(evs, maxevents, timeout_ms);
+    /* select fallback */
+    return evloop_wait_select(el, evs, maxevents, timeout_ms);
 }
 
 /* ── EventLoop 抽象层结束 ──────────────────────────────────── */
@@ -1287,6 +1315,15 @@ static int set_nonblock(socket_t fd, int nb) {
 #endif
 }
 
+static void set_tcp_nodelay(socket_t fd) {
+    int one = 1;
+#ifdef _WIN32
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
+#else
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+#endif
+}
+
 static socket_t tcp_connect(const char *ip, int port, int timeout_ms, int *latency_ms) {
     long start = now_ms();
     int family = strchr(ip, ':') ? AF_INET6 : AF_INET;
@@ -1363,6 +1400,7 @@ static socket_t tcp_connect(const char *ip, int port, int timeout_ms, int *laten
         return INVALID_SOCKET;
     }
     set_nonblock(fd, 0);
+    set_tcp_nodelay(fd);
     if (latency_ms) {
         int elapsed = (int)(now_ms() - start);
         *latency_ms = elapsed > 0 ? elapsed : 1;
@@ -1668,6 +1706,7 @@ static socket_t tcp_connect_ev(const char *ip, int port, int timeout_ms, int *la
         }
     }
     set_nonblock(fd, 0);
+    set_tcp_nodelay(fd);
     if (latency_ms) {
         int elapsed = (int)(now_ms() - start);
         *latency_ms = elapsed > 0 ? elapsed : 1;
@@ -2972,38 +3011,43 @@ static ssize_t recv_timeout(socket_t fd, void *buf, size_t len, int timeout_ms) 
 
 #ifdef __linux__
 /* P1-4: Linux 零拷贝转发，使用 splice() 避免用户态内存拷贝 */
+static void *pipe_worker_fallback(PipeCtx *pc) {
+    char buf[COPY_BUF_SIZE];
+    while (1) {
+        ssize_t n = recv_timeout(pc->from, buf, sizeof(buf), 300000);
+        if (n <= 0) break;
+        char *p = buf;
+        ssize_t left = n;
+        while (left > 0) {
+            ssize_t w = send(pc->to, p, (size_t)left, 0);
+            if (w <= 0) goto done;
+            p += w;
+            left -= w;
+        }
+    }
+    done : close_pair(pc->from, pc->to);
+    return NULL;
+}
+
 static void *pipe_worker(void *arg) {
     PipeCtx *pc = (PipeCtx *)arg;
     int pipefd[2];
     if (pipe(pipefd) != 0) {
-        /* pipe 创建失败，回退到普通 recv/send */
-        char buf[COPY_BUF_SIZE];
-        while (1) {
-            ssize_t n = recv_timeout(pc->from, buf, sizeof(buf), 300000);
-            if (n <= 0) break;
-            char *p = buf;
-            ssize_t left = n;
-            while (left > 0) {
-                ssize_t w = send(pc->to, p, (size_t)left, 0);
-                if (w <= 0) goto done;
-                p += w;
-                left -= w;
-            }
-        }
-        goto done;
+        return pipe_worker_fallback(pc);
     }
     while (1) {
-        ssize_t n = splice(pc->from, NULL, pipefd[1], NULL, 65536, SPLICE_F_MOVE);
+        ssize_t n = splice(pc->from, NULL, pipefd[1], NULL, 65536, SPLICE_F_MOVE | SPLICE_F_MORE);
         if (n <= 0) break;
         while (n > 0) {
-            ssize_t w = splice(pipefd[0], NULL, pc->to, NULL, (size_t)n, SPLICE_F_MOVE);
+            ssize_t w = splice(pipefd[0], NULL, pc->to, NULL, (size_t)n, SPLICE_F_MOVE | SPLICE_F_MORE);
             if (w <= 0) goto done;
             n -= w;
         }
     }
+    done :
     close(pipefd[0]);
     close(pipefd[1]);
-    done : close_pair(pc->from, pc->to);
+    close_pair(pc->from, pc->to);
     return NULL;
 }
 #else
@@ -3345,6 +3389,21 @@ static void carrier_get_current_ip(CarrierRuntime *rt, char *out, size_t sz) {
     pthread_mutex_unlock(&rt->candidates.mu);
 }
 
+static int carrier_choose_ip_fast(CarrierRuntime *rt, char *out, size_t sz) {
+    if (!rt || !out || sz == 0) return 0;
+    out[0] = '\0';
+    if (!atomic_load_explicit(&rt->candidates.cache_valid, memory_order_acquire)) return 0;
+    pthread_mutex_lock(&rt->candidates.mu);
+    if (rt->candidates.current_ip[0]) {
+        size_t n = strlen(rt->candidates.current_ip);
+        if (n >= sz) n = sz - 1;
+        memcpy(out, rt->candidates.current_ip, n);
+        out[n] = '\0';
+    }
+    pthread_mutex_unlock(&rt->candidates.mu);
+    return out[0] ? 1 : 0;
+}
+
 static int carrier_select_valid_ip(CarrierRuntime *rt) {
     if (!rt) return 0;
     for (size_t i = 0; i < rt->candidates.len; i++) {
@@ -3405,13 +3464,8 @@ static int carrier_choose_ip_for_connection(CarrierRuntime *rt, char *out, size_
     out[0] = '\0';
     if (rt->candidates.len == 0) return 0;
 
-    /* P0-1: 如果缓存有效，直接使用当前 IP，不做健康检查 */
-    if (atomic_load(&rt->candidates.cache_valid)) {
-        pthread_mutex_lock(&rt->candidates.mu);
-        snprintf(out, sz, "%s", rt->candidates.current_ip);
-        pthread_mutex_unlock(&rt->candidates.mu);
-        if (out[0]) return 1;
-    }
+    /* P0-1: 如果缓存有效，快速获取当前 IP，避免重复健康检查 */
+    if (carrier_choose_ip_fast(rt, out, sz)) return 1;
 
     /* 缓存无效或当前 IP 为空，遍历候选池做健康检查 */
     /* 加锁保护 items 数组，防止与 carrier_rescan_and_select_ip 中的 free(items) 竞态 */
@@ -3615,6 +3669,7 @@ static void *carrier_accept_thread(void *arg) {
             snprintf(cc->client_addr, sizeof(cc->client_addr), "[%s]:%d", ipbuf, ntohs(sin6->sin6_port));
         }
         pthread_t tid;
+        set_tcp_nodelay(client_fd);
         create_small_thread(&tid, connection_thread, cc);
         pthread_detach(tid);
     }
