@@ -5,6 +5,15 @@ on:
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release 标签版本（例如 v0.0.15，留空则自动从 cfnat.c 提取版本）'
+        required: false
+        default: ''
+      prerelease:
+        description: '是否标记为 Pre-release 预发布'
+        type: boolean
+        default: false
 
 permissions:
   contents: write
@@ -263,7 +272,7 @@ jobs:
       - build-linux-musl
       - build-windows
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
 
     steps:
       - name: Checkout repository
@@ -271,6 +280,27 @@ jobs:
         with:
           fetch-depth: 1
           token: ${{ github.token }}
+
+      - name: Determine tag name
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          elif [ -n "${{ inputs.tag_name }}" ]; then
+            tag="${{ inputs.tag_name }}"
+          else
+            # 从 cfnat.c 自动提取 CFNAT_VERSION
+            ver=$(grep -E '^#define[[:space:]]+CFNAT_VERSION[[:space:]]+"' cfnat.c | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+            if [ -n "$ver" ]; then
+              tag="v${ver}"
+            else
+              tag="continuous"
+            fi
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Using release tag: $tag"
 
       - name: Download artifacts
         uses: actions/download-artifact@v8
@@ -303,4 +333,8 @@ jobs:
       - name: Upload GitHub Release
         uses: softprops/action-gh-release@v3
         with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: Release ${{ steps.vars.outputs.tag }}
+          prerelease: ${{ inputs.prerelease || false }}
+          make_latest: true
           files: release/*
