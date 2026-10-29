@@ -142,24 +142,6 @@ zig cc -target x86_64-linux-musl -O2 -pipe -std=c11 \
   -pthread -static -s
 ```
 
-macOS：
-
-```bash
-clang -O2 -pipe -std=c11 -Wall -Wextra -Wno-unused-parameter \
-  ./cfnat.c -o ./cfnat-macos \
-  -pthread
-```
-
-Windows（MinGW-w64）：
-
-```bash
-x86_64-w64-mingw32-gcc \
-  -O2 -pipe -std=c11 -D_WIN32_WINNT=0x0601 \
-  -finput-charset=UTF-8 -fexec-charset=UTF-8 \
-  -Wall -Wextra -Wno-unused-parameter \
-  ./cfnat.c -o ./cfnat.exe \
-  -lws2_32 -lwininet -lwinpthread -static -s
-```
 
 ### 2. 启动
 
@@ -167,12 +149,6 @@ Linux 示例：
 
 ```bash
 ./cfnat-linux -direct-listen=0.0.0.0:40000 -colo=HKG -delay=120 -random=true
-```
-
-macOS 示例：
-
-```bash
-./cfnat-macos -direct-listen=0.0.0.0:40000 -colo=HKG -delay=120 -random=true
 ```
 
 Windows 示例：
@@ -654,31 +630,6 @@ zig cc -target x86_64-linux-musl -O2 -pipe -std=c11 \
 - 如需完全静态二进制，推荐 musl 静态版。
 - 当前源码只依赖标准 socket / 域名解析接口，不需要额外的 resolver 库。
 
-
-
-### Windows 构建
-
-64 位：
-
-```bash
-x86_64-w64-mingw32-gcc \
-  -O2 -pipe -std=c11 -D_WIN32_WINNT=0x0601 \
-  -finput-charset=UTF-8 -fexec-charset=UTF-8 \
-  -Wall -Wextra -Wno-unused-parameter \
-  ./cfnat.c -o ./cfnat-windows-amd64.exe \
-  -lws2_32 -lwininet -lwinpthread -static -s
-```
-
-32 位：
-
-```bash
-i686-w64-mingw32-gcc \
-  -O2 -pipe -std=c11 -D_WIN32_WINNT=0x0601 \
-  -finput-charset=UTF-8 -fexec-charset=UTF-8 \
-  -Wall -Wextra -Wno-unused-parameter \
-  ./cfnat.c -o ./cfnat-windows-386.exe \
-  -lws2_32 -lwininet -lwinpthread -static -s
-```
 
 说明：
 
