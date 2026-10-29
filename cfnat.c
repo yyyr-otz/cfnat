@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.1"
+#define CFNAT_VERSION "0.0.14"
 
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
@@ -17,6 +17,7 @@
 #include <netdb.h>
 #include <net/if.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/time.h>
@@ -1316,11 +1317,15 @@ static int set_nonblock(socket_t fd, int nb) {
 }
 
 static void set_tcp_nodelay(socket_t fd) {
+#if defined(TCP_NODELAY)
     int one = 1;
 #ifdef _WIN32
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, (const char *)&one, sizeof(one));
 #else
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+#endif
+#else
+    (void)fd;
 #endif
 }
 
@@ -3669,7 +3674,7 @@ static void *carrier_accept_thread(void *arg) {
             snprintf(cc->client_addr, sizeof(cc->client_addr), "[%s]:%d", ipbuf, ntohs(sin6->sin6_port));
         }
         pthread_t tid;
-        set_tcp_nodelay(client_fd);
+        set_tcp_nodelay(cfd);
         create_small_thread(&tid, connection_thread, cc);
         pthread_detach(tid);
     }
