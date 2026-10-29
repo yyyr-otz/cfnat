@@ -590,7 +590,7 @@ Cloudflare IP
 
 | 平台                    | 源文件               | 主要依赖                                                                                            |
 | ----------------------- | -------------------- | --------------------------------------------------------------------------------------------------- |
-| Linux / macOS / Windows | [`cfnat.c`](cfnat.c) | Linux/macOS: `pthread`、POSIX/BSD socket、`getaddrinfo`<br>Windows: Winsock2、WinINet、`winpthread` |
+| Linux / Windows | [`cfnat.c`](cfnat.c) | Linux/macOS: `pthread`、Windows: Winsock2、WinINet、`winpthread` |
 
 平台差异通过 `_WIN32` / `__APPLE__` 等条件编译处理，避免三份源码重复维护。
 
