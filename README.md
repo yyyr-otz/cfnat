@@ -1,8 +1,35 @@
-# cfnat C 版 v0.0.14
+# cfnat C 版 v0.0.1
 
 面向低内存环境的 **Cloudflare IP 扫描 + 单端口 TCP 转发** 工具。
 
-C 版基于 [`cfnat.go`](cfnat.go) 移植，目标不是把功能做得更复杂，而是在保留扫描、优选、转发、健康检查、百度前置代理和双方案监听等核心能力的同时，尽量降低常驻内存占用，适合 OpenWrt、路由器、小内存 VPS、ARM 小板机等资源受限环境。
+当前版本针对 **Linux 与 Windows 11 的 64 位现代平台（amd64 / arm64）** 进行了专项热路径优化、零拷贝吞吐提升与 I/O 抽象层加固。
+
+C 版基于 [`cfnat.go`](cfnat.go) 移植，目标不是把功能做得更复杂，而是在保留扫描、优选、转发、健康检查、百度前置代理和双方案监听等核心能力的同时，尽量降低常驻内存占用，适合 OpenWrt、软路由、小内存 VPS、ARM64 实例以及 Windows 11 设备。
+
+---
+
+## ⚡ 现代平台优化与支持说明
+
+### 1. 核心优化内容
+- **全链路禁用 Nagle 算法（`TCP_NODELAY`）**：在客户端建连接收以及拨号上游优选 IP / 百度前置连接时全面注入，消除 40ms 交互延迟，显著加速 TLS 握手及短报文首包响应。
+- **并发连接热路径无锁化加速（`carrier_choose_ip_fast`）**：在连接频繁进入时，基于 `atomic_load_explicit(..., memory_order_acquire)` 原语直接判定缓存有效性，并使用直接内存复制替代格式化解析，大幅消除了连接建立时对全局互斥锁的争抢。
+- **Linux 内核级零拷贝加固（`splice`）**：
+  - 开启 `SPLICE_F_MORE` 标志，提示内核聚合数据包，大幅提高吞吐量；
+  - 将 16 KB 回退缓冲区解耦到 fallback 分支，在走 splice 时杜绝无谓的栈内存分配，消除 64 KB 极小线程栈下的栈溢出隐患。
+- **Windows 平台 EventLoop I/O 事件驱动补齐**：完善非 epoll 平台下的 `evloop_wait_select` 回退实现，支持 Windows 下单套接字的非阻塞异步可写/可读事件等待，解决 HTTP 探测时的虚假超时。
+
+### 2. 目标平台与停止支持说明
+为保证现代高性能特性、减少历史包袱并精简构建工作流，当前维护重点聚焦于：
+- **官方全力支持与构建矩阵**：
+  - **Linux amd64 (x86_64)**：glibc 动态版 + musl 全静态独立版
+  - **Linux arm64 (aarch64)**：glibc 动态版 + musl 全静态独立版（OpenWrt/软路由/ARM VPS 推荐）
+  - **Windows 11 amd64 (x86_64)**：Win11 原生静态可执行文件
+  - **Windows 11 arm64 (aarch64)**：Surface / 骁龙 X Elite / ARM 笔记本原生运行
+- **不再主动维护/构建的平台**：
+  - **Windows 7 / XP / 32位系统 (x86/i686)**：已移除 MinGW 386 编译矩阵；Windows 宏默认适配现代 Windows 10/11 (`_WIN32_WINNT=0x0A00`)。
+  - **老旧 32 位嵌入式 Linux 架构**：包括 ARMv5、ARMv6、ARMv7、MIPS、MIPSEL 等架构，已从持续集成中移除。
+  - **小众服务器架构**：MIPS64、PowerPC (ppc64/ppc64le)、RISC-V 64、s390x。
+  - **macOS**：已从默认 GitHub Actions 矩阵精简（如需使用仍可本地自行源码编译）。
 
 ---
 
@@ -627,50 +654,7 @@ zig cc -target x86_64-linux-musl -O2 -pipe -std=c11 \
 - 如需完全静态二进制，推荐 musl 静态版。
 - 当前源码只依赖标准 socket / 域名解析接口，不需要额外的 resolver 库。
 
-### macOS 构建
 
-```bash
-clang -O2 -pipe -std=c11 -Wall -Wextra -Wno-unused-parameter \
-  ./cfnat.c -o ./cfnat-macos \
-  -pthread
-```
-
-交叉指定架构示例：
-
-```bash
-clang -O2 -pipe -std=c11 \
-  -arch x86_64 -mmacosx-version-min=10.13 \
-  ./cfnat.c -o ./cfnat-darwin-amd64 \
-  -pthread
-```
-
-```bash
-clang -O2 -pipe -std=c11 \
-  -arch arm64 -mmacosx-version-min=11.0 \
-  ./cfnat.c -o ./cfnat-darwin-arm64 \
-  -pthread
-```
-
-说明：
-
-- macOS amd64 最低目标可设为 `10.13`。
-- macOS arm64 最低目标通常设为 `11.0`，因为 Apple Silicon 从 macOS 11 开始支持。
-- macOS 不支持像 Linux musl 那样生成完全静态的系统 libc 二进制。
-- macOS 版同样不需要额外链接 `-lresolv`。
-
-### Windows 中文显示
-
-Windows 7 的传统 CMD 对 UTF-8 控制台支持不稳定，单纯调用 `SetConsoleOutputCP(CP_UTF8)` 或执行 `chcp 65001` 仍可能乱码。
-
-Windows 版现在不再依赖控制台代码页显示中文。程序会把内部 UTF-8 日志转换为 Unicode，并通过 `WriteConsoleW` 直接写入控制台。
-
-这样在 Windows 7 / Windows 10 / Windows 11 下都更稳定：
-
-- 直接在 CMD 运行时，中文走 Unicode 控制台输出。
-- 输出重定向到文件时，仍保留 UTF-8 文本。
-- 不需要用户手动执行 `chcp 65001`。
-
-如果 Windows 7 下仍显示方块，通常是控制台字体缺少中文字形，建议把 CMD 字体改成支持中文的字体，或使用 PowerShell。
 
 ### Windows 构建
 
@@ -726,15 +710,14 @@ Win7 如果系统 TLS 组件过旧，HTTPS 下载仍可能失败。这种情况�
 .github/workflows/build.yml
 ```
 
-当前工作流包含：
+当前工作流已精简并升级为专供现代 64 位平台：
 
-- Linux glibc 动态版：amd64、386、armv5、armv6、armv7、arm64、mips、mipsel、mips64、mips64el、ppc64、ppc64le、riscv64、s390x。
-- Linux musl 静态版：amd64、386、armv6、armv7、arm64、mips、mipsel、riscv64。
-- armv5、mips64、mips64el、ppc64、ppc64le、s390x 当前使用 glibc 动态版发布；Zig 0.15.1 在 armv5 musl 下会因 32 位原子内建符号缺失导致链接失败，在 mips64 / ppc64 / s390x 等架构下也不能稳定提供 musl libc，因此不放入必跑 musl 矩阵，避免 release 出现红叉。
-- Windows：amd64、386。
-- macOS：amd64、arm64。
-- tag 触发发布：推送 `v*` 标签后打包 release 文件和校验和。
-- 手动触发：支持 `workflow_dispatch`。
+- **Linux glibc 动态版**：`amd64`、`arm64`
+- **Linux musl 全静态独立版**：`amd64`、`arm64`（推荐软路由 / OpenWrt / Alpine）
+- **Windows 11 原生版**：`amd64`、`arm64`（Zig 交叉编译，免额外 DLL）
+- **触发与发布**：
+  - 推送 `v*` 标签自动打包创建 GitHub Release。
+  - 支持 `workflow_dispatch` 手动网页触发一键发布，支持输入自定义版本或自动从 `cfnat.c` 提取版本号，并支持重复发布时强制覆盖更新 Release 资产。
 
 发布包会把二进制文件放入 `bin/`，并附带源码、README 和基础数据文件。
 
@@ -752,18 +735,13 @@ Win7 如果系统 TLS 组件过旧，HTTPS 下载仍可能失败。这种情况�
 ## 仓库文件说明
 
 ```text
-cfnat.go                         Go 版实现 / 参考实现
-cfnat-origin.go                  原始 Go 版留档
 cfnat.c                          C 版统一入口，支持 Linux / macOS / Windows
 ips-v4.txt                       IPv4 数据文件
 ips-v6.txt                       IPv6 数据文件
 locations.json                   Cloudflare 数据中心位置文件
 README.md                        主说明文档
 .github/workflows/build.yml      C 版多平台构建工作流
-.github/workflows/build_go.yml   Go 版构建工作流
 ```
-
-`README-build.md` 已合并进本文件，不再单独维护，避免构建说明和主文档互相漂移。
 
 ---
 
