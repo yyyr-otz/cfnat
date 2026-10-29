@@ -1,850 +1,216 @@
-# cfnat C 版 v0.0.1
+# cfnat C 版 (现代平台优化版)
 
 面向低内存环境的 **Cloudflare IP 扫描 + 单端口 TCP 转发** 工具。
 
-当前版本针对 **Linux 与 Windows 11 的 64 位现代平台（amd64 / arm64）** 进行了专项热路径优化、零拷贝吞吐提升与 I/O 抽象层加固。
+当前版本针对 **Linux、Windows 11 及 Android Termux 现代平台（amd64 / arm64）** 进行了专项热路径优化、零拷贝吞吐提升、I/O 抽象层加固与 Android 沙箱兼容适配。
 
-C 版基于 [`cfnat.go`](cfnat.go) 移植，目标不是把功能做得更复杂，而是在保留扫描、优选、转发、健康检查、百度前置代理和双方案监听等核心能力的同时，尽量降低常驻内存占用，适合 OpenWrt、软路由、小内存 VPS、ARM64 实例以及 Windows 11 设备。
-
----
-
-## ⚡ 现代平台优化与支持说明
-
-### 1. 核心优化内容
-- **全链路禁用 Nagle 算法（`TCP_NODELAY`）**：在客户端建连接收以及拨号上游优选 IP / 百度前置连接时全面注入，消除 40ms 交互延迟，显著加速 TLS 握手及短报文首包响应。
-- **并发连接热路径无锁化加速（`carrier_choose_ip_fast`）**：在连接频繁进入时，基于 `atomic_load_explicit(..., memory_order_acquire)` 原语直接判定缓存有效性，并使用直接内存复制替代格式化解析，大幅消除了连接建立时对全局互斥锁的争抢。
-- **Linux 内核级零拷贝加固（`splice`）**：
-  - 开启 `SPLICE_F_MORE` 标志，提示内核聚合数据包，大幅提高吞吐量；
-  - 将 16 KB 回退缓冲区解耦到 fallback 分支，在走 splice 时杜绝无谓的栈内存分配，消除 64 KB 极小线程栈下的栈溢出隐患。
-- **Windows 平台 EventLoop I/O 事件驱动补齐**：完善非 epoll 平台下的 `evloop_wait_select` 回退实现，支持 Windows 下单套接字的非阻塞异步可写/可读事件等待，解决 HTTP 探测时的虚假超时。
-
-### 2. 目标平台与停止支持说明
-为保证现代高性能特性、减少历史包袱并精简构建工作流，当前维护重点聚焦于：
-- **官方全力支持与构建矩阵**：
-  - **Linux amd64 (x86_64)**：glibc 动态版 + musl 全静态独立版
-  - **Linux arm64 (aarch64)**：glibc 动态版 + musl 全静态独立版（OpenWrt/软路由/ARM VPS 推荐）
-  - **Windows 11 amd64 (x86_64)**：Win11 原生静态可执行文件
-  - **Windows 11 arm64 (aarch64)**：Surface / 骁龙 X Elite / ARM 笔记本原生运行
-- **不再主动维护/构建的平台**：
-  - **Windows 7 / XP / 32位系统 (x86/i686)**：已移除 MinGW 386 编译矩阵；Windows 宏默认适配现代 Windows 10/11 (`_WIN32_WINNT=0x0A00`)。
-  - **老旧 32 位嵌入式 Linux 架构**：包括 ARMv5、ARMv6、ARMv7、MIPS、MIPSEL 等架构，已从持续集成中移除。
-  - **小众服务器架构**：MIPS64、PowerPC (ppc64/ppc64le)、RISC-V 64、s390x。
-  - **macOS**：已从默认 GitHub Actions 矩阵精简（如需使用仍可本地自行源码编译）。
+核心目标是保留扫描、优选、转发、健康检查、百度前置代理和双方案监听等核心能力的同时，尽量压低常驻内存占用，非常适合 OpenWrt/软路由、手机 Termux、小内存 VPS 以及 Windows 11 设备。
 
 ---
 
 ## 目录
 
-- [项目定位](#项目定位)
+- [现代平台优化与支持说明](#现代平台优化与支持说明)
+- [项目定位与转发链路](#项目定位与转发链路)
 - [核心特性](#核心特性)
-- [快速开始](#快速开始)
+- [快速开始与编译](#快速开始与编译)
+- [Android Termux 运行指南](#android-termux-运行指南)
 - [运行参数](#运行参数)
 - [常用示例](#常用示例)
-- [工作原理](#工作原理)
-- [快速启动缓存](#快速启动缓存)
-- [百度前置代理与双方案监听](#百度前置代理与双方案监听)
-- [构建与发布](#构建与发布)
-- [仓库文件说明](#仓库文件说明)
-- [数据文件说明](#数据文件说明)
-- [日志与排错](#日志与排错)
+- [构建与 GitHub Actions 发布](#构建与-github-actions-发布)
 - [资源占用说明](#资源占用说明)
 - [常见问题](#常见问题)
 - [免责声明](#免责声明)
 
 ---
 
-## 项目定位
+## ⚡ 现代平台优化与支持说明
+
+### 1. 核心性能优化
+- **全链路禁用 Nagle 算法（`TCP_NODELAY`）**：在接入客户端连接以及拨号上游连接时全面注入，消除 40ms 交互延迟，显著提升 TLS 握手及首包响应速度。
+- **高并发热路径无锁化加速（`carrier_choose_ip_fast`）**：新连接进入时，通过 `atomic_load_explicit(..., memory_order_acquire)` 原语判定缓存有效性，并使用直接内存复制替代格式化解析，大幅消除连接建立时对全局互斥锁的争抢。
+- **Linux 内核级零拷贝加固（`splice`）**：
+  - 开启 `SPLICE_F_MORE` 提示内核聚合数据包，显著提升转发吞吐量；
+  - 16 KB 回退缓冲区解耦，在走零拷贝时彻底杜绝无谓的栈内存分配，根除 64 KB 极小线程栈下的栈溢出隐患。
+- **Windows 11 EventLoop 事件驱动补齐**：完善非 epoll 平台下的 `evloop_wait_select` 回退实现，支持 Windows 下单套接字的非阻塞异步事件等待，解决 HTTP 探测时的虚假超时。
+- **Android Termux 沙箱审计兼容**：在 Android 平台下自动隔离 `splice` 系统调用，避免触发 Android `seccomp` 过滤机制报 `signal 31 (SIGSYS)` 错误，确保转发稳定。
+
+### 2. 目标平台支持矩阵
+当前重点维护与构建以下现代主流平台：
+- **Linux amd64 (x86_64)**：glibc 动态版 + musl 全静态独立版
+- **Linux arm64 (aarch64)**：glibc 动态版 + musl 全静态独立版（OpenWrt/软路由/ARM VPS 推荐）
+- **Android Termux (arm64 & amd64)**：官方 NDK r26b 编译，适配 Bionic libc 与 seccomp 审计，Termux 开箱即用
+- **Windows 11 amd64 (x86_64)**：Win11 原生纯静态可执行文件
+- **Windows 11 arm64 (aarch64)**：Surface / 骁龙 X Elite / ARM 笔记本原生运行
+
+> **不再主动支持的平台**：
+> - Windows 7 / XP 及 32 位系统（宏定义已升级为 `_WIN32_WINNT=0x0A00` Win10/11）。
+> - 老旧 32 位嵌入式架构（ARMv5/ARMv6/ARMv7、MIPS、MIPSEL）。
+> - 小众服务器架构（MIPS64、PowerPC、RISC-V 64、s390x）及 macOS。
+
+---
+
+## 项目定位与转发链路
 
 cfnat C 版做三件事：
-
 1. 扫描 Cloudflare IP，按数据中心、延迟、丢包率筛出候选节点。
 2. 在本机监听一个 TCP 端口，自动识别 TLS / 非 TLS 流量。
 3. 把客户端连接转发到当前可用的 Cloudflare 优选 IP，并在失败时自动切换。
 
-它不是 HTTP 反向代理，也不会解密或篡改业务数据。它只做 TCP 字节转发。
-
-典型链路：
+它只做纯粹的高性能 TCP 字节转发，不是 HTTP 反向代理，也不会解密或篡改业务数据。
 
 ```text
-客户端
-  ↓
-cfnat 本地监听端口
-  ↓
-Cloudflare 优选 IP:443 或 :80
-```
-
-启用百度前置代理时：
-
-```text
-客户端
-  ↓
-cfnat 本地监听端口
-  ↓
-百度前置节点（HTTP CONNECT）
-  ↓
-Cloudflare 优选 IP:443 或 :80
+客户端  ──→  cfnat 本地监听端口  ──→  Cloudflare 优选 IP:443 或 :80
+                                  (可选) 百度前置节点(HTTP CONNECT)
 ```
 
 ---
 
 ## 核心特性
 
-### 核心路由与转发
 - **渐进式三级健康检查**（FULL → MEDIUM → LIGHT）：新节点 FULL 探测建立基线，连续成功即逐级降级，任意失败立即升级至 FULL，以最小开销保障候选池质量。
-- **TLS 感知健康检查**：转发端口为 443 时自动使用 TLS ClientHello 探测（SNI: cloudflaremirrors.com），非 443 端口使用 HTTP 探测，避免健康检查与真实流量路径偏差。
-- **连接生命周期追踪**：记录每条连接的建立、选择和断开全链路，分配唯一连接 ID 与客户端地址，检测 <3000ms 快速断开（Fast-Fail）并自动切换 IP，提升弱网环境下用户体验。
-- **单端口同时承接 TLS 与非 TLS / HTTP 流量**：客户端只需连接一个本地端口，程序根据首字节（0x16自动分流到 443/80 目标端口。
-- **出站接口绑定**：支持 `-bind-if` 参数将连接绑定到指定网络接口（如 `eth0`、`en0`），满足多网卡 / 旁路网关场景。
-
-### 智能选路与自适应
+- **单端口同时承接 TLS 与非 TLS / HTTP 流量**：客户端只需连接一个本地端口，程序根据首字节（`0x16`）自动分流到 443 或 80 目标端口。
 - **EWMA 综合评分选优**：候选 IP 按 EWMA 平滑延迟（α=0.125）、丢包率、抖动和连续失败次数综合打分，始终使用当前 score 最低的最优 IP。
-- **SNI 感知 IP 选择**：读取客户端 TLS ClientHello 中的 SNI，为不同域名选择独立的最优 IP；连接失败时自动回退到该 SNI 对应的下一候选 IP。
-- **候选缓存与快速启动**：默认启用缓存，二次启动时先对缓存 IP 做快速健康检查，命中后立即监听，后台异步刷新，实现秒级恢复。
-- **代理模式**：支持直连优选（探测 Cloudflare 原生 IP）、百度前置优选（通过百度加速）以及两者同进程同时监听。
-- **自动切换与重试**：当前 IP 连续两次失败后自动切换到下一候选；候选池耗尽后自动重新扫描，启动失败则 3 秒后自动重试，永不退出。
-
-### 网络与协议支持
-- **双栈支持**：支持 IPv4 / IPv6 扫描入口，支持 IPv4 / IPv6 监听地址。
-- **Cloudflare 数据中心过滤**：支持按 `HKG`、`SJC`、`LAX` 等三字码筛选特定数据中心。
-- **IPv6 CIDR 随机抽样**：IPv6 /64 及以上前缀范围使用 `ipv6_cidr_sample()` 随机采样，避免 IPv6 完整展开导致内存爆炸。
-- **DNS 解析系统与 Fake-IP 绕过**：内置 DoH（AliDNS、Cloudflare）与 UDP DNS（223.5.5.5、119.29.29.29、1.1.1.1、8.8.8.8）解析器，自动检测 198.18.0.0/15 Fake-IP 并回退到真实解析；支持 `-baidu-resolver` 自定义解析器（`auto`、`udp://IP`、`doh://IP/path?host=HOST`），内置 12 个百度代理备用 IP 兜底。
-
-### 高性能实现细节
-- **事件驱动 I/O 多路复用**：Linux epoll / macOS kqueue / select 回退，避免 select 轮询开销，EventLoop 支持 HTTP 响应头事件驱动接收。
-- **CIDR 惰性展开**（前缀和 + 二分查找）：只存 CIDR 范围，按需生成 IP，KB 级内存即可处理百万级 IP 段。
-- **HTTP Keep-Alive 连接复用**：同一 IP 多次探测复用 TCP 连接，断连后自动重连，减少握手开销。
-- **多级缓存**：连接级 IP 选择缓存 + 代理节点选择缓存（5 秒），连接建立和节点切换时 O(1) 获取，降低 CPU 开销。
-
-### 跨平台与可观测性
-- **单一源码跨平台**：`cfnat.c` 通过条件编译同时支持 Linux / macOS / Windows，无外部依赖。
-- **统一日志级别**：`silent`、`error`、`warn`、`info`、`debug`，满足不同场景的可观测性需求。
+- **SNI 感知 IP 选择**：读取客户端 TLS ClientHello 中的 SNI，为不同域名选择独立的最优 IP；连接失败时自动回退。
+- **候选缓存与快速启动**：默认启用缓存，二次启动时先对缓存 IP 做快速健康检查，命中后立即监听，秒级恢复。
+- **IPv6 CIDR 随机抽样**：IPv6 /64 及以上前缀范围使用随机采样，避免 IPv6 展开导致内存爆炸。
+- **内置 DNS 系统**：内置 DoH（AliDNS、Cloudflare）与 UDP DNS 解析器，自动检测 198.18.0.0/15 Fake-IP 并回退。
+- **CIDR 惰性展开**：只存 CIDR 范围，按需计算 IP，KB 级内存即可处理百万级 IP 段。
 
 ---
 
-## 快速开始
+## 快速开始与编译
 
 ### 1. 本地编译
 
-Linux（glibc 动态版，推荐给常规发行版）：
-
+**Linux（glibc 动态版）**：
 ```bash
 gcc -O2 -pipe -std=c11 -Wall -Wextra -Wno-unused-parameter \
-  ./cfnat.c -o ./cfnat-linux \
-  -pthread
+  ./cfnat.c -o ./cfnat-linux -pthread
 ```
 
-Linux（musl 静态版，推荐给 OpenWrt / Alpine / 小系统）：
-
+**Linux（musl 静态版，推荐给 OpenWrt / Alpine）**：
 ```bash
 zig cc -target x86_64-linux-musl -O2 -pipe -std=c11 \
   -Wall -Wextra -Wno-unused-parameter \
-  ./cfnat.c -o ./cfnat-linux-amd64-musl \
-  -pthread -static -s
+  ./cfnat.c -o ./cfnat-linux-amd64-musl -pthread -static -s
 ```
 
+**Windows 11（Zig 交叉编译）**：
+```bash
+zig cc -target x86_64-windows-gnu -O2 -pipe -std=c11 -D_WIN32_WINNT=0x0A00 \
+  -Wall -Wextra -Wno-unused-parameter \
+  ./cfnat.c -o ./cfnat.exe -lws2_32 -ldnsapi -lwininet -static -s
+```
 
-### 2. 启动
-
-Linux 示例：
+### 2. 启动示例
 
 ```bash
-./cfnat-linux -direct-listen=0.0.0.0:40000 -colo=HKG -delay=120 -random=true
+# 启动直连优选监听
+./cfnat -direct-listen=0.0.0.0:40000 -colo=HKG,SJC -delay=150
+
+# 客户端统一连接
+服务器IP:40000  (TLS 流量自动去 443，非 TLS 去 80)
 ```
 
-Windows 示例：
+---
 
-```bash
-cfnat.exe -direct-listen=0.0.0.0:40000 -colo=HKG -delay=120 -random=true
-```
+## Android Termux 运行指南
 
-### 3. 客户端访问
-
-客户端统一连接同一个端口：
-
-```text
-服务器IP:40000
-```
-
-程序会自动识别连接类型：
-
-```text
-TLS 流量           → Cloudflare IP:443
-非 TLS / HTTP 流量 → Cloudflare IP:80
-```
+1. **获取二进制**：从 GitHub Release 下载 `cfnat-android-arm64`（绝大多数现代手机为 ARM64 架构）。
+2. **放入 Termux 私有目录执行**：
+   ```bash
+   cd ~
+   chmod +x cfnat-android-arm64
+   # 非 root 环境监听端口需大于 1024
+   ./cfnat-android-arm64 -direct-listen=127.0.0.1:40000 -colo=HKG
+   ```
+3. **后台保活（防止手机锁屏杀进程）**：
+   - 在 Termux 中执行 `termux-wake-lock`（获取 CPU 唤醒锁）；
+   - 在手机系统设置中将 Termux 的省电策略设为 **“无限制 / 允许后台高耗电”**。
 
 ---
 
 ## 运行参数
 
-| 参数             | 说明                                                                        | 默认值                         |
-| ---------------- | --------------------------------------------------------------------------- | ------------------------------ |
-| `-direct-listen` | 直连优选监听地址；只填它时，只跑直连 Cloudflare 优选                        | 空                             |
-| `-baidu-listen`  | 百度前置优选监听地址；只填它时，只跑百度前置方案                            | 空                             |
-| `-baidu-resolver`| 百度域名解析器，系统 DNS 返回 Fake-IP(198.18.0.0/15) 时恢复真实节点；支持 `auto`（默认，内置 DoH+UDP 回退）、`udp://IP`（指定 UDP DNS）、`doh://IP/path?host=HOST`（指定 DoH） | `auto`                         |
-| `-bind-if`       | 出站连接绑定到指定网络接口，例如 `eth0`、`en0`                               | 空（不绑定）                   |
-| `-colo`          | Cloudflare 数据中心过滤，多个用逗号分隔，例如 `HKG,SJC,LAX`                 | 空                             |
-| `-delay`         | 有效延迟阈值，单位毫秒                                                      | `300`                          |
-| `-ipnum`         | 保留的候选 IP 数量                                                          | `20`                           |
-| `-ips`           | 扫描 IPv4 或 IPv6，取值 `4` 或 `6`                                          | `4`                            |
-| `-num`           | 每个客户端连接的目标连接尝试次数                                            | `5`                            |
-| `-port`          | TLS 流量转发目标端口                                                        | `443`                          |
-| `-http-port`     | 非 TLS / HTTP 流量转发目标端口                                              | `80`                           |
-| `-random`        | 是否从 CIDR 随机抽样 IP；`true` 启动快，`false` 会完整展开 CIDR，扫描量很大 | `true`                         |
-| `-task`          | 扫描线程数                                                                  | `100`                          |
-| `-V` / `-version` | 显示版本号并退出                                                            | —                              |
-| `-code`          | HTTP / HTTPS 探测期望状态码                                                 | `200`                          |
-| `-domain`        | 健康检查目标域名与路径                                                      | `cloudflaremirrors.com/debian` |
-| `-health-log`    | 健康检查成功日志输出间隔，单位秒；设为 `0` 可关闭成功日志                   | `60`                           |
-| `-log`           | 日志级别：`silent`、`error`、`warn`、`info`、`debug`                        | `info`                         |
+| 参数 | 说明 | 默认值 |
+| :--- | :--- | :--- |
+| `-ipfile` | 自定义 IPv4 数据文件路径 | `ips-v4.txt` |
+| `-ipfile6` | 自定义 IPv6 数据文件路径 | `ips-v6.txt` |
+| `-location` | 自定义位置数据文件路径 | `locations.json` |
+| `-colo` | 匹配特定数据中心，多个用逗号隔开 (如 `HKG,SJC`) | 留空全部匹配 |
+| `-delay` | 有效延迟上限（毫秒） | `300` |
+| `-task` | 扫描并发线程数 | `100` |
+| `-ipnum` | 保留的最优候选 IP 数量 | `20` |
+| `-port` | TLS 转发目标端口 | `443` |
+| `-http-port` | 非 TLS 转发目标端口 | `80` |
+| `-direct-listen` | 开启直连优选本地监听地址 (如 `0.0.0.0:40000`) | 留空不开启 |
+| `-baidu-listen` | 开启百度前置优选本地监听地址 (如 `0.0.0.0:40001`) | 留空不开启 |
+| `-mixed-listen` | 开启混合模式监听地址 (先直连，失败自动切百度) | 留空不开启 |
+| `-log` | 日志级别：`silent` / `error` / `warn` / `info` / `debug` | `info` |
+| `-cache` | 是否启用快速启动缓存 | `true` |
+| `-health-check` | 健康检查时间间隔（秒，0 表示禁用） | `60` |
 
 ---
 
 ## 常用示例
 
-### 只扫描不监听（查看候选 IP）
-
+### 1. 仅测速扫描（不监听）
 ```bash
-./cfnat-linux -colo=HKG -delay=120 -random=true
+./cfnat -colo=HKG -delay=150 -ipnum=10
 ```
 
-### 只监听直连优选
-
+### 2. 双方案同时监听（直连 + 百度前置）
 ```bash
-./cfnat-linux -direct-listen=0.0.0.0:1234 -colo=HKG
+./cfnat -direct-listen=0.0.0.0:40000 -baidu-listen=0.0.0.0:40001 -colo=HKG
 ```
 
-### 只监听百度前置优选
-
+### 3. 混合优选模式（稳定优先）
 ```bash
-./cfnat-linux -baidu-listen=0.0.0.0:1235 -colo=HKG
-```
-
-### 同时监听直连优选和百度前置优选
-
-```bash
-./cfnat-linux \
-  -direct-listen=0.0.0.0:1234 \
-  -baidu-listen=0.0.0.0:1235 \
-  -colo=HKG
-```
-
-双方案模式下：
-
-```text
-服务器IP:1234 → 直连 Cloudflare 优选
-服务器IP:1235 → 百度前置优选
-```
-
-### 同时接受多个数据中心
-
-```bash
-./cfnat-linux -direct-listen=0.0.0.0:40000 -colo=HKG,SJC,LAX -delay=120
-```
-
-### 使用 IPv6 扫描源
-
-```bash
-./cfnat-linux -direct-listen=[::]:40000 -ips=6 -colo=HKG -delay=120
-```
-
-### 打开调试日志
-
-```bash
-./cfnat-linux -log=debug
-```
-
-### 提高候选池规模和扫描并发
-
-```bash
-./cfnat-linux -ipnum=50 -task=200
+./cfnat -mixed-listen=0.0.0.0:40000 -colo=HKG
 ```
 
 ---
 
-## 工作原理
-
-### 1. 加载 IP 段
-
-程序启动后根据 `-ips` 选择 IPv4 或 IPv6 扫描源：
-
-```text
--ips=4 → IPv4
--ips=6 → IPv6
-```
-
-本地数据文件不存在时，会尝试自动下载。
-
-### 2. 生成待测 IP
-
-根据 `-random` 决定扫描方式：
-
-```text
--random=true   从每个 CIDR 随机抽取 IP，启动快，适合日常使用
--random=false  完整展开 CIDR 后按顺序测试，扫描更全面，但 IP 数量可能超过百万，耗时明显更长
-```
-
-程序会输出 IP 列表加载进度和扫描进度。Windows 下如果看到“默认百度代理池已建立”后短时间没有发现有效 IP，通常是在完整展开或扫描大量候选，并不是卡死。需要快速启动时优先使用默认的 `-random=true`。
-
----
-
-## 快速启动缓存
-
-程序默认启用候选缓存，用来解决"每次启动都要重新扫描一遍"的问题。
-
-首次运行时仍会正常扫描 IP。扫描成功后，程序会把当前候选池写入缓存文件。后续启动时会先读取缓存，对前几个候选 IP 做快速健康检查：
-
-```text
-启动
-→ 读取候选缓存
-→ 快速检查缓存里的前几个 IP
-→ 命中可用 IP 后立即开始监听
-→ 后台继续扫描刷新候选池
-→ 刷新完成后写回缓存
-```
-
-这样第二次及之后启动通常不需要等待完整扫描完成，命中缓存后可以先进入监听状态，再慢慢刷新更优结果。
-
-缓存文件按 IP 类型和运行模式区分：
-
-```text
-direct-cache-v4.txt      IPv4 直连模式缓存
-direct-cache-v6.txt      IPv6 直连模式缓存
-baidu-cache-v4.txt       IPv4 百度前置代理缓存
-baidu-cache-v6.txt       IPv6 百度前置代理缓存
-mixed-cache-v4.txt       IPv4 混合模式缓存
-mixed-cache-v6.txt       IPv6 混合模式缓存
-```
-
-缓存不按时间失效。程序启动时只看健康检查结果：缓存 IP 可用就立即使用，不可用才等待完整扫描。
-
-后台刷新不会阻塞监听服务。刷新成功后会重新按 score 排序，并把扫描结果写回缓存。
-
-需要完全重新扫描时，删除对应的 `*-cache-*.txt` 文件即可。
-
-### 3. TCP 连通性测试
-
-对待测 IP 发起 TCP 连接测试，并记录建连耗时。
-
-这个耗时会作为基础延迟，后续用于候选评分。
-
-### 4. 识别 Cloudflare 数据中心
-
-程序向目标 IP 发起 HTTP 探测，并优先从响应头中读取 `CF-RAY`。
-
-探测时会先使用目标 IP 作为 `Host` 发起请求，行为更接近原 Go 版；随后再尝试默认域名。这样可以避免部分 Windows / 网络环境下请求有响应但没有命中预期 Host，导致一直扫不到 IP。
-
-示例：
-
-```text
-xxxx-HKG
-xxxx-SJC
-xxxx-LAX
-```
-
-后缀就是 Cloudflare 数据中心代码。程序会结合 `locations.json` 映射地区与城市信息。
-
-如果 HTTP 响应能正常返回但没有 `CF-RAY`，并且没有指定 `-colo`，程序会把这个 IP 作为 `UNK` 候选保留下来，再由后续健康检查确认是否可用。
-
-仅 TCP 连接成功但没有读到 HTTP 响应时，不再直接加入候选池，避免 Windows 多线程扫描或百度前置代理场景下把大量不可确认节点误判为有效 IP。
-
-### 5. 按 `-colo` 过滤
-
-如果指定：
-
-```bash
--colo=HKG,SJC,LAX
-```
-
-程序只保留匹配这些数据中心的结果。
-
-不指定 `-colo` 时，不按数据中心过滤。
-
-### 6. 综合评分
-
-候选 IP 会根据 EWMA 平滑延迟、丢包率、抖动和连续失败次数计算综合分，分数越低越优。
-
-评分公式：
-
-```text
-base_latency = ewma_latency > 0 ? ewma_latency : latency_ms
-score = base_latency * 10 + loss_rate * 25 + jitter_ms * 5
-if consecutive_fail > 0:
-    penalty = 50
-    for i in 0..min(consecutive_fail, 10): penalty *= 2
-    score += penalty
-```
-
-- **EWMA 平滑延迟**：`ewma = ewma × 7/8 + best_latency × 1/8`（α=0.125），消除单次延迟毛刺。
-- **抖动（jitter）**：`jitter = (jitter × 7 + |best_latency - ewma|) / 8`，同样用 EWMA 平滑，衡量延迟波动幅度，抖动大的 IP 即使平均延迟低也会被扣分。
-- **连续失败指数惩罚**：连续失败 1 次 +50，2 次 +100，3 次 +200……指数级增长，快速淘汰不稳定节点。
-
-所以程序不是单纯选择最低延迟，而是综合评估平滑延迟、稳定性、丢包率和历史可靠性。
-
-### 优选原则
-
-程序没有多套选择逻辑，只有一套固定的自动优选逻辑：
-
-```text
-扫描候选
-→ 按 score 排序
-→ 永远取 score 最低的 IP
-→ 健康检查失败
-→ 切换到下一个最优候选
-→ 候选池耗尽后重新扫描并重新排序
-```
-
-这个模型可以避免轮询或随机选择带来的链路漂移，让行为更稳定、代码更简单。
-
-### 7. 健康检查
-
-程序会对候选 IP 做目标端口健康检查。采用三级渐进策略，根据节点历史表现动态调整检查强度：
-
-```text
-FULL（全量）     → TCP 连通 + HTTP 请求 + 完整响应体读取，验证内容完整性
-MEDIUM（中等）   → TCP 连通 + HTTP 请求，验证 HTTP 状态码
-LIGHT（轻量级）  → TCP 端口连通性探测，仅检查端口是否可达
-```
-
-- 新节点首次检查从 `FULL` 开始建立基线。
-- 连续成功 3 次后降为 `MEDIUM`，减轻检查开销。
-- 连续成功 10 次后进一步降为 `LIGHT`，仅做 TCP 握手。
-- 任意一次失败立即升级为 `FULL`，确认节点是否彻底不可用。
-- 只有健康检查通过的 IP 才会成为当前转发 IP。
-
-**TLS 感知健康检查**：
-- 转发端口为 443 时，自动使用 TLS ClientHello 探测（SNI: `cloudflaremirrors.com`）
-- 非 443 端口继续使用 HTTP 探测
-- 避免健康检查与真实 TLS 流量路径偏差，提升 443 端口检查准确性
-
-### 8. 自动切换
-
-运行期间会定时检查当前 IP。
-
-当当前 IP 连续失败两次后，程序会切换到下一个可用候选；如果候选池耗尽，会重新扫描。
-
-启动时如果所有监听模式均未扫描到有效 IP，程序不会直接退出，而是释放当前 IP 列表，等待 3 秒后重新加载 IP 段并再次扫描，直到至少一个监听模式成功获取候选 IP 为止。
-
-切换时优先使用代理节点选择缓存（5 秒有效期），避免高频重复选择。
-
-### 9. 单端口自动分流
-
-客户端只需要连接同一个本地端口。程序接收连接后读取客户端首字节：
-
-```text
-首字节是 0x16 → 认为是 TLS 流量
-其他情况      → 认为是非 TLS / HTTP 流量
-```
-
-然后转发到不同目标端口：
-
-```text
-TLS 流量           → Cloudflare IP:-port
-非 TLS / HTTP 流量 → Cloudflare IP:-http-port
-```
-
-默认等价于：
-
-```text
-TLS 流量           → Cloudflare IP:443
-非 TLS / HTTP 流量 → Cloudflare IP:80
-```
-
-**TLS ClientHello 完整转发**：
-- 识别为 TLS 流量后，程序会读取完整的 TLS ClientHello 报文
-- 从 ClientHello 中提取 SNI（Server Name Indication）
-- 将完整的 ClientHello 转发给上游，而非仅首字节
-- 确保 TLS 握手完整性，避免因截断 ClientHello 导致握手失败
-
-### 10. 出站接口绑定
-
-通过 `-bind-if` 参数可以将所有出站连接绑定到指定网络接口：
-
-```bash
-./cfnat-linux -direct-listen=0.0.0.0:40000 -bind-if=eth0 -colo=HKG
-```
-
-跨平台实现方式：
-
-| 平台      | 实现方式                       |
-| --------- | ------------------------------ |
-| Linux     | `SO_BINDTODEVICE` socket 选项 |
-| macOS     | `IP_BOUND_IF` / `IPV6_BOUND_IF` |
-| Windows   | 当前暂未支持                   |
-
-### 12. 连接生命周期追踪
-
-程序为每个连接分配唯一 ID，追踪从建立到关闭的完整生命周期：
-
-- 连接建立时记录客户端地址和连接 ID
-- 健康检查发现 <3000ms 快速断开时计入连续失败计数
-- 达到阈值后自动切换候选 IP
-- 连接日志输出统一格式，方便排错
-
-### 13. DNS 解析系统与 Fake-IP 绕过
-
-完整的 DNS 解析子系统，专门解决中国网络环境下百度前置域名解析到 Fake-IP (198.18.0.0/15) 的问题：
-
-**Fake-IP 检测**：
-- `is_fake_ipv4()` 函数检测 IPv4 地址是否落在 198.18.0.0/15 范围内
-- 系统 DNS 返回 Fake-IP 时自动识别并丢弃
-
-**多层回退解析链**：
-1. **系统 getaddrinfo()** - 首选标准解析
-2. **内置 DoH 解析器** - AliDNS (223.5.5.5)、Cloudflare (1.1.1.1)，通过 curl + `--resolve` 绕过系统 DNS
-3. **内置 UDP DNS** - 223.5.5.5、119.29.29.29、1.1.1.1、8.8.8.8，原始 UDP 查询
-4. **自定义解析器** - 通过 `-baidu-resolver` 指定 `udp://IP` 或 `doh://IP/path?host=HOST`
-5. **硬编码备用 IP** - 12 个中国百度代理节点 IPv4 地址，作为最后兜底
-
-**解析流程**：
-```text
-getaddrinfo() → 检测 Fake-IP → 是 → 尝试配置的解析器 → 成功返回真实 IP
-                    ↓ 否
-              直接返回真实 IP
-```
-
-这使得 cfnat 在 DNS 被污染的网络环境下仍能正常工作。
-
-### 14. TLS SNI 支持
-
-TLS 1.2/1.3 ClientHello 解析与构造系统：
-
-- **build_tls_client_hello()** - 构造自定义 SNI 的 TLS ClientHello 报文
-- **tls_probe_host()** - 向指定 IP:端口发送 TLS ClientHello 并验证响应
-- **read_tls_client_hello()** - 从客户端读取 TLS ClientHello
-- **parse_tls_sni()** - 从 ClientHello 中提取 SNI
-
-**应用场景**：
-- 健康检查端口为 443 时，使用真实的 TLS 握手而非明文 HTTP
-- 读取客户端 TLS ClientHello，提取 SNI 实现按域名选 IP
-- 连接失败时，针对该 SNI 重新选择最优 IP 进行故障回退
-- 将完整的 TLS ClientHello 转发给上游（而非仅首字节）
-
-### 15. SNI 感知的 IP 选择与故障回退
-
-- **carrier_tls_sni_check_ip()** - 用指定 SNI 测试 IP 可用性
-- **carrier_choose_ip_for_sni()** - 为指定 SNI 选择最优 IP
-- **connection_thread() 增强** - 读取客户端 SNI，上游连接失败时调用 `carrier_choose_ip_for_sni()` 回退
-
-不同 SNI 主名可路由到不同最优 IP，实现精细化流量调度。
-
----
-
-## 百度前置代理与双方案监听
-
-### 百度前置代理
-
-启用 `-baidu-listen`（配合百度域名和端口）后，程序会通过百度前置节点建立 HTTP CONNECT 链路来扫描和转发。
-
-当使用 `-baidu-listen` 时，程序会先解析 `cloudnproxy.baidu.com`：
-
-- 如果系统 DNS 直接返回真实 IPv4，程序直接使用这些地址建立百度代理池。
-- 如果系统 DNS 返回 `198.18.0.0/15` Fake-IP（常见于 PassWall、SSR-Plus 等路由器 DNS 方案），程序会丢弃这些地址，并根据 `-baidu-resolver` 恢复真实节点。
-- 如果恢复出的真实地址仍无法建立百度 CONNECT 代理池，程序最后会回退到内置百度节点列表（12 个硬编码 IPv4 地址）。
-
-`-baidu-resolver` 支持以下格式：
-
-- `auto`（默认）：先尝试内置 DoH 解析器（AliDNS、Cloudflare），失败后回退到内置 UDP DNS（223.5.5.5 等）
-- `udp://IP`：直接向指定 DNS 服务器发送 UDP A 记录查询，例如 `udp://223.5.5.5`
-- `doh://IP/path?host=HOST`：通过 curl 发起 DoH 查询，例如 `doh://223.5.5.5/resolve?host=dns.alidns.com`
-
-简化链路：
-
-```text
-客户端
-  ↓
-cfnat
-  ↓
-百度前置节点
-  ↓
-Cloudflare IP
-```
-
-这个模式适合本机直连 Cloudflare 不稳定、但经前置节点链路更稳定的网络环境。
-
-注意：百度前置代理不是万能加速器。它的价值在于让扫描路径和实际转发路径尽量一致，减少"扫得通但转发不稳"的偏差。
-
-### 双方案监听
-
-你现在可以把直连优选和百度前置优选明确拆开，而不是再靠一个参数配单入口硬切模式。
-
-示例：
-
-```bash
--direct-listen=0.0.0.0:1234
--baidu-listen=0.0.0.0:1235
-```
-
-行为说明：
-
-- 只填 `-direct-listen`：只启动直连 Cloudflare 优选。
-- 只填 `-baidu-listen`：只启动百度前置优选。
-- 两个都填：同一个进程里同时维护两套候选池、两套监听入口。
-
-百度前置模式不再对解析出的百度 IP 做 ASN 归类筛选，而是直接对解析得到的全部百度 IP 做可用性验证，扫描通过的都可加入优选池。
-
----
-
-## 构建与发布
-
-本仓库当前只维护一个 C 入口文件：
-
-| 平台                    | 源文件               | 主要依赖                                                                                            |
-| ----------------------- | -------------------- | --------------------------------------------------------------------------------------------------- |
-| Linux / Windows | [`cfnat.c`](cfnat.c) | Linux/macOS: `pthread`、Windows: Winsock2、WinINet、`winpthread` |
-
-平台差异通过 `_WIN32` / `__APPLE__` 等条件编译处理，避免三份源码重复维护。
-
-### Linux 发布版本选择
-
-Release 同时提供两类 Linux 文件：
-
-| 类型         | 适合用户                                           | 说明                                                                |
-| ------------ | -------------------------------------------------- | ------------------------------------------------------------------- |
-| glibc 动态版 | Debian、Ubuntu、Arch、CentOS、Fedora 等常规发行版  | 默认推荐，运行时使用系统自己的 glibc，避免静态 glibc 与系统环境错位 |
-| musl 静态版  | Alpine、OpenWrt、ImmortalWrt、极简容器、小内存系统 | 完全静态，更适合轻量系统和无 glibc 环境                             |
-
-glibc fully-static 在部分发行版和新内核环境下可能出现 resolver、pthread、NSS、IPv6 或 DNS 初始化兼容问题，因此不再作为默认发布产物。需要完全静态时，请优先使用 musl 静态版。
-
-### Linux 构建
-
-glibc 动态版：
-
-```bash
-gcc -O2 -pipe -std=c11 -Wall -Wextra -Wno-unused-parameter \
-  ./cfnat.c -o ./cfnat-linux \
-  -pthread
-```
-
-musl 静态版示例：
-
-```bash
-zig cc -target x86_64-linux-musl -O2 -pipe -std=c11 \
-  -Wall -Wextra -Wno-unused-parameter \
-  ./cfnat.c -o ./cfnat-linux-amd64-musl \
-  -pthread -static -s
-```
-
-说明：
-
-- 默认推荐 glibc 动态版，适合常规 Linux 发行版。
-- 如需完全静态二进制，推荐 musl 静态版。
-- 当前源码只依赖标准 socket / 域名解析接口，不需要额外的 resolver 库。
-
-
-说明：
-
-- `_WIN32_WINNT=0x0601` 表示目标为 Windows 7 或更高版本。
-- `-finput-charset=UTF-8 -fexec-charset=UTF-8` 确保源码中的中文字符串按 UTF-8 编译，配合 `WriteConsoleW` 避免 Windows 7 控制台乱码。
-- Windows 网络层使用 Winsock2，因此需要 `-lws2_32`。
-- Windows 自动下载数据文件使用 WinINet，不再依赖 curl/wget，因此需要 `-lwininet`。
-- Windows 线程兼容层使用 MinGW-w64 `winpthread`，因此需要 `-lwinpthread`。
-
-### Windows 数据文件下载说明
-
-Windows 版不再调用外部 `curl` / `wget` 命令下载数据文件，而是使用系统 WinINet API 下载。
-
-启动时会优先查找：
-
-```text
-ips-v4.txt
-ips-v6.txt
-locations.json
-```
-
-Win7 如果系统 TLS 组件过旧，HTTPS 下载仍可能失败。这种情况下把上述三个数据文件放到 exe 同目录即可离线运行。
-
-### GitHub Actions
-
-多平台构建工作流位于：
-
-```text
-.github/workflows/build.yml
-```
-
-当前工作流已精简并升级为专供现代 64 位平台：
-
-- **Linux glibc 动态版**：`amd64`、`arm64`
-- **Linux musl 全静态独立版**：`amd64`、`arm64`（推荐软路由 / OpenWrt / Alpine）
-- **Windows 11 原生版**：`amd64`、`arm64`（Zig 交叉编译，免额外 DLL）
-- **触发与发布**：
-  - 推送 `v*` 标签自动打包创建 GitHub Release。
-  - 支持 `workflow_dispatch` 手动网页触发一键发布，支持输入自定义版本或自动从 `cfnat.c` 提取版本号，并支持重复发布时强制覆盖更新 Release 资产。
-
-发布包会把二进制文件放入 `bin/`，并附带源码、README 和基础数据文件。
-
-### 常见构建失败
-
-| 现象                                                                                             | 原因                                           | 修复                                                                 |
-| ------------------------------------------------------------------------------------------------ | ---------------------------------------------- | -------------------------------------------------------------------- |
-| 旧版 macOS 源码出现 `_res_9_query`、`_res_9_ns_initparse`、`_res_9_ns_parserr` undefined symbols | 使用了系统 resolver API 但未链接 resolver 库   | 当前源码已不再依赖这套接口；如使用旧源码才需要 `-lresolv`            |
-| 旧版 Linux 源码出现 `res_query`、`ns_initparse`、`ns_parserr` undefined reference                | 使用了 glibc resolver API 但未链接 resolver 库 | 当前源码已不再依赖这套接口；如使用旧源码才需要 `-lresolv`            |
-| Windows 出现 Winsock 相关 undefined reference                                                    | 没有链接 Winsock2                              | 加 `-lws2_32`                                                        |
-| Windows 出现 `SOCKET` 相关类型 warning                                                           | Windows `SOCKET` 与 POSIX `int fd` 不同        | 当前统一源码已使用 `socket_t` 和 `INVALID_SOCKET` 封装，避免直接比较 |
-
----
-
-## 仓库文件说明
-
-```text
-cfnat.c                          C 版统一入口，支持 Linux / macOS / Windows
-ips-v4.txt                       IPv4 数据文件
-ips-v6.txt                       IPv6 数据文件
-locations.json                   Cloudflare 数据中心位置文件
-README.md                        主说明文档
-.github/workflows/build.yml      C 版多平台构建工作流
-```
-
----
-
-## 数据文件说明
-
-源码运行时会查找以下本地文件：
-
-```text
-ips-v4.txt
-ips-v6.txt
-locations.json
-```
-
-如果文件不存在，程序会自动从上游地址下载并保存为上述文件名。
-
-离线运行时请直接把下面三个文件放在程序同目录：
-
-```text
-ips-v4.txt
-ips-v6.txt
-locations.json
-```
-
-Linux、macOS、Windows 三个平台统一使用这三个带扩展名的数据文件，避免 Windows 用户看不到文件类型或手动复制时混淆。
-
----
-
-## 日志与排错
-
-### 日志级别
-
-```text
--log=silent  不输出普通日志
--log=error   仅输出错误
--log=warn    输出警告和错误
--log=info    输出常规运行日志
--log=debug   输出调试信息
-```
-
-### 正常日志示例
-
-```text
-可用 IP: 104.18.x.x (健康检查端口:443)
-正在监听 0.0.0.0:40000，TLS目标端口：443，非TLS目标端口：80
-状态检查成功: 当前 IP 104.18.x.x 可用
-```
-
-### 自动切换日志示例
-
-```text
-状态检查失败 (1/2): 当前 IP 104.18.x.x 暂不可用
-连续两次状态检查失败，切换到下一个 IP
-切换到下一个最优 IP: 104.18.x.x 候选索引: 3
-```
-
-### 没有扫到有效 IP
-
-```text
-未发现有效IP，可尝试放宽 -delay 或提高 -log=debug 查看细节，3 秒后重试
-```
-
-监听模式下，程序不会退出，而是自动重试扫描；单次扫描模式（不带 `-listen` 参数）则直接退出，适合脚本化调用。
-
-建议按下面顺序排查：
-
-1. 开启 `-log=debug`，查看扫描统计里的连接失败、读取响应失败、缺少 `CF-RAY`、数据中心过滤数量；如果读取响应失败很高，说明 TCP 可连但 HTTP 探测未成功，不会再被直接当作有效 IP。
-2. 暂时去掉 `-colo`，确认不是数据中心过滤过严。
-3. 放宽延迟限制，例如 `-delay=300` 或更高。
-4. 日常使用保持默认 `-random=true`；只有需要完整扫描时才使用 `-random=false`。
-5. 提高扫描并发，例如 `-task=200`。
-6. 网络直连 Cloudflare 不稳定时，改用 `-baidu-listen` 单独开一个百度前置入口。
+## 构建与 GitHub Actions 发布
+
+工作流文件位于 `.github/workflows/build.yml`：
+- **自动构建产物**：
+  - `cfnat-linux-amd64` / `cfnat-linux-arm64` (glibc 动态版)
+  - `cfnat-linux-amd64-musl` / `cfnat-linux-arm64-musl` (musl 纯静态版)
+  - `cfnat-android-arm64` / `cfnat-android-amd64` (Android NDK Termux 原生版)
+  - `cfnat-windows-amd64.exe` / `cfnat-windows-arm64.exe` (Win11 纯静态版)
+- **触发与发布方式**：
+  - **推送 Tag 发布**：推送形如 `v0.0.15` 的标签时自动触发编译并发布到 Release。
+  - **手动网页触发发布**：在 GitHub Actions 页面点击 **Run workflow**，支持输入版本号或自动从 `cfnat.c` 提取版本号，支持重复发布时强制覆盖更新 Release 资源。
 
 ---
 
 ## 资源占用说明
 
-C 版的核心价值是降低常驻资源占用。
-
-相较于 Go 版，C 版没有 Go 运行时、GC 和 goroutine 调度器的额外常驻成本，并在实现上做了更保守的资源控制：
-
-- 双向转发缓冲区固定为 `16 KB`。
-- 每个转发方向使用固定缓冲区。
-- 连接线程使用较小栈空间。
-- 候选结果只保留必要字段。
-- 使用原生 `pthread` / Winsock / BSD socket。
-- 健康检查逻辑固定频率执行，不引入复杂后台状态机。
-- CIDR 惰性展开（前缀和 + 二分查找）：只存 CIDR 范围，按需生成 IP，KB 级内存即可处理百万级 IP 段。
-- 连接级 IP 选择缓存（cache_valid）减少连接建立时的重复健康检查，降低瞬时 CPU 开销。
-- EventLoop 抽象层使用原生 epoll/kqueue，select 回退，提升高并发下的 I/O 效率。
-- EWMA 评分算法：平滑延迟波动，避免单次毛刺导致链路切换，提升稳定性。
-- 代理节点选择缓存（5 秒）：高频选择场景下 O(1) 命中，降低 CPU 开销。
-- 渐进式三级健康检查：LIGHT 级别仅做 TCP 探测，减少健康检查对转发性能的影响。
-
-更适合：
-
-- OpenWrt / ImmortalWrt 路由器。
-- 小内存 VPS。
-- ARM 小板机。
-- 需要长期驻留的网络中转环境。
-- 连接数波动较大但希望内存可控的场景。
-
-Go 版仍然适合快速开发、维护和功能扩展；C 版更适合资源受限和长期常驻。
+C 版的核心价值是降低常驻资源占用。相较于 Go 版，C 版没有 Go 运行时、GC 和 goroutine 调度器的额外常驻成本：
+- 双向转发缓冲区固定为 `16 KB`，降低常驻内存。
+- 连接线程栈精简为 64 KB。
+- 候选结果只保留必要字段，CIDR 惰性展开，KB 级内存即可处理百万级 IP 段。
+- 连接级 IP 选择缓存（cache_valid）结合原子原语，避免连接建立时的高频加锁与健康检查。
+- EventLoop 使用原生 epoll，select 回退，兼顾极简与并发效率。
 
 ---
 
 ## 常见问题
 
-### 1. 为什么只监听一个端口，却能同时处理 TLS 和非 TLS？
+### 1. 为什么只监听一个端口，却能同时处理 TLS 和 HTTP？
+程序读取客户端连接的首字节：首字节为 `0x16` 时判定为 TLS 握手，自动转发到 `-port`（443）；其他数据判定为 HTTP/非 TLS，自动转发到 `-http-port`（80）。
 
-程序读取客户端连接的首字节：
+### 2. 运行时提示找不到数据文件？
+程序启动时会查找同目录下的 `ips-v4.txt`、`ips-v6.txt` 和 `locations.json`。如文件不存在，程序会自动尝试联网下载；离线环境下请确保将这三个文件置于同级目录下。
 
-```text
-0x16 → TLS
-其他 → 非 TLS / HTTP
-```
-
-然后分别转发到 `-port` 和 `-http-port`。
-
-### 2. `-choose` 参数去哪了？
-
-当前三平台固定使用综合评分最低的候选 IP，不再暴露 `-choose` 参数。
-
-这样可以减少参数复杂度，也避免三平台行为不一致。
-
-### 3. 百度前置代理一定更快吗？
-
-不一定。
-
-它主要解决的是部分网络环境下直连 Cloudflare 不稳定的问题。是否更快取决于本机、前置节点、Cloudflare IP 三者之间的实际链路。
-
-### 4. 什么时候需要同时开启直连优选和百度前置优选？
-
-当你希望把两种链路彻底分开给用户选，或者想在同一台机器上同时保留“直连 Cloudflare 优选”和“百度前置优选”两个入口时，就有必要。
-
-如果你只需要其中一种方案，只填对应的 `-direct-listen` 或 `-baidu-listen` 即可。
-
-### 5. C 版是不是功能一定比 Go 版强？
-
-不是。
-
-C 版的优势是低内存和更可控的运行时开销。Go 版在开发效率、可维护性和扩展速度上仍然更有优势。
-
-### 6. 为什么编译能过，但运行时提示找不到 IP 文件？
-
-C 源码运行时默认查找 `ips-v4.txt`、`ips-v6.txt` 和 `locations.json`。
-
-请确认程序同目录下存在 `ips-v4.txt`、`ips-v6.txt`、`locations.json`，或允许程序联网自动下载。
+### 3. Android Termux 下出现 `Permission denied`？
+- 确保没有使用 `-bind-if`（普通非 root 应用无权绑定网卡设备）；
+- 确保本地监听端口大于 1024（如 40000），避免特权端口绑定受阻。
 
 ---
 
 ## 免责声明
 
-本工具仅用于网络测试与学习用途。
-
-请在合法、合规的网络环境下使用。使用者需要自行承担因错误配置、滥用或违反当地法律法规造成的后果。
+本工具仅用于网络测试与学习用途。请在合法、合规的网络环境下使用，使用者自行承担因配置或使用造成的后果。
