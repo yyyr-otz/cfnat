@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.1"
+#define CFNAT_VERSION "0.0.14"
 
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
@@ -3014,7 +3014,7 @@ static ssize_t recv_timeout(socket_t fd, void *buf, size_t len, int timeout_ms) 
     return recv(fd, buf, len, 0);
 }
 
-#ifdef __linux__
+#if defined(__linux__) && !defined(__ANDROID__)
 /* P1-4: Linux 零拷贝转发，使用 splice() 避免用户态内存拷贝 */
 static void *pipe_worker_fallback(PipeCtx *pc) {
     char buf[COPY_BUF_SIZE];
