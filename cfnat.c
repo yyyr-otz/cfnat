@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.1"
+#define CFNAT_VERSION "0.0.2"
 
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
@@ -209,6 +209,7 @@ typedef struct {
     atomic_size_t header_fail;
     atomic_size_t cfray_miss;
     atomic_size_t colo_skip;
+    atomic_size_t http_code_mismatch;
     long scan_start_ms;
     ResultList *results;
     Config *cfg;
@@ -1792,6 +1793,19 @@ static int extract_cfray(const char *headers, char *colo, size_t sz) {
     return colo[0] ? 0 : -1;
 }
 
+static int extract_http_status_code(const char *headers) {
+    if (!headers) return 0;
+    const char *p = strstr(headers, "HTTP/");
+    if (!p) return 0;
+    p = strchr(p, ' ');
+    if (!p) return 0;
+    while (*p == ' ') p++;
+    if (*p >= '0' && *p <= '9') {
+        return atoi(p);
+    }
+    return 0;
+}
+
 static int str_eq_ci(const char *a, const char *b) {
     return a && b && strcasecmp(a, b) == 0;
 }
@@ -2624,6 +2638,53 @@ static void *scan_worker(void *arg) {
         }
         if (success_count <= 0 || !best_colo[0] || best_latency <= 0) continue;
 
+        /* 测试延迟获得可连通 IP 后，对候选 IP 测试目标 HTTP 状态码（默认 200） */
+        int target_code = ctx->cfg->code > 0 ? ctx->cfg->code : 200;
+        int check_port = ctx->cfg->http_port > 0 ? ctx->cfg->http_port : 80;
+        char req_domain[MAX_DOMAIN_LEN];
+        char req_path[MAX_PATH_LEN];
+        req_domain[0] = '\0';
+        req_path[0] = '\0';
+        const char *dom_slash = strchr(ctx->cfg->domain, '/');
+        if (dom_slash) {
+            size_t dlen = (size_t)(dom_slash - ctx->cfg->domain);
+            if (dlen >= sizeof(req_domain)) dlen = sizeof(req_domain) - 1;
+            memcpy(req_domain, ctx->cfg->domain, dlen);
+            req_domain[dlen] = '\0';
+            snprintf(req_path, sizeof(req_path), "%s", dom_slash);
+        } else {
+            snprintf(req_domain, sizeof(req_domain), "%s", ctx->cfg->domain[0] ? ctx->cfg->domain : "cloudflaremirrors.com");
+            snprintf(req_path, sizeof(req_path), "/");
+        }
+        if (!req_domain[0]) snprintf(req_domain, sizeof(req_domain), "cloudflaremirrors.com");
+        if (!req_path[0]) snprintf(req_path, sizeof(req_path), "/");
+
+        socket_t check_fd = dial_target_with_proxy(ip, check_port, ctx->cfg->delay_ms, ctx->proxy_pool, NULL);
+        if (cfnat_socket_invalid(check_fd)) {
+            debug_msg("IP %s 状态码二次校验失败: 无法连接端口 %d", ip, check_port);
+            atomic_fetch_add(&ctx->http_code_mismatch, 1);
+            continue;
+        }
+        char check_req[1024];
+        snprintf(check_req, sizeof(check_req),
+                 "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n",
+                 req_path, req_domain);
+        send(check_fd, check_req, strlen(check_req), 0);
+        char check_hdr[4096];
+        int chk_n = recv_headers_ev(check_fd, check_hdr, sizeof(check_hdr), ctx->cfg->delay_ms > 2000 ? ctx->cfg->delay_ms : 2000, &el);
+        close(check_fd);
+        if (chk_n <= 0) {
+            debug_msg("IP %s 状态码二次校验失败: 读取响应头超时或失败", ip);
+            atomic_fetch_add(&ctx->http_code_mismatch, 1);
+            continue;
+        }
+        int resp_code = extract_http_status_code(check_hdr);
+        if (resp_code != target_code) {
+            debug_msg("IP %s 状态码二次校验不匹配: 期望 %d，实际返回 %d", ip, target_code, resp_code);
+            atomic_fetch_add(&ctx->http_code_mismatch, 1);
+            continue;
+        }
+
         Result r;
         memset(&r, 0, sizeof(r));
         snprintf(r.ip, sizeof(r.ip), "%s", ip);
@@ -2907,6 +2968,7 @@ static ResultList scan_ips(StringList *ips, CidrList *cidrs, Config *cfg, BaiduP
     atomic_init(&ctx.header_fail, 0);
     atomic_init(&ctx.cfray_miss, 0);
     atomic_init(&ctx.colo_skip, 0);
+    atomic_init(&ctx.http_code_mismatch, 0);
     log_msg("开始扫描候选 IP: %llu 个，线程: %d，单 IP 探测次数: %d，超时: %d ms",
             (unsigned long long)total_ips, threads, cfg->num > 0 ? cfg->num : 1, cfg->delay_ms);
     int created = 0;
@@ -2921,11 +2983,12 @@ static ResultList scan_ips(StringList *ips, CidrList *cidrs, Config *cfg, BaiduP
     if (rl.len > (size_t)cfg->ipnum) rl.len = (size_t)cfg->ipnum;
     log_msg("扫描完成: 有效候选 %zu 个，耗时 %ld 秒", rl.len, (now_ms() - ctx.scan_start_ms) / 1000);
     if (rl.len == 0 || cfg->log_level >= LOG_DEBUG) {
-        log_msg("扫描统计: 连接失败 %zu，读取响应失败 %zu，缺少 CF-RAY %zu，数据中心过滤 %zu",
+        log_msg("扫描统计: 连接失败 %zu，读取响应失败 %zu，缺少 CF-RAY %zu，数据中心过滤 %zu，状态码不匹配 %zu",
                 atomic_load(&ctx.connect_fail),
                 atomic_load(&ctx.header_fail),
                 atomic_load(&ctx.cfray_miss),
-                atomic_load(&ctx.colo_skip));
+                atomic_load(&ctx.colo_skip),
+                atomic_load(&ctx.http_code_mismatch));
         if (rl.len == 0 && atomic_load(&ctx.cfray_miss) > 0 && cfg->colo[0]) {
             warn_msg("已连接到部分 IP，但响应中没有 CF-RAY 或不匹配 -colo；可先去掉 -colo 验证网络链路");
         }
