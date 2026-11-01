@@ -75,6 +75,7 @@ static int cfnat_socket_invalid(socket_t s) { return s < 0; }
 #define MAX_ADDR_LEN 128
 #define MAX_NAME_LEN 64
 #define MAX_DOMAIN_LEN 256
+#define MAX_PATH_LEN 256
 #define MAX_RESOLVER_LEN 64
 #define MAX_RESOLVER_SPEC_LEN 256
 
