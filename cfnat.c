@@ -3108,6 +3108,120 @@ static const char *candidate_cache_file(const char *mode) {
     return candidate_cache_file_for_profile(mode, g_cfg.ips_type);
 }
 
+/* 将 IP 转换为环境网段 CIDR (IPv4 -> /24, IPv6 -> /48) */
+static int ip_to_env_cidr(const char *ip, char *out, size_t out_sz) {
+    if (!ip || !*ip || !out || out_sz == 0) return 0;
+    out[0] = '\0';
+    if (strchr(ip, ':')) {
+        // IPv6 -> /48
+        struct in6_addr in6;
+        if (inet_pton(AF_INET6, ip, &in6) != 1) return 0;
+        // 提取前 48 位 (前 3 组 16 进制数)
+        uint16_t w0 = (uint16_t)((in6.s6_addr[0] << 8) | in6.s6_addr[1]);
+        uint16_t w1 = (uint16_t)((in6.s6_addr[2] << 8) | in6.s6_addr[3]);
+        uint16_t w2 = (uint16_t)((in6.s6_addr[4] << 8) | in6.s6_addr[5]);
+        snprintf(out, out_sz, "%x:%x:%x::/48", w0, w1, w2);
+        return 1;
+    } else {
+        // IPv4 -> /24
+        struct in_addr in4;
+        if (inet_pton(AF_INET, ip, &in4) != 1) return 0;
+        uint32_t addr = ntohl(in4.s_addr);
+        uint32_t a = (addr >> 24) & 0xFF;
+        uint32_t b = (addr >> 16) & 0xFF;
+        uint32_t c = (addr >> 8) & 0xFF;
+        snprintf(out, out_sz, "%u.%u.%u.0/24", a, b, c);
+        return 1;
+    }
+}
+
+static int cmp_str_lines(const void *a, const void *b) {
+    const char *sa = *(const char **)a;
+    const char *sb = *(const char **)b;
+    return strcmp(sa, sb);
+}
+
+/* 将扫描出的有效 IP 聚合为网段并按整行去重、排序追加/更新至 ips-v4-env.txt 或 ips-v6-env.txt */
+static void save_env_cidr_records(int ips_type, const Result *items, size_t len) {
+    if (!items || len == 0) return;
+    const char *env_file = (ips_type == 6) ? "ips-v6-env.txt" : "ips-v4-env.txt";
+
+    // 收集已有行
+    char **lines = NULL;
+    size_t line_count = 0;
+    size_t line_cap = 0;
+
+    FILE *fp = fopen(env_file, "r");
+    if (fp) {
+        char buf[256];
+        while (fgets(buf, sizeof(buf), fp)) {
+            trim_string(buf);
+            if (!buf[0] || buf[0] == '#') continue;
+            if (line_count >= line_cap) {
+                line_cap = line_cap ? line_cap * 2 : 64;
+                char **nlines = realloc(lines, line_cap * sizeof(char *));
+                if (!nlines) break;
+                lines = nlines;
+            }
+            lines[line_count++] = strdup(buf);
+        }
+        fclose(fp);
+    }
+
+    // 将本次扫描结果转换为 "网段,colo" 格式并放入列表
+    for (size_t i = 0; i < len; i++) {
+        const Result *r = &items[i];
+        if (!r->ip[0]) continue;
+        char cidr[128];
+        if (!ip_to_env_cidr(r->ip, cidr, sizeof(cidr))) continue;
+        const char *colo = r->data_center[0] ? r->data_center : "UNK";
+        char entry[256];
+        snprintf(entry, sizeof(entry), "%s,%s", cidr, colo);
+
+        if (line_count >= line_cap) {
+            line_cap = line_cap ? line_cap * 2 : 64;
+            char **nlines = realloc(lines, line_cap * sizeof(char *));
+            if (!nlines) break;
+            lines = nlines;
+        }
+        lines[line_count++] = strdup(entry);
+    }
+
+    if (line_count == 0) {
+        free(lines);
+        return;
+    }
+
+    // 排序
+    qsort(lines, line_count, sizeof(char *), cmp_str_lines);
+
+    // 整行去重并写回文件
+    fp = fopen(env_file, "w");
+    if (!fp) {
+        warn_msg("写入环境资产文件 %s 失败", env_file);
+        for (size_t i = 0; i < line_count; i++) free(lines[i]);
+        free(lines);
+        return;
+    }
+
+    size_t unique_count = 0;
+    const char *last = NULL;
+    for (size_t i = 0; i < line_count; i++) {
+        if (last && strcmp(last, lines[i]) == 0) {
+            continue; // 重复行跳过
+        }
+        fprintf(fp, "%s\n", lines[i]);
+        last = lines[i];
+        unique_count++;
+    }
+    fclose(fp);
+
+    log_msg("已更新环境优选网段资产库: %s (共 %zu 条有效记录)", env_file, unique_count);
+
+    for (size_t i = 0; i < line_count; i++) free(lines[i]);
+    free(lines);
+}
+
 static void save_candidate_cache(const char *path, const Result *items, size_t len) {
     if (!path || !items || len == 0) return;
     FILE *fp = fopen(path, "wb");
@@ -3973,6 +4087,8 @@ static int carrier_rescan_and_select_ip(CarrierRuntime *rt, const char *ipfile) 
         rt->candidates.len = results.len;
         pthread_mutex_unlock(&rt->candidates.mu);
         log_msg("%s 重新扫描得到 %zu 个候选 IP", carrier_display_name(rt->spec.mode), rt->candidates.len);
+        save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), results.items, results.len);
+        save_env_cidr_records(rt->spec.prof.ips_type, results.items, results.len);
         if (carrier_select_valid_ip(rt)) return 1;
         pthread_mutex_lock(&rt->candidates.mu);
         free(results.items);
@@ -4475,6 +4591,7 @@ int main(int argc, char **argv) {
             rt->candidates.len = carrier_results.len;
             // 扫描完成后保存缓存，供下次启动加速
             save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), carrier_results.items, carrier_results.len);
+            save_env_cidr_records(rt->spec.prof.ips_type, carrier_results.items, carrier_results.len);
             if (!carrier_select_valid_ip(rt)) {
                 warn_msg("%s 候选 IP 健康检查全部失败", carrier_display_name(rt->spec.mode));
                 free(rt->candidates.items);
@@ -4566,6 +4683,7 @@ int main(int argc, char **argv) {
         results = scan_ips(&ips, NULL, &g_cfg, NULL);
         if (results.len > 0) {
             save_candidate_cache(candidate_cache_file("direct"), results.items, results.len);
+            save_env_cidr_records(g_cfg.ips_type, results.items, results.len);
         }
     }
     strlist_free(&ips);
