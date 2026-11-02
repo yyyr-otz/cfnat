@@ -1592,6 +1592,7 @@ static int colo_rule_allowed(const char *rule, const char *colo) {
     return has_include ? matched_include : 1;
 }
 
+static int colo_allowed(const char *colo) __attribute__((unused));
 static int colo_allowed(const char *colo) {
     return colo_rule_allowed(g_cfg.colo, colo);
 }
@@ -3155,7 +3156,7 @@ static void save_env_cidr_records(int ips_type, const Result *items, size_t len)
     if (fp) {
         char buf[256];
         while (fgets(buf, sizeof(buf), fp)) {
-            trim_string(buf);
+            trim_line(buf);
             if (!buf[0] || buf[0] == '#') continue;
             if (line_count >= line_cap) {
                 line_cap = line_cap ? line_cap * 2 : 64;
@@ -4414,6 +4415,13 @@ int main(int argc, char **argv) {
         log_msg("解析监听模式失败");
         free(g_locations);
         return 1;
+    }
+
+    // 确保 locations.json 已经加载
+    if (!g_locations || g_location_count == 0) {
+        log_msg("正在加载 locations.json");
+        load_locations();
+        log_msg("locations 加载完成: %zu 条", g_location_count);
     }
 
     /* 检查并下载所需 IP 库文件 */
