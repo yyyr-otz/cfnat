@@ -69,7 +69,10 @@ cfnat C 版做三件事：
 ## 核心特性
 
 - **渐进式三级健康检查**（FULL → MEDIUM → LIGHT）：新节点 FULL 探测建立基线，连续成功即逐级降级，任意失败立即升级至 FULL，以最小开销保障候选池质量。
+- **初筛 HTTP 200 深度状态校验**：延迟初筛后对可通 IP 执行完整的 HTTP 响应码（默认 200）验证，根除 Cloudflare IPv6 Anycast 伪通及 Error 1034（Edge IP Restricted）毒丸节点。
 - **单端口同时承接 TLS 与非 TLS / HTTP 流量**：客户端只需连接一个本地端口，程序根据首字节（`0x16`）自动分流到 443 或 80 目标端口。
+- **灵活的数据中心筛选与反选**：支持正选白名单，支持 `-HKG`、`^HKG`、`!HKG` 排除语法，并提供专用的 `-exclude-colo` 参数。
+- **启动自动打印全量生效配置**：启动瞬间以 INFO 级别详尽列出所有运行参数（包含隐藏的缺省默认值），便于排查。
 - **EWMA 综合评分选优**：候选 IP 按 EWMA 平滑延迟（α=0.125）、丢包率、抖动和连续失败次数综合打分，始终使用当前 score 最低的最优 IP。
 - **SNI 感知 IP 选择**：读取客户端 TLS ClientHello 中的 SNI，为不同域名选择独立的最优 IP；连接失败时自动回退。
 - **候选缓存与快速启动**：默认启用缓存，二次启动时先对缓存 IP 做快速健康检查，命中后立即监听，秒级恢复。
@@ -133,41 +136,83 @@ zig cc -target x86_64-windows-gnu -O2 -pipe -std=c11 -D_WIN32_WINNT=0x0A00 \
 
 ## 运行参数
 
+### 1. 监听模式参数（用于开启本地端口转发）
+
 | 参数 | 说明 | 默认值 |
 | :--- | :--- | :--- |
-| `-ipfile` | 自定义 IPv4 数据文件路径 | `ips-v4.txt` |
-| `-ipfile6` | 自定义 IPv6 数据文件路径 | `ips-v6.txt` |
-| `-location` | 自定义位置数据文件路径 | `locations.json` |
-| `-colo` | 匹配特定数据中心，多个用逗号隔开 (如 `HKG,SJC`) | 留空全部匹配 |
-| `-delay` | 有效延迟上限（毫秒） | `300` |
-| `-task` | 扫描并发线程数 | `200` |
-| `-ipnum` | 保留的最优候选 IP 数量 | `20` |
-| `-port` | TLS 转发目标端口 | `443` |
-| `-http-port` | 非 TLS 转发目标端口 | `80` |
-| `-direct-listen` | 开启直连优选本地监听地址 (如 `0.0.0.0:40000`) | 留空不开启 |
-| `-baidu-listen` | 开启百度前置优选本地监听地址 (如 `0.0.0.0:40001`) | 留空不开启 |
-| `-mixed-listen` | 开启混合模式监听地址 (先直连，失败自动切百度) | 留空不开启 |
+| `-v4-listen[=addr]` | 开启 IPv4 转发本地监听（不带参数时默认 `0.0.0.0:4443`；若全部未指定，则默认开启此项） | 缺省未显式指定时默认 `0.0.0.0:4443` |
+| `-v6-listen[=addr]` | 开启 IPv6 转发本地监听（不带参数时默认 `0.0.0.0:6443`） | 留空不开启 |
+| `-baidu-listen[=addr]` | 开启百度前置优选本地监听（不带参数时默认 `0.0.0.0:5444`） | 留空不开启 |
+| `-direct-listen[=addr]` | 兼容旧版参数：按 `-ips` 指定类型开启直连监听 | 留空不开启 |
+
+> [!TIP]
+> - 支持同时指定任意多个监听参数（例如 `-v4-listen -v6-listen`），即可**单进程同时开启 IPv4 与 IPv6 双转发**，彻底告别多开两个程序的繁琐配置！
+> - 若 `-v4-listen`、`-v6-listen`、`-baidu-listen`、`-direct-listen` 均未指定，程序默认自动开启 IPv4 监听 `0.0.0.0:4443`。
+
+### 2. 通用参数与协议级前缀参数
+
+所有常规参数均支持**全局通用**与**分流独立配置**：
+- **不带前缀的参数**（如 `-delay=200`、`-task=300`、`-port=443`）作为基准默认配置，自动被所有实例继承；
+- **带有 `-v4-` 或 `-v6-` 前缀的参数**（如 `-v6-code=200`、`-v4-delay=150`）仅对对应实例生效，享有最高优先级覆盖基准；
+- 未开启的转发实例会自动忽略对应的专属前缀参数。
+
+| 参数（通用 / v4专属 / v6专属） | 说明 | 默认值 |
+| :--- | :--- | :--- |
+| `-ips` | 全局指定 IP 类型：`4` (IPv4) 或 `6` (IPv6) | `4` |
+| `-colo` / `-v4-colo` / `-v6-colo` | 匹配特定数据中心，支持反选 (前缀 `-` / `^` / `!`)，如 `HKG,SJC` 或 `-HKG,-SJC` | 留空全部匹配 |
+| `-exclude-colo` / `-v4-exclude-colo` / `-v6-exclude-colo` | 显式排除的数据中心列表，如 `HKG,SJC`（支持与 `-colo` 自动合并） | 留空不排除 |
+| `-domain` / `-v4-domain` / `-v6-domain` | 探测目标路径与 Host（用于状态码检测） | `cloudflaremirrors.com/debian` |
+| `-code` / `-v4-code` / `-v6-code` | 期望的有效 HTTP 状态响应码。<br>**缺省/为 0 时：仅测连通性与延迟，跳过 HTTP 响应码检验（极大提速）；**<br>**显式指定（如 `-code=200` 或 `-v6-code=200`）时：测得延迟后进一步校验 HTTP 状态码（杜绝 IPv6 Error 1034 限制）。** | `0` (仅测连通性) |
+| `-delay` / `-v4-delay` / `-v6-delay` | 有效延迟上限（毫秒） | `300` |
+| `-task` / `-v4-task` / `-v6-task` | 扫描并发线程数 | `200` |
+| `-ipnum` / `-v4-ipnum` / `-v6-ipnum` | 保留的最优候选 IP 数量 | `20` |
+| `-num` / `-v4-num` / `-v6-num` | 单 IP 探测尝试次数 | `5` |
+| `-port` / `-v4-port` / `-v6-port` | 上游 TLS 转发目标端口（注意区分本地监听与目标端口） | `443` |
+| `-http-port` / `-v4-http-port` / `-v6-http-port` | 上游非 TLS 转发目标端口 | `80` |
+| `-random` / `-v4-random` / `-v6-random` | 是否按 CIDR 随机抽样生成候选 IP | `true` |
+| `-baidu-resolver` | 针对 Fake-IP 的百度解析方式: `auto` / `udp://` / `doh://` | `auto` |
+| `-bind-if` | 绑定出站物理网卡 (如 `eth0`、`en0`) | 留空使用默认路由 |
+| `-health-log` | 定时输出健康检查日志的间隔秒数 | `60` |
 | `-log` | 日志级别：`silent` / `error` / `warn` / `info` / `debug` | `info` |
-| `-cache` | 是否启用快速启动缓存 | `true` |
-| `-health-check` | 健康检查时间间隔（秒，0 表示禁用） | `60` |
 
 ---
 
 ## 常用示例
 
-### 1. 仅测速扫描（不监听）
+### 1. 经典双栈双转发（单进程同时监听 IPv4 与 IPv6）
+```bash
+# 同时开启 IPv4（本地 4443）与 IPv6（本地 6443），IPv6 指定检测 HTTP 200 排除 1034，IPv4 追求极速仅测延迟
+./cfnat -v4-listen -v6-listen -v6-code=200 -task=300 -exclude-colo=HKG
+```
+
+### 2. 自定义本地监听地址与目标端口
+```bash
+# IPv4 监听 127.0.0.1:1080，IPv6 监听 0.0.0.0:2080，上游 TLS 端口为 8443
+./cfnat -v4-listen=127.0.0.1:1080 -v6-listen=2080 -port=8443
+```
+
+### 3. 仅测速扫描（不监听）
 ```bash
 ./cfnat -colo=HKG -delay=150 -ipnum=10
 ```
 
-### 2. 双方案同时监听（直连 + 百度前置）
+### 4. 排除特定数据中心（反选模式，如排除 HKG）
 ```bash
-./cfnat -direct-listen=0.0.0.0:40000 -baidu-listen=0.0.0.0:40001 -colo=HKG
+# 方式 A：直接在 -colo 参数中使用减号前缀
+./cfnat -v6-listen -colo=-HKG
+
+# 方式 B：使用专用的 -exclude-colo 参数（脚本/HTML/VBS 环境下最安全）
+./cfnat -v6-listen -exclude-colo=HKG,SJC
 ```
 
-### 3. 混合优选模式（稳定优先）
+### 5. 直连与百度前置同时监听
 ```bash
-./cfnat -mixed-listen=0.0.0.0:40000 -colo=HKG
+./cfnat -v4-listen=40000 -baidu-listen=40001 -colo=HKG
+```
+
+### 6. 配合 Xray / Sing-box 出站优选
+```bash
+./cfnat -v6-listen=443 -port=443 -http-port=80 -v6-code=200 -task=300 -exclude-colo=HKG
 ```
 
 ---
