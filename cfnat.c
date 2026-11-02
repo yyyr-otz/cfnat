@@ -975,6 +975,32 @@ static void parse_args(Config *c, int argc, char **argv) {
     if (c->baidu_listen[0]) c->use_baidu_proxy = 1;
 }
 
+static void log_current_config(const Config *c) {
+    log_msg("当前运行配置 (含缺省默认值):");
+    log_msg("  IP协议版本 (-ips): IPv%d", c->ips_type);
+    log_msg("  TLS转发端口 (-port): %d", c->port);
+    log_msg("  HTTP转发端口 (-http-port): %d", c->http_port);
+    log_msg("  并发扫描线程 (-task): %d", c->task);
+    log_msg("  最大有效延迟 (-delay): %d ms", c->delay_ms);
+    log_msg("  候选IP提取数 (-ipnum): %d", c->ipnum);
+    log_msg("  单IP探测次数 (-num): %d", c->num);
+    log_msg("  随机生成IP (-random): %s", c->random_mode ? "true" : "false");
+    log_msg("  状态码检查域名 (-domain): %s", c->domain);
+    log_msg("  期望响应状态码 (-code): %d", c->code);
+    log_msg("  数据中心筛选 (-colo): %s", c->colo[0] ? c->colo : "(不限)");
+    log_msg("  直连监听地址 (-direct-listen): %s", c->direct_listen[0] ? c->direct_listen : "(未启用)");
+    log_msg("  百度前置监听 (-baidu-listen): %s", c->baidu_listen[0] ? c->baidu_listen : "(未启用)");
+    if (c->baidu_listen[0] || c->use_baidu_proxy) {
+        log_msg("  百度域名解析器 (-baidu-resolver): %s", c->baidu_resolver);
+        log_msg("  百度前置目标域名: %s", c->baidu_domain);
+        log_msg("  百度前置端口 (-baidu-port): %d", c->baidu_port);
+        log_msg("  百度候选节点数 (-baidu-ipnum): %d", c->baidu_ipnum);
+    }
+    log_msg("  出站绑定物理网卡 (-bind-if): %s", c->bind_if[0] ? c->bind_if : "(系统默认路由)");
+    log_msg("  健康检查日志间隔 (-health-log): %d 秒", c->health_log);
+    log_msg("  日志级别 (-log): %s", c->log_name);
+}
+
 static int file_exists(const char *path) {
     struct stat st;
     return stat(path, &st) == 0 && S_ISREG(st.st_mode);
@@ -3969,6 +3995,7 @@ int main(int argc, char **argv) {
     }
 #endif
     parse_args(&g_cfg, argc, argv);
+    log_current_config(&g_cfg);
     if (validate_bind_interface(&g_cfg) != 0) {
 #ifdef _WIN32
         WSACleanup();
