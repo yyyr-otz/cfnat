@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.2"
+#define CFNAT_VERSION "0.0.3"
 
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
@@ -148,7 +148,7 @@ typedef enum {
 } LogLevel;
 
 typedef struct {
-    char colo[128], domain[256], log_name[16];
+    char colo[256], domain[256], log_name[16];
     char baidu_domain[MAX_DOMAIN_LEN], baidu_scan_target[MAX_ADDR_LEN];
     char direct_listen[MAX_ADDR_LEN], baidu_listen[MAX_ADDR_LEN];
     char bind_if[MAX_NAME_LEN], baidu_resolver[MAX_RESOLVER_SPEC_LEN];
@@ -858,7 +858,8 @@ static void usage(const char *p) {
     printf("  -baidu-resolver=value     Fake-IP 时百度域名解析器: auto | udp://IP | doh://IP/path?host=HOST\n");
     printf("                              例如 doh://223.5.5.5/resolve?host=dns.alidns.com\n");
     printf("                              或 doh://1.1.1.1/dns-query?host=cloudflare-dns.com\n");
-    printf("  -colo=value               筛选数据中心例如 HKG,SJC,LAX\n");
+    printf("  -colo=value               筛选数据中心，支持反选 (前缀 -, ^, !)，例如 HKG,SJC 或 -HKG,-SJC\n");
+    printf("  -exclude-colo=value       排除的数据中心，例如 HKG,SJC\n");
     printf("  -delay=value              有效延迟毫秒 (default 300)\n");
     printf("  -ipnum=value              提取的有效IP数量 (default 20)\n");
     printf("  -ips=value                指定IPv4还是IPv6 (4或6, C版优先IPv4)\n");
@@ -899,6 +900,7 @@ static void cfg_defaults(Config *c) {
 
 static void parse_args(Config *c, int argc, char **argv) {
     cfg_defaults(c);
+    char exclude_colo_buf[256] = {0};
     for (int i = 1; i < argc; i++) {
         char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -924,6 +926,10 @@ static void parse_args(Config *c, int argc, char **argv) {
         else if (!strcmp(key, "bind-if") && val) snprintf(c->bind_if, sizeof(c->bind_if), "%s", val);
         else if (!strcmp(key, "code") && val) c->code = atoi(val);
         else if (!strcmp(key, "colo") && val) snprintf(c->colo, sizeof(c->colo), "%s", val);
+        else if ((!strcmp(key, "exclude-colo") || !strcmp(key, "ex-colo")) && val) {
+            if (exclude_colo_buf[0]) snprintf(exclude_colo_buf + strlen(exclude_colo_buf), sizeof(exclude_colo_buf) - strlen(exclude_colo_buf), ",%s", val);
+            else snprintf(exclude_colo_buf, sizeof(exclude_colo_buf), "%s", val);
+        }
         else if (!strcmp(key, "delay") && val) c->delay_ms = atoi(val);
         else if (!strcmp(key, "domain") && val) snprintf(c->domain, sizeof(c->domain), "%s", val);
         else if (!strcmp(key, "ipnum") && val) c->ipnum = atoi(val);
@@ -940,6 +946,25 @@ static void parse_args(Config *c, int argc, char **argv) {
         else if (!strcmp(key, "random")) c->random_mode = parse_bool(val);
         else if (!strcmp(key, "task") && val) c->task = atoi(val);
         else if (!strcmp(key, "health-log") && val) c->health_log = atoi(val);
+    }
+    /* 统一解释并拼接 -exclude-colo 到 c->colo 中 */
+    if (exclude_colo_buf[0]) {
+        char tmp_ex[sizeof(exclude_colo_buf)];
+        snprintf(tmp_ex, sizeof(tmp_ex), "%s", exclude_colo_buf);
+        char *save = NULL;
+        char *tok = strtok_r(tmp_ex, ",", &save);
+        while (tok) {
+            trim_line(tok);
+            while (*tok == '-' || *tok == '^' || *tok == '!' || *tok == ' ') tok++;
+            if (*tok) {
+                if (c->colo[0]) {
+                    snprintf(c->colo + strlen(c->colo), sizeof(c->colo) - strlen(c->colo), ",-%s", tok);
+                } else {
+                    snprintf(c->colo, sizeof(c->colo), "-%s", tok);
+                }
+            }
+            tok = strtok_r(NULL, ",", &save);
+        }
     }
     if (c->delay_ms <= 0) c->delay_ms = 300;
     if (c->ipnum <= 0) c->ipnum = 20;
@@ -1292,17 +1317,35 @@ static Location *find_location(const char *iata) {
 }
 
 static int colo_allowed(const char *colo) {
-    if (!g_cfg.colo[0]) return 1;
-    char tmp[128];
+    if (!g_cfg.colo[0] || !colo || !*colo) return 1;
+
+    char tmp[sizeof(g_cfg.colo)];
     snprintf(tmp, sizeof(tmp), "%s", g_cfg.colo);
+
+    int has_include = 0;
+    int matched_include = 0;
+
     char *save = NULL;
     char *tok = strtok_r(tmp, ",", &save);
     while (tok) {
         trim_line(tok);
-        if (!strcasecmp(tok, colo)) return 1;
+        if (*tok) {
+            if (*tok == '-' || *tok == '^' || *tok == '!') {
+                const char *ex = tok + 1;
+                while (*ex == ' ') ex++;
+                if (*ex && !strcasecmp(ex, colo)) {
+                    return 0; /* 命中排除项，直接拒绝 */
+                }
+            } else {
+                has_include = 1;
+                if (!strcasecmp(tok, colo)) {
+                    matched_include = 1;
+                }
+            }
+        }
         tok = strtok_r(NULL, ",", &save);
     }
-    return 0;
+    return has_include ? matched_include : 1;
 }
 
 static int set_nonblock(socket_t fd, int nb) {
