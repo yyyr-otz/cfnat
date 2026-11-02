@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.3"
+#define CFNAT_VERSION "0.0.4"
 
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
@@ -148,13 +148,35 @@ typedef enum {
 } LogLevel;
 
 typedef struct {
+    int enabled;
+    int ips_type;             /* 4 或 6 */
+    char name[32];            /* "v4", "v6", "baidu" */
+    char listen_addr[MAX_ADDR_LEN]; /* 本地监听地址 */
+    int port;                 /* TLS 转发目标端口 */
+    int http_port;            /* HTTP 转发目标端口 */
+    int delay_ms;             /* 延迟上限 (ms) */
+    int task;                 /* 并发扫描线程数 */
+    int ipnum;                /* 提取有效 IP 数量 */
+    int num;                  /* 单 IP 探测次数 */
+    int random_mode;          /* 是否随机抽样 */
+    int code;                 /* HTTP 期望状态码 (0 表示不检测，仅测连通性) */
+    char domain[MAX_DOMAIN_LEN]; /* 状态码检查域名/路径 */
+    char colo[256];           /* 数据中心筛选规则 (含排除) */
+    int use_baidu_proxy;      /* 0: 直连, 1: 百度前置, 2: 混合 */
+} ProfileConfig;
+
+typedef struct {
     char colo[256], domain[256], log_name[16];
     char baidu_domain[MAX_DOMAIN_LEN], baidu_scan_target[MAX_ADDR_LEN];
     char direct_listen[MAX_ADDR_LEN], baidu_listen[MAX_ADDR_LEN];
+    char v4_listen[MAX_ADDR_LEN], v6_listen[MAX_ADDR_LEN];
     char bind_if[MAX_NAME_LEN], baidu_resolver[MAX_RESOLVER_SPEC_LEN];
     int code, delay_ms, ipnum, ips_type, num, port, http_port, random_mode, task, health_log;
     int use_baidu_proxy, baidu_port, baidu_ipnum;
     LogLevel log_level;
+    ProfileConfig prof_v4;
+    ProfileConfig prof_v6;
+    ProfileConfig prof_baidu;
 } Config;
 
 typedef struct {
@@ -501,6 +523,7 @@ typedef struct {
     char mode[MAX_NAME_LEN];
     char addr[MAX_ADDR_LEN];
     int use_baidu_proxy;
+    ProfileConfig prof;
 } CarrierListenSpec;
 
 typedef struct {
@@ -853,26 +876,46 @@ static void usage(const char *p) {
     printf("Usage of %s:\n", p);
     printf("  -V, -version              显示版本号\n");
     printf("  -bind-if=value            绑定出站物理网卡，例如 macOS: en0，Linux: eth0\n");
-    printf("  -direct-listen=value      直连优选监听地址，例如 0.0.0.0:1234\n");
-    printf("  -baidu-listen=value       百度前置优选监听地址，例如 0.0.0.0:1235\n");
+    printf("  -v4-listen[=addr]         开启 IPv4 本地监听地址 (默认 0.0.0.0:4443)\n");
+    printf("  -v6-listen[=addr]         开启 IPv6 本地监听地址 (默认 0.0.0.0:6443)\n");
+    printf("  -baidu-listen[=addr]      开启百度前置本地监听地址 (默认 0.0.0.0:5444)\n");
+    printf("  -direct-listen=value      兼容旧参数: 直连优选监听地址 (默认 IPv4: 4443，指定 -ips=6 为 6443)\n");
     printf("  -baidu-resolver=value     Fake-IP 时百度域名解析器: auto | udp://IP | doh://IP/path?host=HOST\n");
-    printf("                              例如 doh://223.5.5.5/resolve?host=dns.alidns.com\n");
-    printf("                              或 doh://1.1.1.1/dns-query?host=cloudflare-dns.com\n");
-    printf("  -colo=value               筛选数据中心，支持反选 (前缀 -, ^, !)，例如 HKG,SJC 或 -HKG,-SJC\n");
-    printf("  -exclude-colo=value       排除的数据中心，例如 HKG,SJC\n");
-    printf("  -delay=value              有效延迟毫秒 (default 300)\n");
-    printf("  -ipnum=value              提取的有效IP数量 (default 20)\n");
-    printf("  -ips=value                指定IPv4还是IPv6 (4或6, C版优先IPv4)\n");
-    printf("  -log=value                日志级别: silent,error,warn,info,debug (default info)\n");
-    printf("  -num=value                每个连接的目标连接尝试次数 (default 5)\n");
+    printf("  -colo=value               数据中心筛选 (支持反选: -HKG, ^HKG, !HKG)\n");
+    printf("  -exclude-colo=value       显式排除的数据中心，例如 HKG,SJC\n");
+    printf("  -delay=value              有效延迟毫秒上限 (default 300)\n");
+    printf("  -ipnum=value              提取的有效 IP 数量 (default 20)\n");
+    printf("  -num=value                单 IP 探测尝试次数 (default 5)\n");
     printf("  -port=value               TLS 转发目标端口 (default 443)\n");
-    printf("  -http-port=value          非TLS/HTTP 转发目标端口 (default 80)\n");
-    printf("  -random=value             是否随机生成IP (default true)\n");
-    printf("  -task=value               扫描线程数 (default 200)\n");
+    printf("  -http-port=value          非 TLS/HTTP 转发目标端口 (default 80)\n");
+    printf("  -code=value               期望响应 HTTP 状态码 (默认缺省 0: 仅测连通性; 显式指定如 200 则做二次状态检测)\n");
+    printf("  -domain=value             状态码检查域名地址 (default cloudflaremirrors.com/debian)\n");
+    printf("  -random=value             是否随机生成 IP (default true)\n");
+    printf("  -task=value               并发扫描线程数 (default 200)\n");
+    printf("  -log=value                日志级别: silent,error,warn,info,debug (default info)\n");
+    printf("  注: 以上参数均支持 -v4- 或 -v6- 前缀实现精细化覆盖，如 -v6-code=200 -v4-delay=150\n");
 }
 
 static int parse_bool(const char *v) {
     return !v || strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 || strcasecmp(v, "yes") == 0 || strcasecmp(v, "on") == 0;
+}
+
+static void format_listen_endpoint(const char *in, int default_port, char *out, size_t outsz) {
+    if (!out || outsz == 0) return;
+    if (!in || !*in) {
+        snprintf(out, outsz, "0.0.0.0:%d", default_port);
+        return;
+    }
+    /* 如果输入是纯数字（端口），自动拼上 0.0.0.0: */
+    int is_all_digit = 1;
+    for (const char *p = in; *p; p++) {
+        if (!isdigit((unsigned char)*p)) { is_all_digit = 0; break; }
+    }
+    if (is_all_digit) {
+        snprintf(out, outsz, "0.0.0.0:%s", in);
+    } else {
+        snprintf(out, outsz, "%s", in);
+    }
 }
 
 static void cfg_defaults(Config *c) {
@@ -882,7 +925,7 @@ static void cfg_defaults(Config *c) {
     strcpy(c->baidu_domain, DEFAULT_BAIDU_DOMAIN);
     strcpy(c->baidu_scan_target, DEFAULT_BAIDU_SCAN_TARGET);
     strcpy(c->baidu_resolver, "auto");
-    c->code = 200;
+    c->code = 0;  /* 默认缺省 0: 仅测连通性 */
     c->delay_ms = 300;
     c->ipnum = 20;
     c->ips_type = 4;
@@ -901,6 +944,26 @@ static void cfg_defaults(Config *c) {
 static void parse_args(Config *c, int argc, char **argv) {
     cfg_defaults(c);
     char exclude_colo_buf[256] = {0};
+    char v4_exclude_colo_buf[256] = {0};
+    char v6_exclude_colo_buf[256] = {0};
+
+    /* 标记哪些专属参数被显式指定了 */
+    int has_v4_listen = 0, has_v6_listen = 0, has_baidu_listen = 0;
+    char v4_listen_val[MAX_ADDR_LEN] = {0};
+    char v6_listen_val[MAX_ADDR_LEN] = {0};
+    char baidu_listen_val[MAX_ADDR_LEN] = {0};
+
+    int v4_port = 0, v6_port = 0;
+    int v4_http_port = 0, v6_http_port = 0;
+    int v4_delay = 0, v6_delay = 0;
+    int v4_task = 0, v6_task = 0;
+    int v4_ipnum = 0, v6_ipnum = 0;
+    int v4_num = 0, v6_num = 0;
+    int v4_code = -1, v6_code = -1; /* -1 表示未指定专属 */
+    int v4_random = -1, v6_random = -1;
+    char v4_colo[256] = {0}, v6_colo[256] = {0};
+    char v4_domain[MAX_DOMAIN_LEN] = {0}, v6_domain[MAX_DOMAIN_LEN] = {0};
+
     for (int i = 1; i < argc; i++) {
         char *arg = argv[i];
         if (!strcmp(arg, "-h") || !strcmp(arg, "--help")) {
@@ -920,8 +983,51 @@ static void parse_args(Config *c, int argc, char **argv) {
             *eq = 0;
             val = eq + 1;
         } else if (i + 1 < argc && argv[i + 1][0] != '-') val = argv[++i];
-        if (!strcmp(key, "direct-listen") && val) snprintf(c->direct_listen, sizeof(c->direct_listen), "%s", val);
-        else if (!strcmp(key, "baidu-listen") && val) snprintf(c->baidu_listen, sizeof(c->baidu_listen), "%s", val);
+
+        /* 本地监听参数解析: 支持 -v4-listen, -v6-listen, -baidu-listen, -direct-listen */
+        if (!strcmp(key, "v4-listen")) {
+            has_v4_listen = 1;
+            format_listen_endpoint(val, 4443, v4_listen_val, sizeof(v4_listen_val));
+        } else if (!strcmp(key, "v6-listen")) {
+            has_v6_listen = 1;
+            format_listen_endpoint(val, 6443, v6_listen_val, sizeof(v6_listen_val));
+        } else if (!strcmp(key, "baidu-listen")) {
+            has_baidu_listen = 1;
+            format_listen_endpoint(val, 5444, baidu_listen_val, sizeof(baidu_listen_val));
+        } else if (!strcmp(key, "direct-listen") && val) {
+            snprintf(c->direct_listen, sizeof(c->direct_listen), "%s", val);
+        }
+        /* v4 专属覆盖参数 */
+        else if (!strcmp(key, "v4-port") && val) v4_port = atoi(val);
+        else if (!strcmp(key, "v4-http-port") && val) v4_http_port = atoi(val);
+        else if (!strcmp(key, "v4-delay") && val) v4_delay = atoi(val);
+        else if (!strcmp(key, "v4-task") && val) v4_task = atoi(val);
+        else if (!strcmp(key, "v4-ipnum") && val) v4_ipnum = atoi(val);
+        else if (!strcmp(key, "v4-num") && val) v4_num = atoi(val);
+        else if (!strcmp(key, "v4-code") && val) v4_code = atoi(val);
+        else if (!strcmp(key, "v4-domain") && val) snprintf(v4_domain, sizeof(v4_domain), "%s", val);
+        else if (!strcmp(key, "v4-colo") && val) snprintf(v4_colo, sizeof(v4_colo), "%s", val);
+        else if ((!strcmp(key, "v4-exclude-colo") || !strcmp(key, "v4-ex-colo")) && val) {
+            if (v4_exclude_colo_buf[0]) snprintf(v4_exclude_colo_buf + strlen(v4_exclude_colo_buf), sizeof(v4_exclude_colo_buf) - strlen(v4_exclude_colo_buf), ",%s", val);
+            else snprintf(v4_exclude_colo_buf, sizeof(v4_exclude_colo_buf), "%s", val);
+        } else if (!strcmp(key, "v4-random")) v4_random = parse_bool(val);
+
+        /* v6 专属覆盖参数 */
+        else if (!strcmp(key, "v6-port") && val) v6_port = atoi(val);
+        else if (!strcmp(key, "v6-http-port") && val) v6_http_port = atoi(val);
+        else if (!strcmp(key, "v6-delay") && val) v6_delay = atoi(val);
+        else if (!strcmp(key, "v6-task") && val) v6_task = atoi(val);
+        else if (!strcmp(key, "v6-ipnum") && val) v6_ipnum = atoi(val);
+        else if (!strcmp(key, "v6-num") && val) v6_num = atoi(val);
+        else if (!strcmp(key, "v6-code") && val) v6_code = atoi(val);
+        else if (!strcmp(key, "v6-domain") && val) snprintf(v6_domain, sizeof(v6_domain), "%s", val);
+        else if (!strcmp(key, "v6-colo") && val) snprintf(v6_colo, sizeof(v6_colo), "%s", val);
+        else if ((!strcmp(key, "v6-exclude-colo") || !strcmp(key, "v6-ex-colo")) && val) {
+            if (v6_exclude_colo_buf[0]) snprintf(v6_exclude_colo_buf + strlen(v6_exclude_colo_buf), sizeof(v6_exclude_colo_buf) - strlen(v6_exclude_colo_buf), ",%s", val);
+            else snprintf(v6_exclude_colo_buf, sizeof(v6_exclude_colo_buf), "%s", val);
+        } else if (!strcmp(key, "v6-random")) v6_random = parse_bool(val);
+
+        /* 全局通用参数 */
         else if (!strcmp(key, "baidu-resolver") && val) snprintf(c->baidu_resolver, sizeof(c->baidu_resolver), "%s", val);
         else if (!strcmp(key, "bind-if") && val) snprintf(c->bind_if, sizeof(c->bind_if), "%s", val);
         else if (!strcmp(key, "code") && val) c->code = atoi(val);
@@ -947,7 +1053,8 @@ static void parse_args(Config *c, int argc, char **argv) {
         else if (!strcmp(key, "task") && val) c->task = atoi(val);
         else if (!strcmp(key, "health-log") && val) c->health_log = atoi(val);
     }
-    /* 统一解释并拼接 -exclude-colo 到 c->colo 中 */
+
+    /* 统一合并全局 exclude-colo 到 c->colo */
     if (exclude_colo_buf[0]) {
         char tmp_ex[sizeof(exclude_colo_buf)];
         snprintf(tmp_ex, sizeof(tmp_ex), "%s", exclude_colo_buf);
@@ -957,48 +1064,159 @@ static void parse_args(Config *c, int argc, char **argv) {
             trim_line(tok);
             while (*tok == '-' || *tok == '^' || *tok == '!' || *tok == ' ') tok++;
             if (*tok) {
-                if (c->colo[0]) {
-                    snprintf(c->colo + strlen(c->colo), sizeof(c->colo) - strlen(c->colo), ",-%s", tok);
-                } else {
-                    snprintf(c->colo, sizeof(c->colo), "-%s", tok);
-                }
+                if (c->colo[0]) snprintf(c->colo + strlen(c->colo), sizeof(c->colo) - strlen(c->colo), ",-%s", tok);
+                else snprintf(c->colo, sizeof(c->colo), "-%s", tok);
             }
             tok = strtok_r(NULL, ",", &save);
         }
     }
+
     if (c->delay_ms <= 0) c->delay_ms = 300;
     if (c->ipnum <= 0) c->ipnum = 20;
     if (c->num <= 0) c->num = 1;
     if (c->task <= 0) c->task = 1;
     if (c->baidu_port <= 0) c->baidu_port = 443;
     if (c->baidu_ipnum <= 0) c->baidu_ipnum = 12;
-    if (c->baidu_listen[0]) c->use_baidu_proxy = 1;
+
+    /* 判定激活哪个 profile:
+       1. 若用户显式指定了 -v4-listen, -v6-listen 或 -baidu-listen 中的任意一个，则按需开启；
+       2. 若用户指定了旧的 -direct-listen 或 -baidu-listen，则兼容旧逻辑；
+       3. 若用户全都没指定，则默认仅开启 IPv4，监听 0.0.0.0:4443。
+    */
+    int any_explicit_listen = (has_v4_listen || has_v6_listen || has_baidu_listen || c->direct_listen[0]);
+    if (!any_explicit_listen) {
+        has_v4_listen = 1;
+        snprintf(v4_listen_val, sizeof(v4_listen_val), "0.0.0.0:4443");
+    }
+
+    /* 如果指定了 -direct-listen，按照用户传入的 -ips=6 或 4 映射到对应 profile */
+    if (c->direct_listen[0]) {
+        if (c->ips_type == 6) {
+            has_v6_listen = 1;
+            format_listen_endpoint(c->direct_listen, 6443, v6_listen_val, sizeof(v6_listen_val));
+        } else {
+            has_v4_listen = 1;
+            format_listen_endpoint(c->direct_listen, 4443, v4_listen_val, sizeof(v4_listen_val));
+        }
+    }
+
+    /* 初始化 prof_v4 */
+    c->prof_v4.enabled = has_v4_listen;
+    c->prof_v4.ips_type = 4;
+    snprintf(c->prof_v4.name, sizeof(c->prof_v4.name), "v4");
+    snprintf(c->prof_v4.listen_addr, sizeof(c->prof_v4.listen_addr), "%s", v4_listen_val[0] ? v4_listen_val : "0.0.0.0:4443");
+    c->prof_v4.port = v4_port > 0 ? v4_port : c->port;
+    c->prof_v4.http_port = v4_http_port > 0 ? v4_http_port : c->http_port;
+    c->prof_v4.delay_ms = v4_delay > 0 ? v4_delay : c->delay_ms;
+    c->prof_v4.task = v4_task > 0 ? v4_task : c->task;
+    c->prof_v4.ipnum = v4_ipnum > 0 ? v4_ipnum : c->ipnum;
+    c->prof_v4.num = v4_num > 0 ? v4_num : c->num;
+    c->prof_v4.code = v4_code >= 0 ? v4_code : c->code;
+    c->prof_v4.random_mode = v4_random >= 0 ? v4_random : c->random_mode;
+    snprintf(c->prof_v4.domain, sizeof(c->prof_v4.domain), "%s", v4_domain[0] ? v4_domain : c->domain);
+    snprintf(c->prof_v4.colo, sizeof(c->prof_v4.colo), "%s", v4_colo[0] ? v4_colo : c->colo);
+    if (v4_exclude_colo_buf[0]) {
+        char tmp_ex[sizeof(v4_exclude_colo_buf)];
+        snprintf(tmp_ex, sizeof(tmp_ex), "%s", v4_exclude_colo_buf);
+        char *save = NULL;
+        char *tok = strtok_r(tmp_ex, ",", &save);
+        while (tok) {
+            trim_line(tok);
+            while (*tok == '-' || *tok == '^' || *tok == '!' || *tok == ' ') tok++;
+            if (*tok) {
+                if (c->prof_v4.colo[0]) snprintf(c->prof_v4.colo + strlen(c->prof_v4.colo), sizeof(c->prof_v4.colo) - strlen(c->prof_v4.colo), ",-%s", tok);
+                else snprintf(c->prof_v4.colo, sizeof(c->prof_v4.colo), "-%s", tok);
+            }
+            tok = strtok_r(NULL, ",", &save);
+        }
+    }
+    c->prof_v4.use_baidu_proxy = 0;
+
+    /* 初始化 prof_v6 */
+    c->prof_v6.enabled = has_v6_listen;
+    c->prof_v6.ips_type = 6;
+    snprintf(c->prof_v6.name, sizeof(c->prof_v6.name), "v6");
+    snprintf(c->prof_v6.listen_addr, sizeof(c->prof_v6.listen_addr), "%s", v6_listen_val[0] ? v6_listen_val : "0.0.0.0:6443");
+    c->prof_v6.port = v6_port > 0 ? v6_port : c->port;
+    c->prof_v6.http_port = v6_http_port > 0 ? v6_http_port : c->http_port;
+    c->prof_v6.delay_ms = v6_delay > 0 ? v6_delay : c->delay_ms;
+    c->prof_v6.task = v6_task > 0 ? v6_task : c->task;
+    c->prof_v6.ipnum = v6_ipnum > 0 ? v6_ipnum : c->ipnum;
+    c->prof_v6.num = v6_num > 0 ? v6_num : c->num;
+    c->prof_v6.code = v6_code >= 0 ? v6_code : c->code;
+    c->prof_v6.random_mode = v6_random >= 0 ? v6_random : c->random_mode;
+    snprintf(c->prof_v6.domain, sizeof(c->prof_v6.domain), "%s", v6_domain[0] ? v6_domain : c->domain);
+    snprintf(c->prof_v6.colo, sizeof(c->prof_v6.colo), "%s", v6_colo[0] ? v6_colo : c->colo);
+    if (v6_exclude_colo_buf[0]) {
+        char tmp_ex[sizeof(v6_exclude_colo_buf)];
+        snprintf(tmp_ex, sizeof(tmp_ex), "%s", v6_exclude_colo_buf);
+        char *save = NULL;
+        char *tok = strtok_r(tmp_ex, ",", &save);
+        while (tok) {
+            trim_line(tok);
+            while (*tok == '-' || *tok == '^' || *tok == '!' || *tok == ' ') tok++;
+            if (*tok) {
+                if (c->prof_v6.colo[0]) snprintf(c->prof_v6.colo + strlen(c->prof_v6.colo), sizeof(c->prof_v6.colo) - strlen(c->prof_v6.colo), ",-%s", tok);
+                else snprintf(c->prof_v6.colo, sizeof(c->prof_v6.colo), "-%s", tok);
+            }
+            tok = strtok_r(NULL, ",", &save);
+        }
+    }
+    c->prof_v6.use_baidu_proxy = 0;
+
+    /* 初始化 prof_baidu */
+    c->prof_baidu.enabled = has_baidu_listen;
+    c->prof_baidu.ips_type = c->ips_type;
+    snprintf(c->prof_baidu.name, sizeof(c->prof_baidu.name), "baidu");
+    snprintf(c->prof_baidu.listen_addr, sizeof(c->prof_baidu.listen_addr), "%s", baidu_listen_val[0] ? baidu_listen_val : "0.0.0.0:5444");
+    c->prof_baidu.port = c->port;
+    c->prof_baidu.http_port = c->http_port;
+    c->prof_baidu.delay_ms = c->delay_ms;
+    c->prof_baidu.task = c->task;
+    c->prof_baidu.ipnum = c->ipnum;
+    c->prof_baidu.num = c->num;
+    c->prof_baidu.code = c->code;
+    c->prof_baidu.random_mode = c->random_mode;
+    snprintf(c->prof_baidu.domain, sizeof(c->prof_baidu.domain), "%s", c->domain);
+    snprintf(c->prof_baidu.colo, sizeof(c->prof_baidu.colo), "%s", c->colo);
+    c->prof_baidu.use_baidu_proxy = 1;
+    if (has_baidu_listen) c->use_baidu_proxy = 1;
 }
 
 static void log_current_config(const Config *c) {
-    log_msg("当前运行配置 (含缺省默认值):");
-    log_msg("  IP协议版本 (-ips): IPv%d", c->ips_type);
-    log_msg("  TLS转发端口 (-port): %d", c->port);
-    log_msg("  HTTP转发端口 (-http-port): %d", c->http_port);
-    log_msg("  并发扫描线程 (-task): %d", c->task);
-    log_msg("  最大有效延迟 (-delay): %d ms", c->delay_ms);
-    log_msg("  候选IP提取数 (-ipnum): %d", c->ipnum);
-    log_msg("  单IP探测次数 (-num): %d", c->num);
-    log_msg("  随机生成IP (-random): %s", c->random_mode ? "true" : "false");
-    log_msg("  状态码检查域名 (-domain): %s", c->domain);
-    log_msg("  期望响应状态码 (-code): %d", c->code);
-    log_msg("  数据中心筛选 (-colo): %s", c->colo[0] ? c->colo : "(不限)");
-    log_msg("  直连监听地址 (-direct-listen): %s", c->direct_listen[0] ? c->direct_listen : "(未启用)");
-    log_msg("  百度前置监听 (-baidu-listen): %s", c->baidu_listen[0] ? c->baidu_listen : "(未启用)");
-    if (c->baidu_listen[0] || c->use_baidu_proxy) {
-        log_msg("  百度域名解析器 (-baidu-resolver): %s", c->baidu_resolver);
-        log_msg("  百度前置目标域名: %s", c->baidu_domain);
-        log_msg("  百度前置端口 (-baidu-port): %d", c->baidu_port);
-        log_msg("  百度候选节点数 (-baidu-ipnum): %d", c->baidu_ipnum);
+    log_msg("当前运行配置清单 (含缺省默认值):");
+    if (c->prof_v4.enabled) {
+        log_msg("  [IPv4 转发实例] 监听地址: %s", c->prof_v4.listen_addr);
+        log_msg("    TLS目标端口: %d | HTTP目标端口: %d", c->prof_v4.port, c->prof_v4.http_port);
+        log_msg("    并发扫描线程: %d | 延迟上限: %d ms | 候选IP保留: %d", c->prof_v4.task, c->prof_v4.delay_ms, c->prof_v4.ipnum);
+        log_msg("    状态码校验 (-code): %s", c->prof_v4.code > 0 ? "启用" : "未启用 (仅测连通性)");
+        if (c->prof_v4.code > 0) log_msg("    期望状态码: %d (域名: %s)", c->prof_v4.code, c->prof_v4.domain);
+        log_msg("    数据中心筛选: %s", c->prof_v4.colo[0] ? c->prof_v4.colo : "(不限)");
+    } else {
+        log_msg("  [IPv4 转发实例] 未启用");
     }
-    log_msg("  出站绑定物理网卡 (-bind-if): %s", c->bind_if[0] ? c->bind_if : "(系统默认路由)");
-    log_msg("  健康检查日志间隔 (-health-log): %d 秒", c->health_log);
-    log_msg("  日志级别 (-log): %s", c->log_name);
+
+    if (c->prof_v6.enabled) {
+        log_msg("  [IPv6 转发实例] 监听地址: %s", c->prof_v6.listen_addr);
+        log_msg("    TLS目标端口: %d | HTTP目标端口: %d", c->prof_v6.port, c->prof_v6.http_port);
+        log_msg("    并发扫描线程: %d | 延迟上限: %d ms | 候选IP保留: %d", c->prof_v6.task, c->prof_v6.delay_ms, c->prof_v6.ipnum);
+        log_msg("    状态码校验 (-code): %s", c->prof_v6.code > 0 ? "启用" : "未启用 (仅测连通性)");
+        if (c->prof_v6.code > 0) log_msg("    期望状态码: %d (域名: %s)", c->prof_v6.code, c->prof_v6.domain);
+        log_msg("    数据中心筛选: %s", c->prof_v6.colo[0] ? c->prof_v6.colo : "(不限)");
+    } else {
+        log_msg("  [IPv6 转发实例] 未启用");
+    }
+
+    if (c->prof_baidu.enabled) {
+        log_msg("  [百度前置实例] 监听地址: %s", c->prof_baidu.listen_addr);
+        log_msg("    百度解析器 (-baidu-resolver): %s", c->baidu_resolver);
+        log_msg("    百度前置目标: %s:%d (候选数: %d)", c->baidu_domain, c->baidu_port, c->baidu_ipnum);
+    } else {
+        log_msg("  [百度前置实例] 未启用");
+    }
+
+    log_msg("  全局设置: 出站网卡: %s | 健康检查间隔: %d 秒 | 日志级别: %s",
+            c->bind_if[0] ? c->bind_if : "(系统默认路由)", c->health_log, c->log_name);
 }
 
 static int file_exists(const char *path) {
@@ -1342,11 +1560,11 @@ static Location *find_location(const char *iata) {
     return NULL;
 }
 
-static int colo_allowed(const char *colo) {
-    if (!g_cfg.colo[0] || !colo || !*colo) return 1;
+static int colo_rule_allowed(const char *rule, const char *colo) {
+    if (!rule || !rule[0] || !colo || !*colo) return 1;
 
-    char tmp[sizeof(g_cfg.colo)];
-    snprintf(tmp, sizeof(tmp), "%s", g_cfg.colo);
+    char tmp[256];
+    snprintf(tmp, sizeof(tmp), "%s", rule);
 
     int has_include = 0;
     int matched_include = 0;
@@ -1372,6 +1590,10 @@ static int colo_allowed(const char *colo) {
         tok = strtok_r(NULL, ",", &save);
     }
     return has_include ? matched_include : 1;
+}
+
+static int colo_allowed(const char *colo) {
+    return colo_rule_allowed(g_cfg.colo, colo);
 }
 
 static int set_nonblock(socket_t fd, int nb) {
@@ -1881,7 +2103,8 @@ static int str_eq_ci(const char *a, const char *b) {
 }
 
 static const char *carrier_display_name(const char *mode) {
-    if (str_eq_ci(mode, "direct")) return "直连优选";
+    if (str_eq_ci(mode, "direct") || str_eq_ci(mode, "direct-v4")) return "IPv4直连优选";
+    if (str_eq_ci(mode, "direct-v6")) return "IPv6直连优选";
     if (str_eq_ci(mode, "baidu")) return "百度前置优选";
     if (str_eq_ci(mode, "mixed")) return "混合优选";
     return mode ? mode : "unknown";
@@ -2019,27 +2242,59 @@ static int parse_listen_modes(const Config *cfg, CarrierListenSpec **out_specs, 
     *out_len = 0;
     if (!cfg) return -1;
     size_t len = 0;
-    CarrierListenSpec *specs = calloc(2, sizeof(CarrierListenSpec));
+    CarrierListenSpec *specs = calloc(4, sizeof(CarrierListenSpec));
     if (!specs) return -1;
 
-    if (cfg->direct_listen[0] && cfg->baidu_listen[0] && strcmp(cfg->direct_listen, cfg->baidu_listen) == 0) {
-        // 两个监听地址一样，使用混合模式
-        snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "mixed");
-        snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->direct_listen);
-        specs[len].use_baidu_proxy = 2; // 2 表示混合模式
+    /* 优先使用分协议 profile (prof_v4, prof_v6, prof_baidu) */
+    if (cfg->prof_v4.enabled) {
+        snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "direct-v4");
+        snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->prof_v4.listen_addr);
+        specs[len].use_baidu_proxy = 0;
+        specs[len].prof = cfg->prof_v4;
         len++;
-    } else {
-        if (cfg->direct_listen[0]) {
-            snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "direct");
+    }
+    if (cfg->prof_v6.enabled) {
+        snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "direct-v6");
+        snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->prof_v6.listen_addr);
+        specs[len].use_baidu_proxy = 0;
+        specs[len].prof = cfg->prof_v6;
+        len++;
+    }
+    if (cfg->prof_baidu.enabled) {
+        snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "baidu");
+        snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->prof_baidu.listen_addr);
+        specs[len].use_baidu_proxy = 1;
+        specs[len].prof = cfg->prof_baidu;
+        len++;
+    }
+
+    /* 兼容旧的 -direct-listen / -baidu-listen 单独指定但未走 profile 时的逻辑 */
+    if (len == 0) {
+        if (cfg->direct_listen[0] && cfg->baidu_listen[0] && strcmp(cfg->direct_listen, cfg->baidu_listen) == 0) {
+            snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "mixed");
             snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->direct_listen);
-            specs[len].use_baidu_proxy = 0;
+            specs[len].use_baidu_proxy = 2;
+            specs[len].prof = cfg->prof_v4;
+            snprintf(specs[len].prof.listen_addr, sizeof(specs[len].prof.listen_addr), "%s", cfg->direct_listen);
             len++;
-        }
-        if (cfg->baidu_listen[0]) {
-            snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "baidu");
-            snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->baidu_listen);
-            specs[len].use_baidu_proxy = 1;
-            len++;
+        } else {
+            if (cfg->direct_listen[0]) {
+                snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", cfg->ips_type == 6 ? "direct-v6" : "direct-v4");
+                snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->direct_listen);
+                specs[len].use_baidu_proxy = 0;
+                specs[len].prof = (cfg->ips_type == 6) ? cfg->prof_v6 : cfg->prof_v4;
+                specs[len].prof.ips_type = cfg->ips_type;
+                snprintf(specs[len].prof.listen_addr, sizeof(specs[len].prof.listen_addr), "%s", cfg->direct_listen);
+                len++;
+            }
+            if (cfg->baidu_listen[0]) {
+                snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "baidu");
+                snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->baidu_listen);
+                specs[len].use_baidu_proxy = 1;
+                specs[len].prof = cfg->prof_baidu;
+                snprintf(specs[len].prof.listen_addr, sizeof(specs[len].prof.listen_addr), "%s", cfg->baidu_listen);
+                len++;
+            }
         }
     }
 
@@ -2669,7 +2924,7 @@ static void *scan_worker(void *arg) {
                 atomic_fetch_add(&ctx->cfray_miss, 1);
                 continue;
             }
-            if (!colo_allowed(colo)) {
+            if (!colo_rule_allowed(ctx->cfg->colo, colo)) {
                 atomic_fetch_add(&ctx->colo_skip, 1);
                 continue;
             }
@@ -2708,51 +2963,53 @@ static void *scan_worker(void *arg) {
         }
         if (success_count <= 0 || !best_colo[0] || best_latency <= 0) continue;
 
-        /* 测试延迟获得可连通 IP 后，对候选 IP 测试目标 HTTP 状态码（默认 200） */
-        int target_code = ctx->cfg->code > 0 ? ctx->cfg->code : 200;
-        int check_port = ctx->cfg->http_port > 0 ? ctx->cfg->http_port : 80;
-        char req_domain[MAX_DOMAIN_LEN];
-        char req_path[MAX_PATH_LEN];
-        req_domain[0] = '\0';
-        req_path[0] = '\0';
-        const char *dom_slash = strchr(ctx->cfg->domain, '/');
-        if (dom_slash) {
-            size_t dlen = (size_t)(dom_slash - ctx->cfg->domain);
-            if (dlen >= sizeof(req_domain)) dlen = sizeof(req_domain) - 1;
-            memcpy(req_domain, ctx->cfg->domain, dlen);
-            req_domain[dlen] = '\0';
-            snprintf(req_path, sizeof(req_path), "%s", dom_slash);
-        } else {
-            snprintf(req_domain, sizeof(req_domain), "%s", ctx->cfg->domain[0] ? ctx->cfg->domain : "cloudflaremirrors.com");
-            snprintf(req_path, sizeof(req_path), "/");
-        }
-        if (!req_domain[0]) snprintf(req_domain, sizeof(req_domain), "cloudflaremirrors.com");
-        if (!req_path[0]) snprintf(req_path, sizeof(req_path), "/");
+        /* 若显式指定了 code (code > 0)，在测试延迟获得可连通 IP 后，对候选 IP 测试目标 HTTP 状态码；缺省 code <= 0 时不测 */
+        if (ctx->cfg->code > 0) {
+            int target_code = ctx->cfg->code;
+            int check_port = ctx->cfg->http_port > 0 ? ctx->cfg->http_port : 80;
+            char req_domain[MAX_DOMAIN_LEN];
+            char req_path[MAX_PATH_LEN];
+            req_domain[0] = '\0';
+            req_path[0] = '\0';
+            const char *dom_slash = strchr(ctx->cfg->domain, '/');
+            if (dom_slash) {
+                size_t dlen = (size_t)(dom_slash - ctx->cfg->domain);
+                if (dlen >= sizeof(req_domain)) dlen = sizeof(req_domain) - 1;
+                memcpy(req_domain, ctx->cfg->domain, dlen);
+                req_domain[dlen] = '\0';
+                snprintf(req_path, sizeof(req_path), "%s", dom_slash);
+            } else {
+                snprintf(req_domain, sizeof(req_domain), "%s", ctx->cfg->domain[0] ? ctx->cfg->domain : "cloudflaremirrors.com");
+                snprintf(req_path, sizeof(req_path), "/");
+            }
+            if (!req_domain[0]) snprintf(req_domain, sizeof(req_domain), "cloudflaremirrors.com");
+            if (!req_path[0]) snprintf(req_path, sizeof(req_path), "/");
 
-        socket_t check_fd = dial_target_with_proxy(ip, check_port, ctx->cfg->delay_ms, ctx->proxy_pool, NULL);
-        if (cfnat_socket_invalid(check_fd)) {
-            debug_msg("IP %s 状态码二次校验失败: 无法连接端口 %d", ip, check_port);
-            atomic_fetch_add(&ctx->http_code_mismatch, 1);
-            continue;
-        }
-        char check_req[1024];
-        snprintf(check_req, sizeof(check_req),
-                 "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n",
-                 req_path, req_domain);
-        send(check_fd, check_req, strlen(check_req), 0);
-        char check_hdr[4096];
-        int chk_n = recv_headers_ev(check_fd, check_hdr, sizeof(check_hdr), ctx->cfg->delay_ms > 2000 ? ctx->cfg->delay_ms : 2000, &el);
-        close(check_fd);
-        if (chk_n <= 0) {
-            debug_msg("IP %s 状态码二次校验失败: 读取响应头超时或失败", ip);
-            atomic_fetch_add(&ctx->http_code_mismatch, 1);
-            continue;
-        }
-        int resp_code = extract_http_status_code(check_hdr);
-        if (resp_code != target_code) {
-            debug_msg("IP %s 状态码二次校验不匹配: 期望 %d，实际返回 %d", ip, target_code, resp_code);
-            atomic_fetch_add(&ctx->http_code_mismatch, 1);
-            continue;
+            socket_t check_fd = dial_target_with_proxy(ip, check_port, ctx->cfg->delay_ms, ctx->proxy_pool, NULL);
+            if (cfnat_socket_invalid(check_fd)) {
+                debug_msg("IP %s 状态码二次校验失败: 无法连接端口 %d", ip, check_port);
+                atomic_fetch_add(&ctx->http_code_mismatch, 1);
+                continue;
+            }
+            char check_req[1024];
+            snprintf(check_req, sizeof(check_req),
+                     "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n",
+                     req_path, req_domain);
+            send(check_fd, check_req, strlen(check_req), 0);
+            char check_hdr[4096];
+            int chk_n = recv_headers_ev(check_fd, check_hdr, sizeof(check_hdr), ctx->cfg->delay_ms > 2000 ? ctx->cfg->delay_ms : 2000, &el);
+            close(check_fd);
+            if (chk_n <= 0) {
+                debug_msg("IP %s 状态码二次校验失败: 读取响应头超时或失败", ip);
+                atomic_fetch_add(&ctx->http_code_mismatch, 1);
+                continue;
+            }
+            int resp_code = extract_http_status_code(check_hdr);
+            if (resp_code != target_code) {
+                debug_msg("IP %s 状态码二次校验不匹配: 期望 %d，实际返回 %d", ip, target_code, resp_code);
+                atomic_fetch_add(&ctx->http_code_mismatch, 1);
+                continue;
+            }
         }
 
         Result r;
@@ -2837,15 +3094,18 @@ static int carrier_try_use_candidate_cache(CarrierRuntime *rt);
 #define CACHE_REFRESH_INTERVAL_SECONDS 3600L
 #define CACHE_QUICK_CHECK_COUNT 5
 
-static const char *candidate_cache_file(const char *mode) {
+static const char *candidate_cache_file_for_profile(const char *mode, int ips_type) {
     if (mode && strcmp(mode, "baidu") == 0) {
-        return g_cfg.ips_type == 6 ? "baidu-cache-v6.txt" : "baidu-cache-v4.txt";
+        return ips_type == 6 ? "baidu-cache-v6.txt" : "baidu-cache-v4.txt";
     }
     if (mode && strcmp(mode, "mixed") == 0) {
-        return g_cfg.ips_type == 6 ? "mixed-cache-v6.txt" : "mixed-cache-v4.txt";
+        return ips_type == 6 ? "mixed-cache-v6.txt" : "mixed-cache-v4.txt";
     }
-    // default: direct mode
-    return g_cfg.ips_type == 6 ? "direct-cache-v6.txt" : "direct-cache-v4.txt";
+    return ips_type == 6 ? "direct-cache-v6.txt" : "direct-cache-v4.txt";
+}
+
+static const char *candidate_cache_file(const char *mode) {
+    return candidate_cache_file_for_profile(mode, g_cfg.ips_type);
 }
 
 static void save_candidate_cache(const char *path, const Result *items, size_t len) {
@@ -2878,7 +3138,7 @@ static void save_candidate_cache(const char *path, const Result *items, size_t l
     debug_msg("候选缓存已写入 %s，共 %zu 个", path, limit);
 }
 
-static ResultList load_candidate_cache(const char *path) {
+static ResultList load_candidate_cache_for_profile(const char *path, const ProfileConfig *prof) {
     ResultList rl = {0};
     pthread_mutex_init(&rl.mu, NULL);
     if (!path || !file_exists(path)) return rl;
@@ -2895,6 +3155,11 @@ static ResultList load_candidate_cache(const char *path) {
             rewind(fp);
         }
     }
+
+    int delay_limit = (prof && prof->delay_ms > 0) ? prof->delay_ms : (g_cfg.delay_ms > 0 ? g_cfg.delay_ms : 300);
+    int num_probes = (prof && prof->num > 0) ? prof->num : (g_cfg.num > 0 ? g_cfg.num : 5);
+    int max_ips = (prof && prof->ipnum > 0) ? prof->ipnum : (g_cfg.ipnum > 0 ? g_cfg.ipnum : 20);
+    const char *colo_rule = (prof && prof->colo[0]) ? prof->colo : g_cfg.colo;
 
     while (fgets(line, sizeof(line), fp)) {
         if (line[0] == '#' || line[0] == '\n' || line[0] == '\r') continue;
@@ -2928,19 +3193,23 @@ static ResultList load_candidate_cache(const char *path) {
                             &r.probe_count);
         }
         if (parsed < 8 || !r.ip[0]) continue;
-        if (r.latency_ms <= 0) r.latency_ms = g_cfg.delay_ms > 0 ? g_cfg.delay_ms : 1;
-        if (r.probe_count <= 0) r.probe_count = g_cfg.num > 0 ? g_cfg.num : 1;
+        if (r.latency_ms <= 0) r.latency_ms = delay_limit;
+        if (r.probe_count <= 0) r.probe_count = num_probes;
         if (r.success_count <= 0) r.success_count = 1;
         /* P0-EWMA: 如果 v1 格式没有 EWMA 字段，用原始延迟初始化 */
         if (r.ewma_latency <= 0) r.ewma_latency = r.latency_ms;
-        if (g_cfg.colo[0] && strcmp(r.data_center, "UNK") != 0 && !colo_allowed(r.data_center)) continue;
+        if (colo_rule[0] && strcmp(r.data_center, "UNK") != 0 && !colo_rule_allowed(colo_rule, r.data_center)) continue;
         resultlist_add(&rl, &r);
-        if (g_cfg.ipnum > 0 && rl.len >= (size_t)g_cfg.ipnum) break;
+        if (max_ips > 0 && rl.len >= (size_t)max_ips) break;
     }
     fclose(fp);
     qsort(rl.items, rl.len, sizeof(Result), cmp_result);
     if (rl.len > 0) log_msg("已读取候选缓存 %s，共 %zu 个（v%d格式），开始快速健康检查", path, rl.len, is_v2 ? 2 : 1);
     return rl;
+}
+
+static ResultList load_candidate_cache(const char *path) {
+    return load_candidate_cache_for_profile(path, NULL);
 }
 
 static int try_use_candidate_cache(BaiduProxyPool *proxy_pool, ResultList *out) {
@@ -2970,8 +3239,8 @@ static int try_use_candidate_cache(BaiduProxyPool *proxy_pool, ResultList *out) 
 
 static int carrier_try_use_candidate_cache(CarrierRuntime *rt) {
     if (!rt) return 0;
-    const char *path = candidate_cache_file(rt->spec.mode);
-    ResultList cached = load_candidate_cache(path);
+    const char *path = candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type > 0 ? rt->spec.prof.ips_type : g_cfg.ips_type);
+    ResultList cached = load_candidate_cache_for_profile(path, &rt->spec.prof);
     if (cached.len == 0) {
         pthread_mutex_destroy(&cached.mu);
         return 0;
@@ -3352,9 +3621,9 @@ typedef enum {
     HC_FULL         /* TCP + HTTP 完整探测 */
 } HealthCheckLevel;
 
-static int carrier_probe_and_check(socket_t fd, int timeout_ms) {
-    // TCP 握手成功后按实际 TLS 转发端口做 TLS 探测，避免 443 明文 HTTP 误判。
-    int ok = g_cfg.port == 443 ? tls_probe(fd, timeout_ms) : http_probe(fd, timeout_ms);
+static int carrier_probe_and_check(CarrierRuntime *rt, socket_t fd, int timeout_ms) {
+    int target_port = (rt && rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
+    int ok = target_port == 443 ? tls_probe(fd, timeout_ms) : http_probe(fd, timeout_ms);
     close(fd);
     return ok;
 }
@@ -3362,30 +3631,32 @@ static int carrier_probe_and_check(socket_t fd, int timeout_ms) {
 /* P1-HC: 增强 carrier 健康检查，支持级别参数 */
 static int carrier_health_check_ip_level(CarrierRuntime *rt, const char *ip, HealthCheckLevel level) {
     if (!rt || !ip || !*ip) return 0;
+    int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
+    int timeout_ms = (rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms;
     // 混合模式：先试直连，不行再试百度代理
     if (rt->spec.use_baidu_proxy == 2) {
         int latency = 0;
-        socket_t fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, NULL, &latency);
+        socket_t fd = dial_target_with_proxy(ip, target_port, timeout_ms, NULL, &latency);
         if (cfnat_socket_valid(fd)) {
             if (level == HC_LIGHT) {
                 close(fd);
                 debug_msg("%s 健康检查(轻量/直连)成功: IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
                 return 1;
             }
-            if (carrier_probe_and_check(fd, g_cfg.delay_ms)) {
+            if (carrier_probe_and_check(rt, fd, timeout_ms)) {
                 debug_msg("%s 健康检查成功(直连): IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
                 return 1;
             }
         }
         if (rt->proxy_pool && rt->proxy_pool->len > 0) {
-            fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, rt->proxy_pool, &latency);
+            fd = dial_target_with_proxy(ip, target_port, timeout_ms, rt->proxy_pool, &latency);
             if (cfnat_socket_valid(fd)) {
                 if (level == HC_LIGHT) {
                     close(fd);
                     debug_msg("%s 健康检查(轻量/百度)成功: IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
                     return 1;
                 }
-                if (carrier_probe_and_check(fd, g_cfg.delay_ms)) {
+                if (carrier_probe_and_check(rt, fd, timeout_ms)) {
                     debug_msg("%s 健康检查成功(百度前置): IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
                     return 1;
                 }
@@ -3396,7 +3667,7 @@ static int carrier_health_check_ip_level(CarrierRuntime *rt, const char *ip, Hea
     }
     // 普通模式
     int latency = 0;
-    socket_t fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, rt->proxy_pool, &latency);
+    socket_t fd = dial_target_with_proxy(ip, target_port, timeout_ms, rt->proxy_pool, &latency);
     if (cfnat_socket_invalid(fd)) {
         debug_msg("%s 健康检查失败: IP %s 暂不可用", carrier_display_name(rt->spec.mode), ip);
         return 0;
@@ -3406,7 +3677,7 @@ static int carrier_health_check_ip_level(CarrierRuntime *rt, const char *ip, Hea
         debug_msg("%s 健康检查(轻量)成功: IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
         return 1;
     }
-    if (carrier_probe_and_check(fd, g_cfg.delay_ms)) {
+    if (carrier_probe_and_check(rt, fd, timeout_ms)) {
         debug_msg("%s 健康检查成功: IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
         return 1;
     }
@@ -3416,20 +3687,22 @@ static int carrier_health_check_ip_level(CarrierRuntime *rt, const char *ip, Hea
 
 static int carrier_health_check_ip(CarrierRuntime *rt, const char *ip) {
     if (!rt || !ip || !*ip) return 0;
+    int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
+    int timeout_ms = (rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms;
     // 混合模式：先试直连，不行再试百度代理
     if (rt->spec.use_baidu_proxy == 2) {
         int latency = 0;
-        socket_t fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, NULL, &latency);
+        socket_t fd = dial_target_with_proxy(ip, target_port, timeout_ms, NULL, &latency);
         if (cfnat_socket_valid(fd)) {
-            if (carrier_probe_and_check(fd, g_cfg.delay_ms)) {
+            if (carrier_probe_and_check(rt, fd, timeout_ms)) {
                 debug_msg("%s 健康检查成功(直连): IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
                 return 1;
             }
         }
         if (rt->proxy_pool && rt->proxy_pool->len > 0) {
-            fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, rt->proxy_pool, &latency);
+            fd = dial_target_with_proxy(ip, target_port, timeout_ms, rt->proxy_pool, &latency);
             if (cfnat_socket_valid(fd)) {
-                if (carrier_probe_and_check(fd, g_cfg.delay_ms)) {
+                if (carrier_probe_and_check(rt, fd, timeout_ms)) {
                     debug_msg("%s 健康检查成功(百度前置): IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
                     return 1;
                 }
@@ -3440,12 +3713,12 @@ static int carrier_health_check_ip(CarrierRuntime *rt, const char *ip) {
     }
     // 普通模式
     int latency = 0;
-    socket_t fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, rt->proxy_pool, &latency);
+    socket_t fd = dial_target_with_proxy(ip, target_port, timeout_ms, rt->proxy_pool, &latency);
     if (cfnat_socket_invalid(fd)) {
         debug_msg("%s 健康检查失败: IP %s 暂不可用", carrier_display_name(rt->spec.mode), ip);
         return 0;
     }
-    if (carrier_probe_and_check(fd, g_cfg.delay_ms)) {
+    if (carrier_probe_and_check(rt, fd, timeout_ms)) {
         debug_msg("%s 健康检查成功: IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
         return 1;
     }
@@ -3457,26 +3730,28 @@ static int carrier_tls_sni_check_ip(CarrierRuntime *rt, const char *ip, const ch
     if (!rt || !ip || !*ip || !sni_host || !*sni_host) return 0;
     int latency = 0;
     socket_t fd = INVALID_SOCKET;
+    int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
+    int timeout_ms = (rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms;
     if (rt->spec.use_baidu_proxy == 2) {
-        fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, NULL, &latency);
+        fd = dial_target_with_proxy(ip, target_port, timeout_ms, NULL, &latency);
         if (cfnat_socket_valid(fd)) {
-            int ok = tls_probe_host(fd, g_cfg.delay_ms, sni_host);
+            int ok = tls_probe_host(fd, timeout_ms, sni_host);
             close(fd);
             if (ok) return 1;
         }
         if (rt->proxy_pool && rt->proxy_pool->len > 0) {
-            fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, rt->proxy_pool, &latency);
+            fd = dial_target_with_proxy(ip, target_port, timeout_ms, rt->proxy_pool, &latency);
             if (cfnat_socket_valid(fd)) {
-                int ok = tls_probe_host(fd, g_cfg.delay_ms, sni_host);
+                int ok = tls_probe_host(fd, timeout_ms, sni_host);
                 close(fd);
                 if (ok) return 1;
             }
         }
         return 0;
     }
-    fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, rt->proxy_pool, &latency);
+    fd = dial_target_with_proxy(ip, target_port, timeout_ms, rt->proxy_pool, &latency);
     if (cfnat_socket_invalid(fd)) return 0;
-    int ok = tls_probe_host(fd, g_cfg.delay_ms, sni_host);
+    int ok = tls_probe_host(fd, timeout_ms, sni_host);
     close(fd);
     return ok;
 }
@@ -3635,7 +3910,19 @@ static int carrier_rescan_and_select_ip(CarrierRuntime *rt, const char *ipfile) 
     pthread_mutex_unlock(&rt->candidates.mu);
     for (;;) {
         if (!atomic_load(&g_running)) return 0;
-        StringList ips = load_ip_list(ipfile, g_cfg.random_mode);
+        Config scan_cfg = g_cfg;
+        if (rt->spec.prof.enabled) {
+            if (rt->spec.prof.port > 0) scan_cfg.port = rt->spec.prof.port;
+            if (rt->spec.prof.http_port > 0) scan_cfg.http_port = rt->spec.prof.http_port;
+            if (rt->spec.prof.delay_ms > 0) scan_cfg.delay_ms = rt->spec.prof.delay_ms;
+            if (rt->spec.prof.task > 0) scan_cfg.task = rt->spec.prof.task;
+            if (rt->spec.prof.ipnum > 0) scan_cfg.ipnum = rt->spec.prof.ipnum;
+            if (rt->spec.prof.num > 0) scan_cfg.num = rt->spec.prof.num;
+            scan_cfg.code = rt->spec.prof.code; /* 包含 code==0 */
+            if (rt->spec.prof.domain[0]) snprintf(scan_cfg.domain, sizeof(scan_cfg.domain), "%s", rt->spec.prof.domain);
+            if (rt->spec.prof.colo[0]) snprintf(scan_cfg.colo, sizeof(scan_cfg.colo), "%s", rt->spec.prof.colo);
+        }
+        StringList ips = load_ip_list(ipfile, rt->spec.prof.enabled ? rt->spec.prof.random_mode : g_cfg.random_mode);
         if (ips.len == 0) {
             warn_msg("%s 没有可扫描的 IP，3 秒后重试", carrier_display_name(rt->spec.mode));
             if (sleep_interruptible_ms(3000) != 0) return 0;
@@ -3644,10 +3931,10 @@ static int carrier_rescan_and_select_ip(CarrierRuntime *rt, const char *ipfile) 
         ResultList results = {0};
         if (rt->spec.use_baidu_proxy == 2) {
             // 混合模式重扫描
-            ResultList results_direct = scan_ips(&ips, NULL, &g_cfg, NULL);
+            ResultList results_direct = scan_ips(&ips, NULL, &scan_cfg, NULL);
             ResultList results_baidu = {0};
             if (rt->proxy_pool && rt->proxy_pool->len > 0) {
-                results_baidu = scan_ips(&ips, NULL, &g_cfg, rt->proxy_pool);
+                results_baidu = scan_ips(&ips, NULL, &scan_cfg, rt->proxy_pool);
             }
             pthread_mutex_init(&results.mu, NULL);
             for (size_t j = 0; j < results_direct.len; j++) {
@@ -3672,7 +3959,7 @@ static int carrier_rescan_and_select_ip(CarrierRuntime *rt, const char *ipfile) 
             }
         } else {
             // 普通模式重扫描
-            results = scan_ips(&ips, NULL, &g_cfg, rt->proxy_pool);
+            results = scan_ips(&ips, NULL, &scan_cfg, rt->proxy_pool);
         }
         strlist_free(&ips);
         if (results.len == 0) {
@@ -3737,7 +4024,8 @@ static void *carrier_health_thread(void *arg) {
             log_msg("%s 连续两次状态检查失败，切换到下一个 IP", carrier_display_name(rt->spec.mode));
             if (!carrier_switch_next_ip(rt)) {
                 log_msg("%s 没有更多可用 IP，开始重新扫描", carrier_display_name(rt->spec.mode));
-                if (!carrier_rescan_and_select_ip(rt, g_cfg.ips_type == 6 ? "ips-v6.txt" : "ips-v4.txt")) {
+                const char *rescan_file = (rt->spec.prof.ips_type == 6) ? "ips-v6.txt" : ((rt->spec.prof.ips_type == 4) ? "ips-v4.txt" : (g_cfg.ips_type == 6 ? "ips-v6.txt" : "ips-v4.txt"));
+                if (!carrier_rescan_and_select_ip(rt, rescan_file)) {
                     atomic_store(&g_running, 0);
                     return NULL;
                 }
@@ -3787,10 +4075,10 @@ static void *carrier_accept_thread(void *arg) {
         }
         cc->client_fd = cfd;
         snprintf(cc->ip, sizeof(cc->ip), "%s", ip);
-        cc->tls_port = g_cfg.port;
-        cc->http_port = g_cfg.http_port;
-        cc->num = g_cfg.num;
-        cc->delay_ms = g_cfg.delay_ms;
+        cc->tls_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
+        cc->http_port = (rt->spec.prof.http_port > 0) ? rt->spec.prof.http_port : g_cfg.http_port;
+        cc->num = (rt->spec.prof.num > 0) ? rt->spec.prof.num : g_cfg.num;
+        cc->delay_ms = (rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms;
         cc->proxy_pool = rt->proxy_pool;
         cc->runtime = rt;
         cc->use_mixed = (rt->spec.use_baidu_proxy == 2) ? 1 : 0;
@@ -4004,27 +4292,35 @@ int main(int argc, char **argv) {
     }
     install_signals();
     if (g_cfg.bind_if[0]) log_msg("出站连接绑定网络接口: %s", g_cfg.bind_if);
-    const char *ipfile = g_cfg.ips_type == 6 ? "ips-v6.txt" : "ips-v4.txt";
-    const char **urls = g_cfg.ips_type == 6 ? IPS_V6_URLS : IPS_V4_URLS;
-    if (ensure_data_file(ipfile, urls) != 0) {
-        log_msg("下载 %s 失败", ipfile);
-        return 1;
-    }
-    log_msg("正在加载 locations.json");
-    load_locations();
-    log_msg("locations 加载完成: %zu 条", g_location_count);
     CarrierListenSpec *carrier_specs = NULL;
     size_t carrier_spec_len = 0;
     if (parse_listen_modes(&g_cfg, &carrier_specs, &carrier_spec_len) != 0) {
-        log_msg("解析 -direct-listen / -baidu-listen 失败");
+        log_msg("解析监听模式失败");
         free(g_locations);
         return 1;
     }
-    StringList ips = load_ip_list(ipfile, g_cfg.random_mode);
-    if (ips.len == 0) {
-        log_msg("没有可扫描的 IP");
+
+    /* 检查并下载所需 IP 库文件 */
+    int need_v4 = 0, need_v6 = 0;
+    if (carrier_spec_len > 0) {
+        for (size_t i = 0; i < carrier_spec_len; i++) {
+            if (carrier_specs[i].prof.ips_type == 6) need_v6 = 1;
+            else need_v4 = 1;
+        }
+    } else {
+        if (g_cfg.ips_type == 6) need_v6 = 1;
+        else need_v4 = 1;
+    }
+
+    if (need_v4 && ensure_data_file("ips-v4.txt", IPS_V4_URLS) != 0) {
+        log_msg("下载 ips-v4.txt 失败");
         free(carrier_specs);
-        baidu_pool_free(&g_default_proxy_pool);
+        free(g_locations);
+        return 1;
+    }
+    if (need_v6 && ensure_data_file("ips-v6.txt", IPS_V6_URLS) != 0) {
+        log_msg("下载 ips-v6.txt 失败");
+        free(carrier_specs);
         free(g_locations);
         return 1;
     }
@@ -4032,7 +4328,6 @@ int main(int argc, char **argv) {
         size_t started_count = 0;
         g_carrier_runtimes = calloc(carrier_spec_len, sizeof(CarrierRuntime));
         if (!g_carrier_runtimes) {
-            strlist_free(&ips);
             free(carrier_specs);
             baidu_pool_free(&g_default_proxy_pool);
             free(g_locations);
@@ -4042,7 +4337,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         g_carrier_runtime_count = carrier_spec_len;
-        log_msg("双方案监听模式启动，监听器数量: %zu", carrier_spec_len);
+        log_msg("转发监听模式启动，监听器数量: %zu", carrier_spec_len);
         for (size_t i = 0; i < carrier_spec_len; i++) {
             CarrierRuntime *rt = &g_carrier_runtimes[i];
             rt->listen_fd = INVALID_SOCKET;
@@ -4058,14 +4353,13 @@ int main(int argc, char **argv) {
                     baidu_pool_ok = 0;
                     break;
                 }
-                if (g_cfg.ips_type == 6 && !carrier_check_baidu_ipv6_support(rt)) {
+                if (rt->spec.prof.ips_type == 6 && !carrier_check_baidu_ipv6_support(rt)) {
                     baidu_pool_ok = 0;
                     break;
                 }
             }
         }
         if (!baidu_pool_ok) {
-            strlist_free(&ips);
             free(carrier_specs);
             for (size_t i = 0; i < g_carrier_runtime_count; i++) {
                 CarrierRuntime *rt = &g_carrier_runtimes[i];
@@ -4102,19 +4396,42 @@ int main(int argc, char **argv) {
                     rt->candidates.len = 0;
                     continue;
                 }
-                log_msg("%s 正在监听 %s，TLS目标端口：%d，非TLS目标端口：%d，连接尝试次数：%d，有效延迟：%d ms，日志：%s", carrier_display_name(rt->spec.mode), rt->spec.addr, g_cfg.port, g_cfg.http_port, g_cfg.num, g_cfg.delay_ms, g_cfg.log_name);
+                log_msg("%s 正在监听 %s，TLS目标端口：%d，非TLS目标端口：%d，连接尝试次数：%d，有效延迟：%d ms，日志：%s",
+                        carrier_display_name(rt->spec.mode), rt->spec.addr,
+                        rt->spec.prof.port, rt->spec.prof.http_port, rt->spec.prof.num, rt->spec.prof.delay_ms, g_cfg.log_name);
                 create_small_thread(&rt->health_tid, carrier_health_thread, rt);
                 create_small_thread(&rt->accept_tid, carrier_accept_thread, rt);
                 continue;
             }
+
+            const char *cur_ipfile = (rt->spec.prof.ips_type == 6) ? "ips-v6.txt" : "ips-v4.txt";
+            StringList profile_ips = load_ip_list(cur_ipfile, rt->spec.prof.random_mode);
+            if (profile_ips.len == 0) {
+                warn_msg("%s 没有可扫描的 IP (%s 为空)", carrier_display_name(rt->spec.mode), cur_ipfile);
+                continue;
+            }
+
+            Config scan_cfg = g_cfg;
+            scan_cfg.ips_type = rt->spec.prof.ips_type;
+            scan_cfg.port = rt->spec.prof.port;
+            scan_cfg.http_port = rt->spec.prof.http_port;
+            scan_cfg.delay_ms = rt->spec.prof.delay_ms;
+            scan_cfg.task = rt->spec.prof.task;
+            scan_cfg.ipnum = rt->spec.prof.ipnum;
+            scan_cfg.num = rt->spec.prof.num;
+            scan_cfg.random_mode = rt->spec.prof.random_mode;
+            scan_cfg.code = rt->spec.prof.code;
+            snprintf(scan_cfg.domain, sizeof(scan_cfg.domain), "%s", rt->spec.prof.domain);
+            snprintf(scan_cfg.colo, sizeof(scan_cfg.colo), "%s", rt->spec.prof.colo);
+
             if (rt->spec.use_baidu_proxy == 2) {
                 // 混合模式：同时用直连和百度扫描，合并结果
                 // 先直连扫描
-                ResultList results_direct = scan_ips(&ips, NULL, &g_cfg, NULL);
+                ResultList results_direct = scan_ips(&profile_ips, NULL, &scan_cfg, NULL);
                 // 再百度前置扫描（如果有百度代理池的话）
                 ResultList results_baidu = {0};
                 if (rt->proxy_pool && rt->proxy_pool->len > 0) {
-                    results_baidu = scan_ips(&ips, NULL, &g_cfg, rt->proxy_pool);
+                    results_baidu = scan_ips(&profile_ips, NULL, &scan_cfg, rt->proxy_pool);
                 }
 
                 // 合并结果，去重
@@ -4146,8 +4463,9 @@ int main(int argc, char **argv) {
                 }
             } else {
                 // 普通模式
-                carrier_results = scan_ips(&ips, NULL, &g_cfg, rt->proxy_pool);
+                carrier_results = scan_ips(&profile_ips, NULL, &scan_cfg, rt->proxy_pool);
             }
+            strlist_free(&profile_ips);
 
             if (carrier_results.len == 0) {
                 warn_msg("%s 未扫描到可用候选 IP", carrier_display_name(rt->spec.mode));
@@ -4156,7 +4474,7 @@ int main(int argc, char **argv) {
             rt->candidates.items = carrier_results.items;
             rt->candidates.len = carrier_results.len;
             // 扫描完成后保存缓存，供下次启动加速
-            save_candidate_cache(candidate_cache_file(rt->spec.mode), carrier_results.items, carrier_results.len);
+            save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), carrier_results.items, carrier_results.len);
             if (!carrier_select_valid_ip(rt)) {
                 warn_msg("%s 候选 IP 健康检查全部失败", carrier_display_name(rt->spec.mode));
                 free(rt->candidates.items);
@@ -4172,12 +4490,13 @@ int main(int argc, char **argv) {
                 rt->candidates.len = 0;
                 continue;
             }
-            log_msg("%s 正在监听 %s，TLS目标端口：%d，非TLS目标端口：%d，连接尝试次数：%d，有效延迟：%d ms，日志：%s", carrier_display_name(rt->spec.mode), rt->spec.addr, g_cfg.port, g_cfg.http_port, g_cfg.num, g_cfg.delay_ms, g_cfg.log_name);
+            log_msg("%s 正在监听 %s，TLS目标端口：%d，非TLS目标端口：%d，连接尝试次数：%d，有效延迟：%d ms，日志：%s",
+                    carrier_display_name(rt->spec.mode), rt->spec.addr,
+                    rt->spec.prof.port, rt->spec.prof.http_port, rt->spec.prof.num, rt->spec.prof.delay_ms, g_cfg.log_name);
             create_small_thread(&rt->health_tid, carrier_health_thread, rt);
             create_small_thread(&rt->accept_tid, carrier_accept_thread, rt);
             started_count++;
         }
-        strlist_free(&ips);
         free(carrier_specs);
         if (started_count == 0) {
             for (size_t i = 0; i < g_carrier_runtime_count; i++) {
@@ -4232,6 +4551,14 @@ int main(int argc, char **argv) {
         return 0;
     }
     long start = now_ms();
+    const char *cli_ipfile = (g_cfg.ips_type == 6) ? "ips-v6.txt" : "ips-v4.txt";
+    StringList ips = load_ip_list(cli_ipfile, g_cfg.random_mode);
+    if (ips.len == 0) {
+        log_msg("没有可扫描的 IP (%s 为空)", cli_ipfile);
+        baidu_pool_free(&g_default_proxy_pool);
+        free(g_locations);
+        return 1;
+    }
     // 先尝试读取候选缓存，如果命中且健康检查通过则跳过完整扫描
     ResultList results = {0};
     int cache_hit = try_use_candidate_cache(NULL, &results);
@@ -4242,7 +4569,6 @@ int main(int argc, char **argv) {
         }
     }
     strlist_free(&ips);
-    free(carrier_specs);
     if (!cache_hit) {
         printf("候选池统计\n");
         printf("候选总数: %zu\n", results.len);
