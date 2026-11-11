@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.5"
+#define CFNAT_VERSION "0.0.14"
 
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
@@ -2382,7 +2382,8 @@ static int parse_listen_modes(const Config *cfg, CarrierListenSpec **out_specs, 
             snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "mixed");
             snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->direct_listen);
             specs[len].use_baidu_proxy = 2;
-            specs[len].prof = cfg->prof_v4;
+            specs[len].prof = (cfg->ips_type == 6) ? cfg->prof_v6 : cfg->prof_v4;
+            specs[len].prof.ips_type = cfg->ips_type;
             snprintf(specs[len].prof.listen_addr, sizeof(specs[len].prof.listen_addr), "%s", cfg->direct_listen);
             len++;
         } else {
@@ -3194,7 +3195,7 @@ static int cmp_result(const void *a, const void *b) {
 static int health_check_ip(const char *ip, BaiduProxyPool *proxy_pool);
 static int carrier_health_check_ip(CarrierRuntime *rt, const char *ip);
 static int carrier_set_current_candidate(CarrierRuntime *rt, size_t idx);
-static int carrier_rescan_and_select_ip(CarrierRuntime *rt, const char *ipfile);
+static int carrier_rescan_and_select_ip(CarrierRuntime *rt);
 static void carrier_note_connection_result(CarrierRuntime *rt, const char *ip, long lifetime_ms);
 static int carrier_choose_ip_for_sni(CarrierRuntime *rt, const char *sni_host, char *out, size_t sz);
 static int carrier_try_use_candidate_cache(CarrierRuntime *rt);
@@ -3265,6 +3266,10 @@ static void save_env_cidr_records(int ips_type, const Result *items, size_t len)
         while (fgets(buf, sizeof(buf), fp)) {
             trim_line(buf);
             if (!buf[0] || buf[0] == '#') continue;
+            // 严格按目标协议过滤已有行，自动清洗历史上混入的异构网段
+            int line_is_v6 = (strchr(buf, ':') != NULL);
+            if (ips_type == 6 && !line_is_v6) continue;
+            if (ips_type == 4 && line_is_v6) continue;
             if (line_count >= line_cap) {
                 line_cap = line_cap ? line_cap * 2 : 64;
                 char **nlines = realloc(lines, line_cap * sizeof(char *));
@@ -3280,6 +3285,9 @@ static void save_env_cidr_records(int ips_type, const Result *items, size_t len)
     for (size_t i = 0; i < len; i++) {
         const Result *r = &items[i];
         if (!r->ip[0]) continue;
+        int is_v6 = (strchr(r->ip, ':') != NULL);
+        if (ips_type == 6 && !is_v6) continue; // 坚决防止 IPv4 写入 IPv6 资产库
+        if (ips_type == 4 && is_v6) continue;  // 坚决防止 IPv6 写入 IPv4 资产库
         char cidr[128];
         if (!ip_to_env_cidr(r->ip, cidr, sizeof(cidr))) continue;
         const char *colo = r->data_center[0] ? r->data_center : "UNK";
@@ -3415,6 +3423,8 @@ static ResultList load_candidate_cache_for_profile(const char *path, const Profi
                             &r.probe_count);
         }
         if (parsed < 8 || !r.ip[0]) continue;
+        if (prof && prof->ips_type == 6 && !strchr(r.ip, ':')) continue;
+        if (prof && prof->ips_type == 4 && strchr(r.ip, ':')) continue;
         if (r.latency_ms <= 0) r.latency_ms = delay_limit;
         if (r.probe_count <= 0) r.probe_count = num_probes;
         if (r.success_count <= 0) r.success_count = 1;
@@ -4089,7 +4099,7 @@ static void carrier_note_connection_result(CarrierRuntime *rt, const char *ip, l
         log_msg("%s 当前 IP %s 连续快速断开，标记为不可用并切换", carrier_display_name(rt->spec.mode), ip);
         if (!carrier_switch_next_ip(rt)) {
             log_msg("%s 没有更多可用 IP，开始重新扫描", carrier_display_name(rt->spec.mode));
-            carrier_rescan_and_select_ip(rt, g_cfg.ips_type == 6 ? "ips-v6.txt" : "ips-v4.txt");
+            carrier_rescan_and_select_ip(rt);
         }
     }
 }
@@ -4120,8 +4130,9 @@ static int carrier_choose_ip_for_connection(CarrierRuntime *rt, char *out, size_
     return 0;
 }
 
-static int carrier_rescan_and_select_ip(CarrierRuntime *rt, const char *ipfile) {
-    if (!rt || !ipfile) return 0;
+static int carrier_rescan_and_select_ip(CarrierRuntime *rt) {
+    if (!rt) return 0;
+    const char *ipfile = (rt->spec.prof.ips_type == 6) ? "ips-v6.txt" : "ips-v4.txt";
     /* 加锁保护 items 的释放，防止与 carrier_choose_ip_for_connection 中的读取竞态 */
     pthread_mutex_lock(&rt->candidates.mu);
     free(rt->candidates.items);
@@ -4133,7 +4144,9 @@ static int carrier_rescan_and_select_ip(CarrierRuntime *rt, const char *ipfile) 
     for (;;) {
         if (!atomic_load(&g_running)) return 0;
         Config scan_cfg = g_cfg;
+        scan_cfg.ips_type = rt->spec.prof.ips_type;
         if (rt->spec.prof.enabled) {
+            scan_cfg.ips_type = rt->spec.prof.ips_type;
             if (rt->spec.prof.port > 0) scan_cfg.port = rt->spec.prof.port;
             if (rt->spec.prof.http_port > 0) scan_cfg.http_port = rt->spec.prof.http_port;
             if (rt->spec.prof.delay_ms > 0) scan_cfg.delay_ms = rt->spec.prof.delay_ms;
@@ -4250,8 +4263,7 @@ static void *carrier_health_thread(void *arg) {
             log_msg("%s 连续两次状态检查失败，切换到下一个 IP", carrier_display_name(rt->spec.mode));
             if (!carrier_switch_next_ip(rt)) {
                 log_msg("%s 没有更多可用 IP，开始重新扫描", carrier_display_name(rt->spec.mode));
-                const char *rescan_file = (rt->spec.prof.ips_type == 6) ? "ips-v6.txt" : ((rt->spec.prof.ips_type == 4) ? "ips-v4.txt" : (g_cfg.ips_type == 6 ? "ips-v6.txt" : "ips-v4.txt"));
-                if (!carrier_rescan_and_select_ip(rt, rescan_file)) {
+                if (!carrier_rescan_and_select_ip(rt)) {
                     atomic_store(&g_running, 0);
                     return NULL;
                 }
