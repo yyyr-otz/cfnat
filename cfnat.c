@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.4"
+#define CFNAT_VERSION "0.0.5"
 
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
@@ -159,6 +159,7 @@ typedef struct {
     int ipnum;                /* 提取有效 IP 数量 */
     int num;                  /* 单 IP 探测次数 */
     int random_mode;          /* 是否随机抽样 */
+    int v6_split;             /* IPv6 细分抽样子网前缀，默认 54 (切分 /54 产生 64 个样本) */
     int code;                 /* HTTP 期望状态码 (0 表示不检测，仅测连通性) */
     char domain[MAX_DOMAIN_LEN]; /* 状态码检查域名/路径 */
     char colo[256];           /* 数据中心筛选规则 (含排除) */
@@ -172,6 +173,7 @@ typedef struct {
     char v4_listen[MAX_ADDR_LEN], v6_listen[MAX_ADDR_LEN];
     char bind_if[MAX_NAME_LEN], baidu_resolver[MAX_RESOLVER_SPEC_LEN];
     int code, delay_ms, ipnum, ips_type, num, port, http_port, random_mode, task, health_log;
+    int v6_split;             /* 全局 IPv6 细分子网前缀 (默认 54) */
     int use_baidu_proxy, baidu_port, baidu_ipnum;
     LogLevel log_level;
     ProfileConfig prof_v4;
@@ -891,6 +893,7 @@ static void usage(const char *p) {
     printf("  -code=value               期望响应 HTTP 状态码 (默认缺省 0: 仅测连通性; 显式指定如 200 则做二次状态检测)\n");
     printf("  -domain=value             状态码检查域名地址 (default cloudflaremirrors.com/debian)\n");
     printf("  -random=value             是否随机生成 IP (default true)\n");
+    printf("  -v6-split=value           IPv6 /48 细分抽样子网前缀，例如 54 (产生 64 个样本, default 54)\n");
     printf("  -task=value               并发扫描线程数 (default 200)\n");
     printf("  -log=value                日志级别: silent,error,warn,info,debug (default info)\n");
     printf("  注: 以上参数均支持 -v4- 或 -v6- 前缀实现精细化覆盖，如 -v6-code=200 -v4-delay=150\n");
@@ -933,6 +936,7 @@ static void cfg_defaults(Config *c) {
     c->port = 443;
     c->http_port = 80;
     c->random_mode = 1;
+    c->v6_split = 54;
     c->task = 200;
     c->health_log = 60;
     c->use_baidu_proxy = 0;
@@ -961,6 +965,7 @@ static void parse_args(Config *c, int argc, char **argv) {
     int v4_num = 0, v6_num = 0;
     int v4_code = -1, v6_code = -1; /* -1 表示未指定专属 */
     int v4_random = -1, v6_random = -1;
+    int v6_split_val = -1;
     char v4_colo[256] = {0}, v6_colo[256] = {0};
     char v4_domain[MAX_DOMAIN_LEN] = {0}, v6_domain[MAX_DOMAIN_LEN] = {0};
 
@@ -1026,6 +1031,17 @@ static void parse_args(Config *c, int argc, char **argv) {
             if (v6_exclude_colo_buf[0]) snprintf(v6_exclude_colo_buf + strlen(v6_exclude_colo_buf), sizeof(v6_exclude_colo_buf) - strlen(v6_exclude_colo_buf), ",%s", val);
             else snprintf(v6_exclude_colo_buf, sizeof(v6_exclude_colo_buf), "%s", val);
         } else if (!strcmp(key, "v6-random")) v6_random = parse_bool(val);
+        else if (!strcmp(key, "v6-split") && val) {
+            int v = atoi(val);
+            if (v >= 48 && v <= 64) {
+                v6_split_val = v;
+                c->v6_split = v;
+            } else {
+                warn_msg("参数 -v6-split=%s 超出有效范围 [48, 64]，默认使用 54", val);
+                v6_split_val = 54;
+                c->v6_split = 54;
+            }
+        }
 
         /* 全局通用参数 */
         else if (!strcmp(key, "baidu-resolver") && val) snprintf(c->baidu_resolver, sizeof(c->baidu_resolver), "%s", val);
@@ -1113,6 +1129,7 @@ static void parse_args(Config *c, int argc, char **argv) {
     c->prof_v4.num = v4_num > 0 ? v4_num : c->num;
     c->prof_v4.code = v4_code >= 0 ? v4_code : c->code;
     c->prof_v4.random_mode = v4_random >= 0 ? v4_random : c->random_mode;
+    c->prof_v4.v6_split = 0;
     snprintf(c->prof_v4.domain, sizeof(c->prof_v4.domain), "%s", v4_domain[0] ? v4_domain : c->domain);
     snprintf(c->prof_v4.colo, sizeof(c->prof_v4.colo), "%s", v4_colo[0] ? v4_colo : c->colo);
     if (v4_exclude_colo_buf[0]) {
@@ -1145,6 +1162,7 @@ static void parse_args(Config *c, int argc, char **argv) {
     c->prof_v6.num = v6_num > 0 ? v6_num : c->num;
     c->prof_v6.code = v6_code >= 0 ? v6_code : c->code;
     c->prof_v6.random_mode = v6_random >= 0 ? v6_random : c->random_mode;
+    c->prof_v6.v6_split = v6_split_val >= 48 && v6_split_val <= 64 ? v6_split_val : (c->v6_split >= 48 && c->v6_split <= 64 ? c->v6_split : 54);
     snprintf(c->prof_v6.domain, sizeof(c->prof_v6.domain), "%s", v6_domain[0] ? v6_domain : c->domain);
     snprintf(c->prof_v6.colo, sizeof(c->prof_v6.colo), "%s", v6_colo[0] ? v6_colo : c->colo);
     if (v6_exclude_colo_buf[0]) {
@@ -1177,6 +1195,7 @@ static void parse_args(Config *c, int argc, char **argv) {
     c->prof_baidu.num = c->num;
     c->prof_baidu.code = c->code;
     c->prof_baidu.random_mode = c->random_mode;
+    c->prof_baidu.v6_split = c->v6_split;
     snprintf(c->prof_baidu.domain, sizeof(c->prof_baidu.domain), "%s", c->domain);
     snprintf(c->prof_baidu.colo, sizeof(c->prof_baidu.colo), "%s", c->colo);
     c->prof_baidu.use_baidu_proxy = 1;
@@ -1200,6 +1219,7 @@ static void log_current_config(const Config *c) {
         log_msg("  [IPv6 转发实例] 监听地址: %s", c->prof_v6.listen_addr);
         log_msg("    TLS目标端口: %d | HTTP目标端口: %d", c->prof_v6.port, c->prof_v6.http_port);
         log_msg("    并发扫描线程: %d | 延迟上限: %d ms | 候选IP保留: %d", c->prof_v6.task, c->prof_v6.delay_ms, c->prof_v6.ipnum);
+        log_msg("    IPv6 子网切分 (-v6-split): /%d (每个/48抽样 %d 个样本)", c->prof_v6.v6_split, 1 << (c->prof_v6.v6_split - 48));
         log_msg("    状态码校验 (-code): %s", c->prof_v6.code > 0 ? "启用" : "未启用 (仅测连通性)");
         if (c->prof_v6.code > 0) log_msg("    期望状态码: %d (域名: %s)", c->prof_v6.code, c->prof_v6.domain);
         log_msg("    数据中心筛选: %s", c->prof_v6.colo[0] ? c->prof_v6.colo : "(不限)");
@@ -1213,6 +1233,15 @@ static void log_current_config(const Config *c) {
         log_msg("    百度前置目标: %s:%d (候选数: %d)", c->baidu_domain, c->baidu_port, c->baidu_ipnum);
     } else {
         log_msg("  [百度前置实例] 未启用");
+    }
+
+    if (!c->prof_v4.enabled && !c->prof_v6.enabled && !c->prof_baidu.enabled) {
+        log_msg("  [CLI 单次测速模式] IP 类型: IPv%d | 端口: %d | 并发线程: %d | 延迟上限: %d ms",
+                c->ips_type, c->port, c->task, c->delay_ms);
+        if (c->ips_type == 6) {
+            log_msg("    IPv6 子网切分 (-v6-split): /%d (每个/48抽样 %d 个样本)", c->v6_split, (c->v6_split >= 48 && c->v6_split <= 64) ? (1 << (c->v6_split - 48)) : 1);
+        }
+        if (c->colo[0]) log_msg("    数据中心筛选: %s", c->colo);
     }
 
     log_msg("  全局设置: 出站网卡: %s | 健康检查间隔: %d 秒 | 日志级别: %s",
@@ -1410,6 +1439,17 @@ static uint64_t rand_u64(void) {
     return v;
 }
 
+/* 将 16 字节 IPv6 二进制地址转换为完全展开的 8 段 16 进制格式 (例如 2606:4700:9a68:1591:f76d:d848:b5de:8e02) */
+static void format_ipv6_full(const unsigned char bytes[16], char *out, size_t outsz) {
+    if (!bytes || !out || outsz < 40) return;
+    uint16_t w[8];
+    for (int i = 0; i < 8; i++) {
+        w[i] = ((uint16_t)bytes[i * 2] << 8) | (uint16_t)bytes[i * 2 + 1];
+    }
+    snprintf(out, outsz, "%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
+             w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
+}
+
 static int ipv6_cidr_sample(const char *base_s, int prefix, char *out, size_t outsz) {
     if (!base_s || !out || outsz == 0 || prefix < 0 || prefix > 128) return -1;
     unsigned char bytes[16];
@@ -1421,7 +1461,54 @@ static int ipv6_cidr_sample(const char *base_s, int prefix, char *out, size_t ou
     for (int bit = prefix; bit < 128; bit++) {
         if (rand_u64() & 1u) bytes[bit / 8] |= (unsigned char)(1u << (7 - (bit % 8)));
     }
-    return inet_ntop(AF_INET6, bytes, out, outsz) ? 0 : -1;
+    format_ipv6_full(bytes, out, outsz);
+    return 0;
+}
+
+/* IPv6 CIDR 抽样与子网切分：支持 -v6-split (默认 54，即每个 /48 切分为 64 个 /54 子网各抽样 1 个) */
+static int ipv6_cidr_sample_split(const char *base_s, int prefix, int v6_split, StringList *out) {
+    if (!base_s || !out || prefix < 0 || prefix > 128) return -1;
+    unsigned char bytes[16];
+    if (inet_pton(AF_INET6, base_s, bytes) != 1) return -1;
+
+    for (int bit = prefix; bit < 128; bit++) {
+        bytes[bit / 8] &= (unsigned char)~(1u << (7 - (bit % 8)));
+    }
+
+    uint16_t w[8];
+    for (int i = 0; i < 8; i++) {
+        w[i] = ((uint16_t)bytes[i * 2] << 8) | (uint16_t)bytes[i * 2 + 1];
+    }
+
+    /* 针对标准的 Cloudflare /48 CIDR 进行指定子网切分 */
+    if (prefix == 48 && v6_split >= 48 && v6_split <= 64) {
+        int split_bits = v6_split - 48;
+        int count = 1 << split_bits;
+        int step = (split_bits == 16) ? 1 : (65536 / count);
+        for (int i = 0; i < count; i++) {
+            uint16_t seg4 = (uint16_t)(i * step + (step > 1 ? (uint16_t)(rand_u64() % (uint64_t)step) : 0));
+            uint16_t seg5 = (uint16_t)(rand_u64() & 0xffff);
+            uint16_t seg6 = (uint16_t)(rand_u64() & 0xffff);
+            uint16_t seg7 = (uint16_t)(rand_u64() & 0xffff);
+            uint16_t seg8 = (uint16_t)(rand_u64() & 0xffff);
+            char ip[MAX_IP_LEN];
+            snprintf(ip, sizeof(ip), "%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
+                     w[0], w[1], w[2], seg4, seg5, seg6, seg7, seg8);
+            strlist_add(out, ip);
+        }
+        return 0;
+    }
+
+    /* 其他前缀情况（例如 /64 或 /32）：在 prefix 之后随机生成主机位，格式化为 8 段完整展开格式 */
+    for (int bit = prefix; bit < 128; bit++) {
+        if (rand_u64() & 1u) {
+            bytes[bit / 8] |= (unsigned char)(1u << (7 - (bit % 8)));
+        }
+    }
+    char ip[MAX_IP_LEN];
+    format_ipv6_full(bytes, ip, sizeof(ip));
+    strlist_add(out, ip);
+    return 0;
 }
 
 static int is_ip_literal(const char *s) {
@@ -1442,7 +1529,8 @@ static void format_addr_port(const char *ip, int port, char *out, size_t outsz) 
     else snprintf(out, outsz, "%s:%d", ip ? ip : "", port);
 }
 
-static StringList load_ip_list(const char *filename, int random_mode) {
+static StringList load_ip_list(const char *filename, int random_mode, int v6_split) {
+    if (v6_split < 48 || v6_split > 64) v6_split = 54;
     StringList out = {0};
     FILE *f = fopen(filename, "r");
     if (!f) return out;
@@ -1457,21 +1545,32 @@ static StringList load_ip_list(const char *filename, int random_mode) {
         if (!line[0]) continue;
         char *slash = strchr(line, '/');
         if (!slash) {
-            if (is_ip_literal(line)) strlist_add(&out, line);
+            if (is_ip_literal(line)) {
+                if (strchr(line, ':')) {
+                    unsigned char b[16];
+                    if (inet_pton(AF_INET6, line, b) == 1) {
+                        char full_ip[MAX_IP_LEN];
+                        format_ipv6_full(b, full_ip, sizeof(full_ip));
+                        strlist_add(&out, full_ip);
+                    } else {
+                        strlist_add(&out, line);
+                    }
+                } else {
+                    strlist_add(&out, line);
+                }
+            }
             continue;
         }
         cidr_count++;
         *slash = 0;
         int prefix = atoi(slash + 1);
         if (strchr(line, ':')) {
-            char ip[MAX_IP_LEN];
             if (!random_mode && !warned_ipv6_expand) {
-                warn_msg("IPv6 CIDR 不支持完整展开，已自动按每个 CIDR 随机抽样 1 个候选");
+                warn_msg("IPv6 空间过大不支持全量展开，已按 -v6-split=/%d 为每个 /48 子网抽样 %d 个候选",
+                         v6_split, 1 << (v6_split - 48));
                 warned_ipv6_expand = 1;
             }
-            if (ipv6_cidr_sample(line, prefix, ip, sizeof(ip)) == 0) {
-                strlist_add(&out, ip);
-            }
+            ipv6_cidr_sample_split(line, prefix, v6_split, &out);
             continue;
         }
         uint32_t base = ipv4_to_u32(line);
@@ -1496,6 +1595,14 @@ static StringList load_ip_list(const char *filename, int random_mode) {
         }
     }
     fclose(f);
+    if (random_mode && out.len > 1) {
+        for (size_t i = out.len - 1; i > 0; i--) {
+            size_t j = (size_t)(rand_u64() % (uint64_t)(i + 1));
+            char *tmp = out.items[i];
+            out.items[i] = out.items[j];
+            out.items[j] = tmp;
+        }
+    }
     log_msg("IP 列表加载完成: %zu 个候选，CIDR 行数: %zu，耗时 %ld 秒", out.len, cidr_count, (now_ms() - start_ms) / 1000);
     if (!random_mode && out.len > 100000) {
         warn_msg("当前使用 -random=false，已完整展开大量 IP，扫描会明显变慢；需要快速启动时建议使用 -random=true");
@@ -4036,8 +4143,10 @@ static int carrier_rescan_and_select_ip(CarrierRuntime *rt, const char *ipfile) 
             scan_cfg.code = rt->spec.prof.code; /* 包含 code==0 */
             if (rt->spec.prof.domain[0]) snprintf(scan_cfg.domain, sizeof(scan_cfg.domain), "%s", rt->spec.prof.domain);
             if (rt->spec.prof.colo[0]) snprintf(scan_cfg.colo, sizeof(scan_cfg.colo), "%s", rt->spec.prof.colo);
+            if (rt->spec.prof.v6_split > 0) scan_cfg.v6_split = rt->spec.prof.v6_split;
         }
-        StringList ips = load_ip_list(ipfile, rt->spec.prof.enabled ? rt->spec.prof.random_mode : g_cfg.random_mode);
+        int cur_v6_split = (rt->spec.prof.enabled && rt->spec.prof.v6_split > 0) ? rt->spec.prof.v6_split : g_cfg.v6_split;
+        StringList ips = load_ip_list(ipfile, rt->spec.prof.enabled ? rt->spec.prof.random_mode : g_cfg.random_mode, cur_v6_split);
         if (ips.len == 0) {
             warn_msg("%s 没有可扫描的 IP，3 秒后重试", carrier_display_name(rt->spec.mode));
             if (sleep_interruptible_ms(3000) != 0) return 0;
@@ -4529,7 +4638,8 @@ int main(int argc, char **argv) {
             }
 
             const char *cur_ipfile = (rt->spec.prof.ips_type == 6) ? "ips-v6.txt" : "ips-v4.txt";
-            StringList profile_ips = load_ip_list(cur_ipfile, rt->spec.prof.random_mode);
+            int cur_v6_split = (rt->spec.prof.v6_split > 0) ? rt->spec.prof.v6_split : g_cfg.v6_split;
+            StringList profile_ips = load_ip_list(cur_ipfile, rt->spec.prof.random_mode, cur_v6_split);
             if (profile_ips.len == 0) {
                 warn_msg("%s 没有可扫描的 IP (%s 为空)", carrier_display_name(rt->spec.mode), cur_ipfile);
                 continue;
@@ -4544,6 +4654,7 @@ int main(int argc, char **argv) {
             scan_cfg.ipnum = rt->spec.prof.ipnum;
             scan_cfg.num = rt->spec.prof.num;
             scan_cfg.random_mode = rt->spec.prof.random_mode;
+            scan_cfg.v6_split = cur_v6_split;
             scan_cfg.code = rt->spec.prof.code;
             snprintf(scan_cfg.domain, sizeof(scan_cfg.domain), "%s", rt->spec.prof.domain);
             snprintf(scan_cfg.colo, sizeof(scan_cfg.colo), "%s", rt->spec.prof.colo);
@@ -4677,7 +4788,7 @@ int main(int argc, char **argv) {
     }
     long start = now_ms();
     const char *cli_ipfile = (g_cfg.ips_type == 6) ? "ips-v6.txt" : "ips-v4.txt";
-    StringList ips = load_ip_list(cli_ipfile, g_cfg.random_mode);
+    StringList ips = load_ip_list(cli_ipfile, g_cfg.random_mode, g_cfg.v6_split);
     if (ips.len == 0) {
         log_msg("没有可扫描的 IP (%s 为空)", cli_ipfile);
         baidu_pool_free(&g_default_proxy_pool);
