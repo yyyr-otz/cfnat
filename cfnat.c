@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.14"
+#define CFNAT_VERSION "0.0.5"
 
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
