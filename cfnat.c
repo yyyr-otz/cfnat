@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.5"
+#define CFNAT_VERSION "0.0.6"
 
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
@@ -3991,10 +3991,14 @@ static int carrier_tls_sni_check_ip(CarrierRuntime *rt, const char *ip, const ch
 static int carrier_choose_ip_for_sni(CarrierRuntime *rt, const char *sni_host, char *out, size_t sz) {
     if (!rt || !sni_host || !*sni_host || !out || sz == 0) return 0;
     out[0] = '\0';
+    char check_ips[32][MAX_IP_LEN];
+    size_t count = 0;
+    char current[MAX_IP_LEN] = {0};
     pthread_mutex_lock(&rt->candidates.mu);
-    size_t len = rt->candidates.len;
-    Result *items = rt->candidates.items;
-    char current[MAX_IP_LEN];
+    count = rt->candidates.len > 32 ? 32 : rt->candidates.len;
+    for (size_t i = 0; i < count; i++) {
+        snprintf(check_ips[i], sizeof(check_ips[i]), "%s", rt->candidates.items[i].ip);
+    }
     snprintf(current, sizeof(current), "%s", rt->candidates.current_ip);
     pthread_mutex_unlock(&rt->candidates.mu);
 
@@ -4004,13 +4008,13 @@ static int carrier_choose_ip_for_sni(CarrierRuntime *rt, const char *sni_host, c
         return 1;
     }
     atomic_store(&rt->candidates.cache_valid, 0);
-    for (size_t i = 0; i < len; i++) {
-        if (current[0] && strcmp(items[i].ip, current) == 0) continue;
-        if (carrier_tls_sni_check_ip(rt, items[i].ip, sni_host)) {
-            snprintf(out, sz, "%s", items[i].ip);
+    for (size_t i = 0; i < count; i++) {
+        if (current[0] && strcmp(check_ips[i], current) == 0) continue;
+        if (carrier_tls_sni_check_ip(rt, check_ips[i], sni_host)) {
+            snprintf(out, sz, "%s", check_ips[i]);
             carrier_set_current_candidate(rt, i);
             atomic_store(&rt->candidates.cache_valid, 1);
-            log_msg("%s 为 SNI %s 切换到可用 IP: %s", carrier_display_name(rt->spec.mode), sni_host, items[i].ip);
+            log_msg("%s 为 SNI %s 切换到可用 IP: %s", carrier_display_name(rt->spec.mode), sni_host, check_ips[i]);
             return 1;
         }
     }
@@ -4065,16 +4069,29 @@ static int carrier_select_valid_ip(CarrierRuntime *rt) {
 static int carrier_switch_next_ip(CarrierRuntime *rt) {
     if (!rt) return 0;
     pthread_mutex_lock(&rt->candidates.mu);
+    size_t len = rt->candidates.len;
     size_t start = rt->candidates.current_index + 1;
     pthread_mutex_unlock(&rt->candidates.mu);
-    for (size_t i = start; i < rt->candidates.len; i++) {
-        if (carrier_health_check_ip(rt, rt->candidates.items[i].ip)) {
-            carrier_set_current_candidate(rt, i);
-            atomic_store(&rt->candidates.cache_valid, 1);  /* P0-1: 新 IP 有效 */
-            log_msg("%s 切换到下一个最优 IP: %s 候选索引: %zu", carrier_display_name(rt->spec.mode), rt->candidates.items[i].ip, i);
-            return 1;
+
+    if (len == 0) return 0;
+
+    /* 消耗比例阈值: 70% */
+    size_t threshold = (size_t)(len * 0.70);
+    if (threshold < 1) threshold = 1;
+
+    /* 1. 如果尚未达到 70% 消耗阈值，顺位尝试后面的备用候选 */
+    if (start < threshold) {
+        for (size_t i = start; i < threshold && i < len; i++) {
+            if (carrier_health_check_ip(rt, rt->candidates.items[i].ip)) {
+                carrier_set_current_candidate(rt, i);
+                atomic_store(&rt->candidates.cache_valid, 1);  /* P0-1: 新 IP 有效 */
+                log_msg("%s 顺位切换到下一个最优 IP: %s (候选索引: %zu/%zu)", carrier_display_name(rt->spec.mode), rt->candidates.items[i].ip, i, len);
+                return 1;
+            }
         }
     }
+
+    /* 2. 消耗达到或超过 70% 阈值，或在 threshold 范围内无可用 IP，交由上层执行测活与补齐 */
     return 0;
 }
 
@@ -4098,7 +4115,7 @@ static void carrier_note_connection_result(CarrierRuntime *rt, const char *ip, l
     if (should_switch) {
         log_msg("%s 当前 IP %s 连续快速断开，标记为不可用并切换", carrier_display_name(rt->spec.mode), ip);
         if (!carrier_switch_next_ip(rt)) {
-            log_msg("%s 没有更多可用 IP，开始重新扫描", carrier_display_name(rt->spec.mode));
+            log_msg("%s 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护候选池", carrier_display_name(rt->spec.mode));
             carrier_rescan_and_select_ip(rt);
         }
     }
@@ -4107,21 +4124,23 @@ static void carrier_note_connection_result(CarrierRuntime *rt, const char *ip, l
 static int carrier_choose_ip_for_connection(CarrierRuntime *rt, char *out, size_t sz) {
     if (!rt || !out || sz == 0) return 0;
     out[0] = '\0';
-    if (rt->candidates.len == 0) return 0;
 
     /* P0-1: 如果缓存有效，快速获取当前 IP，避免重复健康检查 */
     if (carrier_choose_ip_fast(rt, out, sz)) return 1;
 
-    /* 缓存无效或当前 IP 为空，遍历候选池做健康检查 */
-    /* 加锁保护 items 数组，防止与 carrier_rescan_and_select_ip 中的 free(items) 竞态 */
+    /* 缓存无效或当前 IP 为空，加锁复制候选列表后做健康检查 */
+    char check_ips[32][MAX_IP_LEN];
+    size_t count = 0;
     pthread_mutex_lock(&rt->candidates.mu);
-    size_t len = rt->candidates.len;
-    Result *items = rt->candidates.items;
+    count = rt->candidates.len > 32 ? 32 : rt->candidates.len;
+    for (size_t i = 0; i < count; i++) {
+        snprintf(check_ips[i], sizeof(check_ips[i]), "%s", rt->candidates.items[i].ip);
+    }
     pthread_mutex_unlock(&rt->candidates.mu);
 
-    for (size_t i = 0; i < len; i++) {
-        if (carrier_health_check_ip(rt, items[i].ip)) {
-            snprintf(out, sz, "%s", items[i].ip);
+    for (size_t i = 0; i < count; i++) {
+        if (carrier_health_check_ip(rt, check_ips[i])) {
+            snprintf(out, sz, "%s", check_ips[i]);
             carrier_set_current_candidate(rt, i);
             atomic_store(&rt->candidates.cache_valid, 1);
             return 1;
@@ -4133,93 +4152,199 @@ static int carrier_choose_ip_for_connection(CarrierRuntime *rt, char *out, size_
 static int carrier_rescan_and_select_ip(CarrierRuntime *rt) {
     if (!rt) return 0;
     const char *ipfile = (rt->spec.prof.ips_type == 6) ? "ips-v6.txt" : "ips-v4.txt";
-    /* 加锁保护 items 的释放，防止与 carrier_choose_ip_for_connection 中的读取竞态 */
-    pthread_mutex_lock(&rt->candidates.mu);
-    free(rt->candidates.items);
-    rt->candidates.items = NULL;
-    rt->candidates.len = 0;
-    rt->candidates.current_ip[0] = '\0';
-    rt->candidates.current_index = 0;
-    pthread_mutex_unlock(&rt->candidates.mu);
-    for (;;) {
-        if (!atomic_load(&g_running)) return 0;
-        Config scan_cfg = g_cfg;
+
+    /* 1. 准备配置参数 */
+    Config scan_cfg = g_cfg;
+    scan_cfg.ips_type = rt->spec.prof.ips_type;
+    if (rt->spec.prof.enabled) {
         scan_cfg.ips_type = rt->spec.prof.ips_type;
-        if (rt->spec.prof.enabled) {
-            scan_cfg.ips_type = rt->spec.prof.ips_type;
-            if (rt->spec.prof.port > 0) scan_cfg.port = rt->spec.prof.port;
-            if (rt->spec.prof.http_port > 0) scan_cfg.http_port = rt->spec.prof.http_port;
-            if (rt->spec.prof.delay_ms > 0) scan_cfg.delay_ms = rt->spec.prof.delay_ms;
-            if (rt->spec.prof.task > 0) scan_cfg.task = rt->spec.prof.task;
-            if (rt->spec.prof.ipnum > 0) scan_cfg.ipnum = rt->spec.prof.ipnum;
-            if (rt->spec.prof.num > 0) scan_cfg.num = rt->spec.prof.num;
-            scan_cfg.code = rt->spec.prof.code; /* 包含 code==0 */
-            if (rt->spec.prof.domain[0]) snprintf(scan_cfg.domain, sizeof(scan_cfg.domain), "%s", rt->spec.prof.domain);
-            if (rt->spec.prof.colo[0]) snprintf(scan_cfg.colo, sizeof(scan_cfg.colo), "%s", rt->spec.prof.colo);
-            if (rt->spec.prof.v6_split > 0) scan_cfg.v6_split = rt->spec.prof.v6_split;
+        if (rt->spec.prof.port > 0) scan_cfg.port = rt->spec.prof.port;
+        if (rt->spec.prof.http_port > 0) scan_cfg.http_port = rt->spec.prof.http_port;
+        if (rt->spec.prof.delay_ms > 0) scan_cfg.delay_ms = rt->spec.prof.delay_ms;
+        if (rt->spec.prof.task > 0) scan_cfg.task = rt->spec.prof.task;
+        if (rt->spec.prof.ipnum > 0) scan_cfg.ipnum = rt->spec.prof.ipnum;
+        if (rt->spec.prof.num > 0) scan_cfg.num = rt->spec.prof.num;
+        scan_cfg.code = rt->spec.prof.code;
+        if (rt->spec.prof.domain[0]) snprintf(scan_cfg.domain, sizeof(scan_cfg.domain), "%s", rt->spec.prof.domain);
+        if (rt->spec.prof.colo[0]) snprintf(scan_cfg.colo, sizeof(scan_cfg.colo), "%s", rt->spec.prof.colo);
+        if (rt->spec.prof.v6_split > 0) scan_cfg.v6_split = rt->spec.prof.v6_split;
+    }
+    size_t target_ipnum = (size_t)scan_cfg.ipnum;
+    if (target_ipnum == 0) target_ipnum = 20;
+
+    /* 存活门槛: 25% 且保底至少 3 个 (若 target_ipnum 较小则不超过 target_ipnum) */
+    size_t min_survivors = target_ipnum * 25 / 100;
+    if (min_survivors < 3) min_survivors = 3;
+    if (min_survivors > target_ipnum) min_survivors = target_ipnum;
+
+    /* 2. 提取当前候选池中的所有 IP 进行原地快速并发测活 (In-place Re-test) */
+    StringList pool_ips = {0};
+    pthread_mutex_lock(&rt->candidates.mu);
+    size_t old_len = rt->candidates.len;
+    for (size_t i = 0; i < old_len; i++) {
+        if (rt->candidates.items && rt->candidates.items[i].ip[0]) {
+            strlist_add(&pool_ips, rt->candidates.items[i].ip);
         }
+    }
+    pthread_mutex_unlock(&rt->candidates.mu);
+
+    ResultList survivors = {0};
+    if (pool_ips.len > 0) {
+        Config retest_cfg = scan_cfg;
+        if (retest_cfg.task > (int)pool_ips.len) retest_cfg.task = (int)pool_ips.len;
+        if (rt->spec.use_baidu_proxy == 2) {
+            ResultList direct_res = scan_ips(&pool_ips, NULL, &retest_cfg, NULL);
+            ResultList baidu_res = {0};
+            if (rt->proxy_pool && rt->proxy_pool->len > 0) {
+                baidu_res = scan_ips(&pool_ips, NULL, &retest_cfg, rt->proxy_pool);
+            }
+            pthread_mutex_init(&survivors.mu, NULL);
+            for (size_t j = 0; j < direct_res.len; j++) resultlist_add(&survivors, &direct_res.items[j]);
+            for (size_t j = 0; j < baidu_res.len; j++) {
+                int exists = 0;
+                for (size_t k = 0; k < survivors.len; k++) {
+                    if (strcmp(survivors.items[k].ip, baidu_res.items[j].ip) == 0) { exists = 1; break; }
+                }
+                if (!exists) resultlist_add(&survivors, &baidu_res.items[j]);
+            }
+            free(direct_res.items);
+            free(baidu_res.items);
+            if (survivors.len > 0) qsort(survivors.items, survivors.len, sizeof(Result), cmp_result);
+        } else {
+            survivors = scan_ips(&pool_ips, NULL, &retest_cfg, rt->proxy_pool);
+        }
+        strlist_free(&pool_ips);
+    }
+
+    /* 3. 判定原地测活存活数量:
+       分支 1: 存活数量达到门槛 (>= min_survivors)，直接原地自愈，完全无需全量扫描！ */
+    if (survivors.len >= min_survivors) {
+        pthread_mutex_lock(&rt->candidates.mu);
+        free(rt->candidates.items);
+        rt->candidates.items = survivors.items;
+        rt->candidates.len = survivors.len;
+        rt->candidates.current_index = 0;
+        snprintf(rt->candidates.current_ip, sizeof(rt->candidates.current_ip), "%s", survivors.items[0].ip);
+        rt->candidates.fast_fail_count = 0;
+        pthread_mutex_unlock(&rt->candidates.mu);
+        atomic_store(&rt->candidates.cache_valid, 1);
+
+        log_msg("%s 候选池原地测活完成: 存活 %zu/%zu 个 (>= 门槛 %zu)，成功自愈，已切回最优 IP: %s (延迟 %d ms)",
+                carrier_display_name(rt->spec.mode), survivors.len, old_len, min_survivors,
+                survivors.items[0].ip, survivors.items[0].delay);
+
+        save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), survivors.items, survivors.len);
+        return 1;
+    }
+
+    /* 分支 2: 存活数量不足 (< min_survivors)，执行带电增量补充扫描 */
+    if (survivors.len > 0) {
+        /* 关键优化：绝不清空可用 IP，立即将当前转发切换到最优存活 IP，保障客户端零断流！ */
+        pthread_mutex_lock(&rt->candidates.mu);
+        snprintf(rt->candidates.current_ip, sizeof(rt->candidates.current_ip), "%s", survivors.items[0].ip);
+        rt->candidates.fast_fail_count = 0;
+        pthread_mutex_unlock(&rt->candidates.mu);
+        atomic_store(&rt->candidates.cache_valid, 1);
+
+        log_msg("%s 存活候选较少 (%zu/%zu < 门槛 %zu)，保持最优存活 IP %s 维持正常转发，后台启动补充扫描...",
+                carrier_display_name(rt->spec.mode), survivors.len, old_len, min_survivors, survivors.items[0].ip);
+    } else {
+        warn_msg("%s 候选池已全部失效，启动扫描寻找可用候选 IP", carrier_display_name(rt->spec.mode));
+        atomic_store(&rt->candidates.cache_valid, 0);
+    }
+
+    for (;;) {
+        if (!atomic_load(&g_running)) {
+            free(survivors.items);
+            return 0;
+        }
+
+        /* 后台扫描时温和并发，避免瞬间把带宽打满导致正在转发的连接剧烈抖动 */
+        Config fresh_cfg = scan_cfg;
+        if (fresh_cfg.task > 60) fresh_cfg.task = 50;
+
         int cur_v6_split = (rt->spec.prof.enabled && rt->spec.prof.v6_split > 0) ? rt->spec.prof.v6_split : g_cfg.v6_split;
         StringList ips = load_ip_list(ipfile, rt->spec.prof.enabled ? rt->spec.prof.random_mode : g_cfg.random_mode, cur_v6_split);
         if (ips.len == 0) {
             warn_msg("%s 没有可扫描的 IP，3 秒后重试", carrier_display_name(rt->spec.mode));
-            if (sleep_interruptible_ms(3000) != 0) return 0;
+            if (sleep_interruptible_ms(3000) != 0) {
+                free(survivors.items);
+                return 0;
+            }
             continue;
         }
-        ResultList results = {0};
+
+        ResultList fresh_results = {0};
         if (rt->spec.use_baidu_proxy == 2) {
-            // 混合模式重扫描
-            ResultList results_direct = scan_ips(&ips, NULL, &scan_cfg, NULL);
+            ResultList results_direct = scan_ips(&ips, NULL, &fresh_cfg, NULL);
             ResultList results_baidu = {0};
             if (rt->proxy_pool && rt->proxy_pool->len > 0) {
-                results_baidu = scan_ips(&ips, NULL, &scan_cfg, rt->proxy_pool);
+                results_baidu = scan_ips(&ips, NULL, &fresh_cfg, rt->proxy_pool);
             }
-            pthread_mutex_init(&results.mu, NULL);
-            for (size_t j = 0; j < results_direct.len; j++) {
-                resultlist_add(&results, &results_direct.items[j]);
-            }
+            pthread_mutex_init(&fresh_results.mu, NULL);
+            for (size_t j = 0; j < results_direct.len; j++) resultlist_add(&fresh_results, &results_direct.items[j]);
             for (size_t j = 0; j < results_baidu.len; j++) {
                 int exists = 0;
-                for (size_t k = 0; k < results.len; k++) {
-                    if (strcmp(results.items[k].ip, results_baidu.items[j].ip) == 0) {
-                        exists = 1;
-                        break;
-                    }
+                for (size_t k = 0; k < fresh_results.len; k++) {
+                    if (strcmp(fresh_results.items[k].ip, results_baidu.items[j].ip) == 0) { exists = 1; break; }
                 }
-                if (!exists) {
-                    resultlist_add(&results, &results_baidu.items[j]);
-                }
+                if (!exists) resultlist_add(&fresh_results, &results_baidu.items[j]);
             }
             free(results_direct.items);
             free(results_baidu.items);
-            if (results.len > 0) {
-                qsort(results.items, results.len, sizeof(Result), cmp_result);
-            }
+            if (fresh_results.len > 0) qsort(fresh_results.items, fresh_results.len, sizeof(Result), cmp_result);
         } else {
-            // 普通模式重扫描
-            results = scan_ips(&ips, NULL, &scan_cfg, rt->proxy_pool);
+            fresh_results = scan_ips(&ips, NULL, &fresh_cfg, rt->proxy_pool);
         }
         strlist_free(&ips);
-        if (results.len == 0) {
-            warn_msg("%s 重新扫描后仍未发现有效 IP，3 秒后重试", carrier_display_name(rt->spec.mode));
-            if (sleep_interruptible_ms(3000) != 0) return 0;
+
+        /* 合并 survivors 与 fresh_results (去重) */
+        ResultList merged = {0};
+        pthread_mutex_init(&merged.mu, NULL);
+        for (size_t j = 0; j < survivors.len; j++) {
+            resultlist_add(&merged, &survivors.items[j]);
+        }
+        for (size_t j = 0; j < fresh_results.len; j++) {
+            int exists = 0;
+            for (size_t k = 0; k < merged.len; k++) {
+                if (strcmp(merged.items[k].ip, fresh_results.items[j].ip) == 0) { exists = 1; break; }
+            }
+            if (!exists) resultlist_add(&merged, &fresh_results.items[j]);
+        }
+        free(fresh_results.items);
+
+        if (merged.len == 0) {
+            pthread_mutex_destroy(&merged.mu);
+            warn_msg("%s 扫描后仍未发现有效 IP，3 秒后重试", carrier_display_name(rt->spec.mode));
+            if (sleep_interruptible_ms(3000) != 0) {
+                free(survivors.items);
+                return 0;
+            }
             continue;
         }
-        /* 加锁保护 items 的赋值，防止与 carrier_choose_ip_for_connection 中的读取竞态 */
+
+        pthread_mutex_destroy(&merged.mu);
+        qsort(merged.items, merged.len, sizeof(Result), cmp_result);
+        if (merged.len > target_ipnum) merged.len = target_ipnum;
+
+        /* 双缓冲原子切换：释放老 items 并挂载 merged */
+        free(survivors.items);
         pthread_mutex_lock(&rt->candidates.mu);
-        rt->candidates.items = results.items;
-        rt->candidates.len = results.len;
+        free(rt->candidates.items);
+        rt->candidates.items = merged.items;
+        rt->candidates.len = merged.len;
+        rt->candidates.current_index = 0;
+        snprintf(rt->candidates.current_ip, sizeof(rt->candidates.current_ip), "%s", merged.items[0].ip);
+        rt->candidates.fast_fail_count = 0;
         pthread_mutex_unlock(&rt->candidates.mu);
-        log_msg("%s 重新扫描得到 %zu 个候选 IP", carrier_display_name(rt->spec.mode), rt->candidates.len);
-        save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), results.items, results.len);
-        save_env_cidr_records(rt->spec.prof.ips_type, results.items, results.len);
-        if (carrier_select_valid_ip(rt)) return 1;
-        pthread_mutex_lock(&rt->candidates.mu);
-        free(results.items);
-        rt->candidates.items = NULL;
-        rt->candidates.len = 0;
-        pthread_mutex_unlock(&rt->candidates.mu);
-        warn_msg("%s 重新扫描得到的候选 IP 健康检查均失败，3 秒后重试", carrier_display_name(rt->spec.mode));
-        if (sleep_interruptible_ms(3000) != 0) return 0;
+        atomic_store(&rt->candidates.cache_valid, 1);
+
+        log_msg("%s 补充扫描完成: 候选池已补齐至 %zu 个，已切换至最优 IP: %s (延迟 %d ms)",
+                carrier_display_name(rt->spec.mode), rt->candidates.len, merged.items[0].ip, merged.items[0].delay);
+
+        save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), merged.items, merged.len);
+        save_env_cidr_records(rt->spec.prof.ips_type, merged.items, merged.len);
+        return 1;
     }
 }
 
@@ -4230,7 +4355,7 @@ static void *carrier_health_thread(void *arg) {
     long last = 0;
     int consecutive_success = 0;  /* P1-HC: 连续成功次数，用于决定检查级别 */
     while (atomic_load(&g_running)) {
-        if (sleep_interruptible_ms(10000) != 0) break;
+        if (sleep_interruptible_ms(30000) != 0) break;
         char ip[MAX_IP_LEN];
         carrier_get_current_ip(rt, ip, sizeof(ip));
 
@@ -4262,7 +4387,7 @@ static void *carrier_health_thread(void *arg) {
         if (fail >= 2) {
             log_msg("%s 连续两次状态检查失败，切换到下一个 IP", carrier_display_name(rt->spec.mode));
             if (!carrier_switch_next_ip(rt)) {
-                log_msg("%s 没有更多可用 IP，开始重新扫描", carrier_display_name(rt->spec.mode));
+                log_msg("%s 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护候选池", carrier_display_name(rt->spec.mode));
                 if (!carrier_rescan_and_select_ip(rt)) {
                     atomic_store(&g_running, 0);
                     return NULL;
