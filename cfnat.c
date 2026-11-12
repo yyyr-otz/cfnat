@@ -4231,7 +4231,7 @@ static int carrier_rescan_and_select_ip(CarrierRuntime *rt) {
 
         log_msg("%s 候选池原地测活完成: 存活 %zu/%zu 个 (>= 门槛 %zu)，成功自愈，已切回最优 IP: %s (延迟 %d ms)",
                 carrier_display_name(rt->spec.mode), survivors.len, old_len, min_survivors,
-                survivors.items[0].ip, survivors.items[0].delay);
+                survivors.items[0].ip, survivors.items[0].latency_ms);
 
         save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), survivors.items, survivors.len);
         return 1;
@@ -4340,7 +4340,7 @@ static int carrier_rescan_and_select_ip(CarrierRuntime *rt) {
         atomic_store(&rt->candidates.cache_valid, 1);
 
         log_msg("%s 补充扫描完成: 候选池已补齐至 %zu 个，已切换至最优 IP: %s (延迟 %d ms)",
-                carrier_display_name(rt->spec.mode), rt->candidates.len, merged.items[0].ip, merged.items[0].delay);
+                carrier_display_name(rt->spec.mode), rt->candidates.len, merged.items[0].ip, merged.items[0].latency_ms);
 
         save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), merged.items, merged.len);
         save_env_cidr_records(rt->spec.prof.ips_type, merged.items, merged.len);
@@ -4502,7 +4502,7 @@ static socket_t listen_tcp(const char *addr) {
     if (strchr(host, ':')) {
         socket_t fd = socket(AF_INET6, SOCK_STREAM, 0);
         if (cfnat_socket_invalid(fd)) return INVALID_SOCKET;
-        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+        setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const void *)&yes, sizeof(yes));
 #ifdef SO_REUSEPORT
         setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes));
 #endif
@@ -4530,7 +4530,7 @@ static socket_t listen_tcp(const char *addr) {
     }
     socket_t fd = socket(AF_INET, SOCK_STREAM, 0);
     if (cfnat_socket_invalid(fd)) return INVALID_SOCKET;
-    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const void *)&yes, sizeof(yes));
 #ifdef SO_REUSEPORT
     setsockopt(fd, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes));
 #endif
