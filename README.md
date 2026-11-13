@@ -1,8 +1,8 @@
 # cfnat C 版 (现代平台优化版)
 
-面向低内存环境的 **Cloudflare IP 扫描 + 单端口 TCP 转发** 工具。
+面向低内存环境的 **Cloudflare IP 扫描 + 单端口 TCP/UDP (H2/H3) 双轨透明转发** 工具。
 
-当前版本针对 **Linux、Windows 11 及 Android Termux 现代平台（amd64 / arm64）** 进行了专项热路径优化、零拷贝吞吐提升、I/O 抽象层加固与 Android 沙箱兼容适配。
+当前版本针对 **Linux、Windows 11 及 Android Termux 现代平台（amd64 / arm64）** 进行了专项热路径优化、零拷贝吞吐提升、I/O 抽象层加固、Android 沙箱兼容适配，并全面引入了 **HTTP/2 (TCP) 与 HTTP/3 (QUIC/UDP) 双轨独立测优与协同转发机制（v0.0.16-dual）**。
 
 核心目标是保留扫描、优选、转发、健康检查、百度前置代理和双方案监听等核心能力的同时，尽量压低常驻内存占用，非常适合 OpenWrt/软路由、手机 Termux、小内存 VPS 以及 Windows 11 设备。
 
@@ -52,21 +52,46 @@
 
 ## 项目定位与转发链路
 
-cfnat C 版做三件事：
-1. 扫描 Cloudflare IP，按数据中心、延迟、丢包率筛出候选节点。
-2. 在本机监听一个 TCP 端口，自动识别 TLS / 非 TLS 流量。
-3. 把客户端连接转发到当前可用的 Cloudflare 优选 IP，并在失败时自动切换。
+cfnat C 版做四件事：
+1. **智能扫描与两阶段过采样**：扫描 Cloudflare IP，初筛 TCP (H2) 候选池，并基于轻量 QUIC 探针精筛出 UDP (H3) 专用候选池。
+2. **同端口 TCP/UDP 双轨并发监听**：在同一本地端口（如 `127.0.0.1:4443`）同时监听 TCP 与 UDP 数据报。
+3. **精准双轨独立路由转发**：
+   - TCP 连接（H2/TLS）转发至当前**TCP 优选 IP**（支持自动识别首字节 `0x16` 分流 443 或 80 端口）；
+   - UDP 报文（H3/QUIC）转发至当前**UDP 优选 IP:443**，会话状态自动管理。
+4. **双轨协同自愈与热替换**：任何一个池见底时，自动触发一次性双轨原地测活与增量补齐，绝不阻塞断网。
 
-它只做纯粹的高性能 TCP 字节转发，不是 HTTP 反向代理，也不会解密或篡改业务数据。
+它只做纯粹的高性能传输层透明字节/报文转发，不是 HTTP 反向代理，也不会解密或篡改任何业务数据。
 
 ```text
-客户端  ──→  cfnat 本地监听端口  ──→  Cloudflare 优选 IP:443 或 :80
-                                  (可选) 百度前置节点(HTTP CONNECT)
+               ┌── [TCP: H2/TLS] ────→  cfnat 本地 TCP 端口  ────→  TCP 优选 IP:443
+               │
+客户端单端口接入
+ (127.0.0.1:4443)
+               │
+               └── [UDP: H3/QUIC] ───→  cfnat 本地 UDP 端口  ────→  UDP 优选 IP:443
 ```
 
 ---
 
 ## 核心特性
+
+- **H2 (TCP) + H3 (QUIC/UDP) 双轨独立测优与透明分流（v0.0.16-dual 独创）**：
+  - **痛点解决**：国内部分 ISP 对境外 UDP 443 存在严重 QoS 限制甚至黑洞，很多 TCP 延迟极佳的 IP 无法传输 QUIC；传统的“单优选 IP”会导致 H3 频繁断流或连不上。
+  - **独立路由**：同一监听地址（如 `127.0.0.1:4443`）上，TCP 流量自动打向 TCP 最优节点，UDP/QUIC 流量自动打向 UDP 响应最优节点。
+- **RFC 9000 规范的 1200 字节轻量 QUIC 版本协商探针（Version Negotiation Probe）**：
+  - 发送带有保留版本号 `0x5A5A5A5A` 的 1200 字节 QUIC Initial 数据包，诱导 Cloudflare 边缘节点立即回复 27 字节的 Version Negotiation 报文。
+  - **零加密算法库开销**（无需引入 BoringSSL/OpenSSL 等笨重依赖，保持纯单文件 C 极致轻量），**零 CPU 密钥计算消耗**，单包即可精确测得 UDP 443 真实往返 RTT，且完全符合 RFC 9000 防放大攻击要求（规避 Cloudflare 丢弃小包）。
+- **两阶段漏斗形 2× 过采样优选（Funnel Oversampling）**：
+  - TCP 先在全量 IP 中并发扫描出 Top 候选节点；
+  - 仅对 TCP 表现最好的前 `ipnum * 2` 个节点，以 25ms 间隔温和发送 QUIC 探针（避免并发激增被运营商 QoS 判定为扫描阻断），精选出延迟最佳的 `ipnum` 个节点建立 UDP 候选池；
+  - 若当地环境完全阻断 UDP 443，自动优雅降级使用 TCP 最优 IP，确保可靠性。
+- **双轨协同自愈机制（Coordinated Dual-Pool Self-Healing）**：
+  - **统一自愈引擎**：无论 TCP 池见底还是 UDP 池见底（存活低于 25% 或顺位消耗达 70%），互斥锁保障仅触发一次双轨原地测活与增量补充。
+  - **存活火种合并**：提取两池尚存活的 IP 与全新扫描结果统一排序重排，前 `ipnum` 补充 TCP 池，前 `2*ipnum` 精筛补充 UDP 池，双缓存文件（`direct-cache-v4.txt` 与 `direct-cache-v4-udp.txt`）同步沉淀持久化。
+- **双轨独立健康检查守护线程**：
+  - TCP 采用渐进式三级检测（FULL → MEDIUM → LIGHT）；
+  - UDP 采用 30 秒定时间歇式轻量 QUIC 探针；
+  - 任意轨道连续 2 次失败触发顺位切换，水位告警触发双轨协同自愈。
 
 - **渐进式三级健康检查**（FULL → MEDIUM → LIGHT）：新节点 FULL 探测建立基线，连续成功即逐级降级，任意失败立即升级至 FULL，以最小开销保障候选池质量。
 - **初筛 HTTP 200 深度状态校验**：延迟初筛后对可通 IP 执行完整的 HTTP 响应码（默认 200）验证，根除 Cloudflare IPv6 Anycast 伪通及 Error 1034（Edge IP Restricted）毒丸节点。
@@ -216,10 +241,15 @@ zig cc -target x86_64-windows-gnu -O2 -pipe -std=c11 -D_WIN32_WINNT=0x0A00 \
 ./cfnat -v4-listen=40000 -baidu-listen=40001 -colo=HKG
 ```
 
-### 6. 配合 Xray / Sing-box 出站优选
+### 6. 配合 Xray / Sing-box 出站优选（单端口 H2 + H3 全透明支持）
 ```bash
-./cfnat -v6-listen=443 -port=443 -http-port=80 -v6-code=200 -task=300 -exclude-colo=HKG
+# 本地监听 127.0.0.1:4443，自动开启 TCP/H2 与 UDP/H3 双轨测优
+./cfnat -v4-listen=127.0.0.1:4443 -colo=HKG,SJC -delay=200 -task=300
 ```
+客户端（如 Xray / v2rayN / Sing-box / Clash Verge）配置：
+- **服务器地址 (Address)**: `127.0.0.1`
+- **端口 (Port)**: `4443`
+- **协议说明**：无论客户端走普通的 TCP (VLESS/VMess + H2/XTLS)，还是走基于 UDP 的 HTTP/3 (QUIC)，客户端均连接 `127.0.0.1:4443`。cfnat 自动在底层将 TCP 流量导入 TCP 优选节点，将 UDP/QUIC 流量导入 H3 优选节点，无需客户端配置复杂分流！
 
 ---
 
@@ -270,6 +300,13 @@ C 版的核心价值是降低常驻资源占用。相较于 Go 版，C 版没有
 1. **顺位切换几乎瞬间完成（~0ms）**；
 2. **达到 70% 阈值时执行原地 300ms 快速并发测活**，只要有可用节点（$\ge 3$ 个或 $25\%$）即自动满血复原；
 3. **即使存活极少，也会保留最优节点继续承接客户端流量**，后台温和补仓后原子替换，彻底消灭断流掉线与报错。
+
+### 6. 为什么需要将 H2 与 H3 独立测优并在同一端口分别转发？
+- **现实网络差异**：国内部分宽带运营商（如移动、部分省份电信/联通）对境外 UDP 443 存在 QoS 严重限速甚至丢包策略。传统的测优工具只测 TCP，选出的最优 IP 往往在 TCP 下延迟极低，但 UDP 443 根本无法握手。若客户端启用了 HTTP/3 (QUIC)，就会出现页面加载超时、回退延迟严重甚至断流现象。
+- **单端口同构透明路由**：cfnat 在同一个本地监听地址（如 `127.0.0.1:4443`）上同时开启 TCP 与 UDP 监听。Xray / Sing-box / 浏览器等客户端只需将代理目标地址配置为 `127.0.0.1:4443`，无需在客户端上配置两套复杂的端口规则：
+  - 发送 TCP 连接（H2/TLS）时，cfnat 自动转发至经由 TCP 测优出的最优 IP；
+  - 发送 UDP 报文（H3/QUIC）时，cfnat 自动转发至经由 RFC 9000 QUIC 探针精选出的 H3 优选 IP；
+  - 真正做到了“一个配置端口，TCP 极速低延迟，UDP 稳通不断流”。
 
 ---
 
