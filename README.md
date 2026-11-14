@@ -1,8 +1,8 @@
-# cfnat C 版 (现代平台优化版)
+# cfnat C 版 (C23 纯静态现代平台版)
 
 面向低内存环境的 **Cloudflare IP 扫描 + 单端口 TCP/UDP (H2/H3) 双轨透明转发** 工具。
 
-当前版本针对 **Linux、Windows 11 及 Android Termux 现代平台（amd64 / arm64）** 进行了专项热路径优化、零拷贝吞吐提升、I/O 抽象层加固、Android 沙箱兼容适配，并全面引入了 **HTTP/2 (TCP) 与 HTTP/3 (QUIC/UDP) 双轨独立测优与协同转发机制（v0.0.16-dual）**。
+本项目采用最新的 **C23 国际标准 (ISO/IEC 9899:2024)** 进行现代化重构，针对 **Linux、Windows 11 及 Android Termux 现代平台（amd64 / arm64）** 构建**纯静态（Pure Static）独立二进制**，彻底剥离 glibc 依赖，根除一切跨发行版兼容性问题。同时全面集成了 **HTTP/2 (TCP) 与 HTTP/3 (QUIC/UDP) 双轨独立测优与协同转发机制（v0.0.17-c23）**。
 
 核心目标是保留扫描、优选、转发、健康检查、百度前置代理和双方案监听等核心能力的同时，尽量压低常驻内存占用，非常适合 OpenWrt/软路由、手机 Termux、小内存 VPS 以及 Windows 11 设备。
 
@@ -35,13 +35,13 @@
 - **Windows 11 EventLoop 事件驱动补齐**：完善非 epoll 平台下的 `evloop_wait_select` 回退实现，支持 Windows 下单套接字的非阻塞异步事件等待，解决 HTTP 探测时的虚假超时。
 - **Android Termux 沙箱审计兼容**：在 Android 平台下自动隔离 `splice` 系统调用，避免触发 Android `seccomp` 过滤机制报 `signal 31 (SIGSYS)` 错误，确保转发稳定。
 
-### 2. 目标平台支持矩阵
-当前重点维护与构建以下现代主流平台：
-- **Linux amd64 (x86_64)**：glibc 动态版 + musl 全静态独立版
-- **Linux arm64 (aarch64)**：glibc 动态版 + musl 全静态独立版（OpenWrt/软路由/ARM VPS 推荐）
-- **Android Termux (arm64 & amd64)**：官方 NDK r26b 编译，适配 Bionic libc 与 seccomp 审计，Termux 开箱即用
-- **Windows 11 amd64 (x86_64)**：Win11 原生纯静态可执行文件
-- **Windows 11 arm64 (aarch64)**：Surface / 骁龙 X Elite / ARM 笔记本原生运行
+### 2. 目标平台支持矩阵（纯静态架构）
+构建产物全面采用**纯静态（Pure Static）独立二进制**，无外部动态库依赖，开箱即用：
+- **Linux amd64 (x86_64)**：musl 纯静态独立二进制（`cfnat-linux-amd64`），仅需 Linux 3.10+ 内核，无视发行版差异（Ubuntu / Debian / Alpine / CentOS / OpenWrt / Arch 均可直接运行，彻底告别 `GLIBC_xxx not found` 动态库不兼容报错）
+- **Linux arm64 (aarch64)**：musl 纯静态独立二进制（`cfnat-linux-arm64`），适配各类 ARM VPS、树莓派及各类 OpenWrt 软路由
+- **Android Termux (arm64 & amd64)**：官方 NDK r26b 编译（`cfnat-android-arm64` / `cfnat-android-amd64`），适配 Bionic libc 与 Android 沙箱 seccomp 审计，Termux 免 root 开箱即用
+- **Windows 11 amd64 (x86_64)**：Win11 原生纯静态可执行文件（`cfnat-windows-amd64.exe`）
+- **Windows 11 arm64 (aarch64)**：Surface / 骁龙 X Elite / ARM 笔记本原生运行（`cfnat-windows-arm64.exe`）
 
 > **不再主动支持的平台**：
 > - Windows 7 / XP 及 32 位系统（宏定义已升级为 `_WIN32_WINNT=0x0A00` Win10/11）。
@@ -75,7 +75,12 @@ cfnat C 版做四件事：
 
 ## 核心特性
 
-- **H2 (TCP) + H3 (QUIC/UDP) 双轨独立测优与透明分流（v0.0.16-dual 独创）**：
+- **全面遵循 C23 现代语言标准与零开销契约（v0.0.17-c23）**：
+  - 核心源码全面遵循 ISO/IEC 9899:2024 (C23) 标准规范，全面引入 `nullptr` 类型安全空指针、`constexpr` 编译期常量及数字分隔符（如 `16'384`）；
+  - 采用 C23 标称类型枚举（`enum : uint8_t`），精确压缩枚举变量的内存占用并改善 CPU 缓存命中率；
+  - 注入 `[[nodiscard]]` 函数契约属性，严格杜绝关键资源、套接字与健康探测返回值被疏漏丢弃的潜在隐患；
+  - 彻底剥离动态库，发布纯静态 Linux 二进制，极大简化在各类路由器与轻量容器上的部署难度。
+- **H2 (TCP) + H3 (QUIC/UDP) 双轨独立测优与透明分流**：
   - **痛点解决**：国内部分 ISP 对境外 UDP 443 存在严重 QoS 限制甚至黑洞，很多 TCP 延迟极佳的 IP 无法传输 QUIC；传统的“单优选 IP”会导致 H3 频繁断流或连不上。
   - **独立路由**：同一监听地址（如 `127.0.0.1:4443`）上，TCP 流量自动打向 TCP 最优节点，UDP/QUIC 流量自动打向 UDP 响应最优节点。
 - **RFC 9000 规范的 1200 字节轻量 QUIC 版本协商探针（Version Negotiation Probe）**：
@@ -92,6 +97,10 @@ cfnat C 版做四件事：
   - TCP 采用渐进式三级检测（FULL → MEDIUM → LIGHT）；
   - UDP 采用 30 秒定时间歇式轻量 QUIC 探针；
   - 任意轨道连续 2 次失败触发顺位切换，水位告警触发双轨协同自愈。
+- **现代化分级与 ANSI 彩色日志系统（深度降噪与可视化）**：
+  - **默认级别彻底降噪**：日常转发连接（`[CONN]`）与健康检查成功汇报默认保持静默，仅在发生故障切换或自愈时告警，控制台杂音降低 95% 以上；
+  - **终端动态单行刷新**：扫描时在 TTY 终端下自动启用 `\r` 原地单行进度刷新，杜绝滚屏破坏终端历史；
+  - **全量调试与结果表格（`-log=debug`）**：在 DEBUG 模式下，实时流式打印每个被发现的有效 IP（含位置与延迟）、详细百分比进度，且无论命中缓存还是全新扫描，均以 ANSI 彩色高亮输出规整的候选池明细表格（绿/黄/红直观标识延迟）。
 
 - **渐进式三级健康检查**（FULL → MEDIUM → LIGHT）：新节点 FULL 探测建立基线，连续成功即逐级降级，任意失败立即升级至 FULL，以最小开销保障候选池质量。
 - **初筛 HTTP 200 深度状态校验**：延迟初筛后对可通 IP 执行完整的 HTTP 响应码（默认 200）验证，根除 Cloudflare IPv6 Anycast 伪通及 Error 1034（Edge IP Restricted）毒丸节点。
@@ -114,26 +123,30 @@ cfnat C 版做四件事：
 
 ## 快速开始与编译
 
-### 1. 本地编译
+### 1. 本地编译 (C23 标准)
 
-**Linux（glibc 动态版）**：
+推荐使用 Zig (`zig cc`) 或现代 Clang 17+ / GCC 14+ 进行编译：
+
+**Linux（musl 纯静态独立版，推荐任意 Linux 发行版及 OpenWrt）**：
 ```bash
-gcc -O2 -pipe -std=c11 -Wall -Wextra -Wno-unused-parameter \
-  ./cfnat.c -o ./cfnat-linux -pthread
+zig cc -target x86_64-linux-musl -O2 -pipe -std=c23 \
+  -Wall -Wextra -Wno-unused-parameter \
+  ./cfnat.c -o ./cfnat-linux-amd64 -pthread -static -s
 ```
 
-**Linux（musl 静态版，推荐给 OpenWrt / Alpine）**：
+**Linux ARM64（musl 纯静态独立版，适用于 OpenWrt / 树莓派 / ARM VPS）**：
 ```bash
-zig cc -target x86_64-linux-musl -O2 -pipe -std=c11 \
+zig cc -target aarch64-linux-musl -O2 -pipe -std=c23 \
   -Wall -Wextra -Wno-unused-parameter \
-  ./cfnat.c -o ./cfnat-linux-amd64-musl -pthread -static -s
+  ./cfnat.c -o ./cfnat-linux-arm64 -pthread -static -s
 ```
 
 **Windows 11（Zig 交叉编译）**：
 ```bash
-zig cc -target x86_64-windows-gnu -O2 -pipe -std=c11 -D_WIN32_WINNT=0x0A00 \
+zig cc -target x86_64-windows-gnu -O2 -pipe -std=c23 -D_WIN32_WINNT=0x0A00 \
+  -finput-charset=UTF-8 -fexec-charset=UTF-8 \
   -Wall -Wextra -Wno-unused-parameter \
-  ./cfnat.c -o ./cfnat.exe -lws2_32 -ldnsapi -lwininet -static -s
+  ./cfnat.c -o ./cfnat-windows-amd64.exe -lws2_32 -ldnsapi -lwininet -static -s
 ```
 
 ### 2. 启动示例
@@ -166,10 +179,11 @@ zig cc -target x86_64-windows-gnu -O2 -pipe -std=c11 -D_WIN32_WINNT=0x0A00 \
 
 ## 运行参数
 
-### 1. 监听模式参数（用于开启本地端口转发）
+### 1. 监听模式参数（用于开启本地端口转发与运行模式控制）
 
 | 参数 | 说明 | 默认值 |
 | :--- | :--- | :--- |
+| `-cli` / `-scan-only` | 显式开启 **单次 CLI 测速模式**。仅执行一次测速、在终端打印美化彩色候选 IP 表格并保存缓存文件后立即退出，绝不启动常驻转发监听服务。 | 留空不开启 (默认按监听参数启动常驻转发) |
 | `-v4-listen[=addr]` | 开启 IPv4 转发本地监听（不带参数时默认 `0.0.0.0:4443`；若全部未指定，则默认开启此项） | 缺省未显式指定时默认 `0.0.0.0:4443` |
 | `-v6-listen[=addr]` | 开启 IPv6 转发本地监听（不带参数时默认 `0.0.0.0:6443`） | 留空不开启 |
 | `-baidu-listen[=addr]` | 开启百度前置优选本地监听（不带参数时默认 `0.0.0.0:5444`） | 留空不开启 |
@@ -177,7 +191,8 @@ zig cc -target x86_64-windows-gnu -O2 -pipe -std=c11 -D_WIN32_WINNT=0x0A00 \
 
 > [!TIP]
 > - 支持同时指定任意多个监听参数（例如 `-v4-listen -v6-listen`），即可**单进程同时开启 IPv4 与 IPv6 双转发**，彻底告别多开两个程序的繁琐配置！
-> - 若 `-v4-listen`、`-v6-listen`、`-baidu-listen`、`-direct-listen` 均未指定，程序默认自动开启 IPv4 监听 `0.0.0.0:4443`。
+> - 若 `-v4-listen`、`-v6-listen`、`-baidu-listen`、`-direct-listen` 均未指定且未指定 `-cli` / `-scan-only`，程序默认自动开启 IPv4 转发监听 `0.0.0.0:4443`。
+> - 若仅需执行单次测速打印表格（不启动转发监听），请指定 `-cli` 或 `-scan-only`（如 `./cfnat -cli -colo=HKG`）。
 
 ### 2. 通用参数与协议级前缀参数
 
@@ -203,8 +218,8 @@ zig cc -target x86_64-windows-gnu -O2 -pipe -std=c11 -D_WIN32_WINNT=0x0A00 \
 | `-v6-split` | IPv6 /48 子网切分前缀掩码（有效范围 `48` ~ `64`）。<br>**默认 54：将每个 /48 切分为 64 个 /54 子网并在每个子网中随机抽样 1 个候选**（共生成约 4 万个离散候选，大幅增强路由与机房多样性）；<br>若设为 `48` 则每个 /48 仅抽样 1 个。生成的 IPv6 统一展开为标准的 8 段无缩写形式（如 `2606:4700:9a68:1591:f76d:d848:b5de:8e02`）。 | `54` (每个 /48 切分抽样 64 个) |
 | `-baidu-resolver` | 针对 Fake-IP 的百度解析方式: `auto` / `udp://` / `doh://` | `auto` |
 | `-bind-if` | 绑定出站物理网卡 (如 `eth0`、`en0`) | 留空使用默认路由 |
-| `-health-log` | 定时输出健康检查日志的间隔秒数 | `60` |
-| `-log` | 日志级别：`silent` / `error` / `warn` / `info` / `debug` | `info` |
+| `-health-log` | 定时输出健康检查日志的间隔秒数（仅在 `-log=debug` 时输出成功汇报，普通模式仅告警失败） | `60` |
+| `-log` / `-log-level` | 日志级别：`silent` / `error` / `warn` / `info` / `debug`。<br>**`info`（默认）**：日常转发与周期健康检查完全静默，仅输出关键里程碑（启动、自愈、故障切换等），彻底杜绝连接建立/断开刷屏；终端下支持单行原地刷新扫描进度；<br>**`debug`**：开启全量调试模式，实时输出扫描发现的每个有效 IP 及位置信息、详细百分比进度、无论命中缓存还是新扫描均完整打印候选 IP 表格，支持全局 ANSI 语法高亮。 | `info` |
 
 ---
 
@@ -222,9 +237,10 @@ zig cc -target x86_64-windows-gnu -O2 -pipe -std=c11 -D_WIN32_WINNT=0x0A00 \
 ./cfnat -v4-listen=127.0.0.1:1080 -v6-listen=2080 -port=8443
 ```
 
-### 3. 仅测速扫描（不监听）
+### 3. 仅测速扫描（CLI 单次测速模式，不监听端口）
 ```bash
-./cfnat -colo=HKG -delay=150 -ipnum=10
+# 执行单次测速，打印美化彩色候选表格并保存缓存后直接退出
+./cfnat -cli -colo=HKG -delay=150 -ipnum=10
 ```
 
 ### 4. 排除特定数据中心（反选模式，如排除 HKG）
@@ -256,13 +272,13 @@ zig cc -target x86_64-windows-gnu -O2 -pipe -std=c11 -D_WIN32_WINNT=0x0A00 \
 ## 构建与 GitHub Actions 发布
 
 工作流文件位于 `.github/workflows/build.yml`：
-- **自动构建产物**：
-  - `cfnat-linux-amd64` / `cfnat-linux-arm64` (glibc 动态版)
-  - `cfnat-linux-amd64-musl` / `cfnat-linux-arm64-musl` (musl 纯静态版)
+- **自动构建产物（全部为纯静态或原生免外部依赖二进制）**：
+  - `cfnat-linux-amd64` (Linux x86_64 musl 纯静态版)
+  - `cfnat-linux-arm64` (Linux aarch64 musl 纯静态版)
   - `cfnat-android-arm64` / `cfnat-android-amd64` (Android NDK Termux 原生版)
   - `cfnat-windows-amd64.exe` / `cfnat-windows-arm64.exe` (Win11 纯静态版)
 - **触发与发布方式**：
-  - **推送 Tag 发布**：推送形如 `v0.0.15` 的标签时自动触发编译并发布到 Release。
+  - **推送 Tag 发布**：推送形如 `v0.0.17` 的标签时自动触发编译并发布到 Release。
   - **手动网页触发发布**：在 GitHub Actions 页面点击 **Run workflow**，支持输入版本号或自动从 `cfnat.c` 提取版本号，支持重复发布时强制覆盖更新 Release 资源。
 
 ---
