@@ -707,8 +707,26 @@ static int cfnat_fputc(int ch, FILE *stream) {
     return ch;
 }
 
+#ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
+#define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
+#endif
+
 static void init_windows_console_utf8(void) {
     setlocale(LC_ALL, "");
+    HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
+    if (hOut != INVALID_HANDLE_VALUE && hOut != NULL) {
+        DWORD mode = 0;
+        if (GetConsoleMode(hOut, &mode)) {
+            SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
+    HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
+    if (hErr != INVALID_HANDLE_VALUE && hErr != NULL) {
+        DWORD mode = 0;
+        if (GetConsoleMode(hErr, &mode)) {
+            SetConsoleMode(hErr, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
+        }
+    }
 }
 
 #define printf cfnat_printf
@@ -717,6 +735,68 @@ static void init_windows_console_utf8(void) {
 #define fputc cfnat_fputc
 
 #endif
+
+#ifdef _WIN32
+#ifndef isatty
+#define isatty _isatty
+#endif
+#ifndef fileno
+#define fileno _fileno
+#endif
+#endif
+
+#define ANSI_RESET   "\033[0m"
+#define ANSI_BOLD    "\033[1m"
+#define ANSI_DIM     "\033[2m"
+#define ANSI_RED     "\033[31m"
+#define ANSI_GREEN   "\033[32m"
+#define ANSI_YELLOW  "\033[33m"
+#define ANSI_BLUE    "\033[34m"
+#define ANSI_MAGENTA "\033[35m"
+#define ANSI_CYAN    "\033[36m"
+#define ANSI_WHITE   "\033[37m"
+#define ANSI_GRAY    "\033[90m"
+
+static int terminal_has_color(FILE *stream) {
+    if (!stream) return 0;
+    int fd = fileno(stream);
+    if (fd < 0) return 0;
+    return isatty(fd);
+}
+
+static void print_results_table(const Result *items, size_t count, long duration_sec) {
+    if (!items || count == 0) return;
+    int use_color = terminal_has_color(stdout);
+    const char *c_ip = use_color ? (ANSI_CYAN ANSI_BOLD) : "";
+    const char *c_colo = use_color ? (ANSI_YELLOW ANSI_BOLD) : "";
+    const char *c_reg = use_color ? (ANSI_MAGENTA ANSI_BOLD) : "";
+    const char *c_city = use_color ? (ANSI_WHITE ANSI_BOLD) : "";
+    const char *c_lat = use_color ? (ANSI_GREEN ANSI_BOLD) : "";
+    const char *c_val_green = use_color ? ANSI_GREEN : "";
+    const char *c_val_yellow = use_color ? ANSI_YELLOW : "";
+    const char *c_val_red = use_color ? ANSI_RED : "";
+    const char *c_bold = use_color ? ANSI_BOLD : "";
+    const char *reset = use_color ? ANSI_RESET : "";
+
+    printf("\n%sIP 地址%s          | %s数据中心%s | %s地区%s          | %s城市%s        | %s延迟%s\n",
+           c_ip, reset, c_colo, reset, c_reg, reset, c_city, reset, c_lat, reset);
+    printf("-----------------+----------+---------------+---------------+---------\n");
+    for (size_t i = 0; i < count; i++) {
+        const Result *r = &items[i];
+        const char *lat_color = c_val_green;
+        if (r->latency_ms > 250) lat_color = c_val_red;
+        else if (r->latency_ms > 150) lat_color = c_val_yellow;
+
+        printf("%-16s | %-8s | %-13s | %-13s | %s%3d ms%s\n",
+               r->ip,
+               r->data_center[0] ? r->data_center : "UNK",
+               r->region[0] ? r->region : "-",
+               r->city[0] ? r->city : "-",
+               lat_color, r->latency_ms, reset);
+    }
+    printf("\n%s%s成功提取 %zu 个有效IP，耗时 %ld秒%s\n\n",
+           c_bold, c_val_green, count, duration_sec, reset);
+}
 
 static long now_ms(void) {
 #ifdef _WIN32
@@ -779,10 +859,25 @@ static void vlog_line(const char *tag, const char *fmt, va_list ap) {
 #endif
     char ts[32];
     strftime(ts, sizeof(ts), "%Y/%m/%d %H:%M:%S", &tmv);
+
+    int use_color = terminal_has_color(stderr);
+    const char *tag_color = "";
+    const char *time_color = use_color ? ANSI_GRAY : "";
+    const char *reset = use_color ? ANSI_RESET : "";
+
+    if (use_color) {
+        if (!strcmp(tag, "ERROR")) tag_color = ANSI_RED ANSI_BOLD;
+        else if (!strcmp(tag, "WARN")) tag_color = ANSI_YELLOW ANSI_BOLD;
+        else if (!strcmp(tag, "INFO")) tag_color = ANSI_GREEN;
+        else if (!strcmp(tag, "DEBUG")) tag_color = ANSI_MAGENTA;
+        else if (!strcmp(tag, "CONN")) tag_color = ANSI_BLUE;
+        else tag_color = ANSI_CYAN;
+    }
+
     pthread_mutex_lock(&g_log_mu);
-    fprintf(stderr, "%s [%s] ", ts, tag);
+    fprintf(stderr, "%s%s%s [%s%s%s] ", time_color, ts, reset, tag_color, tag, reset);
     vfprintf(stderr, fmt, ap);
-    fputc('\n', stderr);
+    fprintf(stderr, "%s\n", reset);
     fflush(stderr);
     pthread_mutex_unlock(&g_log_mu);
 }
@@ -812,7 +907,7 @@ static void debug_msg(const char *fmt, ...) {
 }
 
 static void conn_msg(const char *fmt, ...) {
-    if (g_cfg.log_level < LOG_INFO) return;
+    if (g_cfg.log_level < LOG_DEBUG) return; /* P1: 仅在 DEBUG 级别输出连接日志，杜绝日常刷屏 */
     va_list ap;
     va_start(ap, fmt);
     vlog_line("CONN", fmt, ap);
@@ -1064,12 +1159,15 @@ static void parse_args(Config *c, int argc, char **argv) {
         else if (!strcmp(key, "domain") && val) snprintf(c->domain, sizeof(c->domain), "%s", val);
         else if (!strcmp(key, "ipnum") && val) c->ipnum = atoi(val);
         else if (!strcmp(key, "ips") && val) c->ips_type = atoi(val);
-        else if (!strcmp(key, "log") && val) {
+        else if ((!strcmp(key, "log") || !strcmp(key, "log-level")) && val) {
             if (parse_log_level(val, &c->log_level) != 0) {
                 fprintf(stderr, "非法 -log=%s，可选值: silent, error, warn, info, debug\n", val);
                 exit(1);
             }
             snprintf(c->log_name, sizeof(c->log_name), "%s", log_level_name(c->log_level));
+        } else if (!strcmp(key, "debug")) {
+            c->log_level = LOG_DEBUG;
+            snprintf(c->log_name, sizeof(c->log_name), "debug");
         } else if (!strcmp(key, "num") && val) c->num = atoi(val);
         else if (!strcmp(key, "port") && val) c->port = atoi(val);
         else if (!strcmp(key, "http-port") && val) c->http_port = atoi(val);
@@ -3155,13 +3253,26 @@ static void *scan_worker(void *arg) {
         }
 
         uint64_t done = atomic_fetch_add(&ctx->completed, 1) + 1;
-        if (done == ctx->total || done % 5000 == 0) {
-            size_t found = 0;
-            pthread_mutex_lock(&ctx->results->mu);
-            found = ctx->results->len;
-            pthread_mutex_unlock(&ctx->results->mu);
-            log_msg("扫描进度: %llu/%llu，已发现有效 IP: %zu，耗时 %ld 秒",
-                    (unsigned long long)done, (unsigned long long)ctx->total, found, (now_ms() - ctx->scan_start_ms) / 1000);
+        uint64_t step = ctx->total / 100;
+        if (step < 5) step = 5;
+        if (step > 500) step = 500;
+
+        if (done == ctx->total || done % step == 0) {
+            double pct = (double)done * 100.0 / (double)(ctx->total > 0 ? ctx->total : 1);
+            if (pct > 100.0) pct = 100.0;
+            if (g_cfg.log_level >= LOG_DEBUG) {
+                if (done == ctx->total || done % (step * 5) == 0) {
+                    log_msg("已完成: %llu 总数: %llu 已完成: %.2f%%",
+                            (unsigned long long)done, (unsigned long long)ctx->total, pct);
+                }
+            } else if (terminal_has_color(stderr)) {
+                pthread_mutex_lock(&g_log_mu);
+                fprintf(stderr, "\r" ANSI_GRAY "[扫描进度]" ANSI_RESET " 已完成: " ANSI_BOLD "%llu" ANSI_RESET " / %llu (" ANSI_GREEN "%.2f%%" ANSI_RESET ")",
+                        (unsigned long long)done, (unsigned long long)ctx->total, pct);
+                if (done == ctx->total) fprintf(stderr, "\n");
+                fflush(stderr);
+                pthread_mutex_unlock(&g_log_mu);
+            }
         }
         if (success_count <= 0 || !best_colo[0] || best_latency <= 0) continue;
 
@@ -3234,9 +3345,17 @@ static void *scan_worker(void *arg) {
             snprintf(r.region, sizeof(r.region), "%s", "Unknown");
             snprintf(r.city, sizeof(r.city), "%s", "Unknown");
         }
-        debug_msg("发现有效IP %s 位置信息 %s 延迟 %d 毫秒 EWMA %d 抖动 %d 丢包 %d%% (%d/%d)",
-                  r.ip, r.city[0] ? r.city : "未知", r.latency_ms, r.ewma_latency, r.jitter_ms,
-                  r.loss_rate, r.success_count, r.probe_count);
+        if (g_cfg.log_level >= LOG_DEBUG) {
+            int use_color = terminal_has_color(stderr);
+            const char *c_ip = use_color ? ANSI_CYAN : "";
+            const char *c_loc = use_color ? ANSI_YELLOW : "";
+            const char *c_ms = use_color ? ANSI_GREEN : "";
+            const char *reset = use_color ? ANSI_RESET : "";
+            debug_msg("发现有效IP %s%s%s 位置信息 %s%s%s 延迟 %s%d%s 毫秒",
+                      c_ip, r.ip, reset,
+                      c_loc, r.city[0] ? r.city : (r.region[0] ? r.region : "未知"), reset,
+                      c_ms, r.latency_ms, reset);
+        }
 
         /* thread-local 积累 */
         if (local_count < LOCAL_MAX) {
@@ -3702,6 +3821,14 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
             rt->candidates.items ? rt->candidates.items[0].latency_ms : 0,
             rt->udp_candidates.current_ip[0] ? rt->udp_candidates.current_ip : rt->candidates.current_ip,
             rt->udp_candidates.items ? rt->udp_candidates.items[0].latency_ms : 0);
+    if (g_cfg.log_level >= LOG_DEBUG) {
+        log_msg("%s [DEBUG] 已载入缓存的 TCP 候选 IP 列表 (共 %zu 个):", carrier_display_name(rt->spec.mode), rt->candidates.len);
+        print_results_table(rt->candidates.items, rt->candidates.len, 0);
+        if (rt->udp_candidates.len > 0) {
+            log_msg("%s [DEBUG] 已载入缓存的 UDP/H3 候选 IP 列表 (共 %zu 个):", carrier_display_name(rt->spec.mode), rt->udp_candidates.len);
+            print_results_table(rt->udp_candidates.items, rt->udp_candidates.len, 0);
+        }
+    }
     return 1;
 }
 
@@ -3759,6 +3886,9 @@ static ResultList scan_ips(StringList *ips, CidrList *cidrs, Config *cfg, BaiduP
     qsort(rl.items, rl.len, sizeof(Result), cmp_result);
     if (rl.len > (size_t)cfg->ipnum) rl.len = (size_t)cfg->ipnum;
     log_msg("扫描完成: 有效候选 %zu 个，耗时 %ld 秒", rl.len, (now_ms() - ctx.scan_start_ms) / 1000);
+    if (cfg->log_level >= LOG_DEBUG) {
+        print_results_table(rl.items, rl.len, (now_ms() - ctx.scan_start_ms) / 1000);
+    }
     if (rl.len == 0 || cfg->log_level >= LOG_DEBUG) {
         log_msg("扫描统计: 连接失败 %zu，读取响应失败 %zu，缺少 CF-RAY %zu，数据中心过滤 %zu，状态码不匹配 %zu",
                 atomic_load(&ctx.connect_fail),
@@ -4679,8 +4809,8 @@ static void *carrier_health_thread(void *arg) {
             consecutive_success++;
             atomic_store(&rt->candidates.cache_valid, 1);
             long n = now_ms();
-            if (g_cfg.health_log > 0 && n - last >= g_cfg.health_log * 1000L) {
-                log_msg("%s TCP 状态检查成功: 当前 IP %s 可用", carrier_display_name(rt->spec.mode), ip);
+            if (g_cfg.log_level >= LOG_DEBUG && g_cfg.health_log > 0 && n - last >= g_cfg.health_log * 1000L) {
+                debug_msg("%s TCP 状态检查成功: 当前 IP %s 可用", carrier_display_name(rt->spec.mode), ip);
                 last = n;
             }
         }
@@ -4725,9 +4855,9 @@ static void *carrier_udp_health_thread(void *arg) {
             fail = 0;
             atomic_store(&rt->udp_candidates.cache_valid, 1);
             long n = now_ms();
-            if (g_cfg.health_log > 0 && n - last_log >= g_cfg.health_log * 1000L) {
-                log_msg("%s UDP/H3 状态检查成功: 当前 IP %s 可用 (延迟 %d ms)",
-                        carrier_display_name(rt->spec.mode), ip, latency);
+            if (g_cfg.log_level >= LOG_DEBUG && g_cfg.health_log > 0 && n - last_log >= g_cfg.health_log * 1000L) {
+                debug_msg("%s UDP/H3 状态检查成功: 当前 IP %s 可用 (延迟 %d ms)",
+                          carrier_display_name(rt->spec.mode), ip, latency);
                 last_log = n;
             }
         }
@@ -5715,17 +5845,18 @@ int main(int argc, char **argv) {
         }
     }
     strlist_free(&ips);
-    if (!cache_hit) {
-        printf("候选池统计\n");
-        printf("候选总数: %zu\n", results.len);
-        printf("IP 地址 | 数据中心 | 地区 | 城市 | 延迟 | 丢包 | 探测成功\n");
-        for (size_t i = 0; i < results.len; i++) printf("%s | %s | %s | %s | %d ms | %d%% | %d/%d\n", results.items[i].ip, results.items[i].data_center, results.items[i].region, results.items[i].city, results.items[i].latency_ms, results.items[i].loss_rate, results.items[i].success_count, results.items[i].probe_count);
+    if (!cache_hit || g_cfg.log_level >= LOG_DEBUG) {
+        print_results_table(results.items, results.len, (now_ms() - start) / 1000);
     }
-    printf("成功提取 %zu 个有效IP，耗时 %ld秒\n", results.len, (now_ms() - start) / 1000);
     if (results.len > 0) {
-        printf("评分最优 IP: %s\n", results.items[0].ip);
-        printf("最佳延迟: %d ms\n", results.items[0].latency_ms);
-        printf("最佳丢包率: %d%%\n", results.items[0].loss_rate);
+        int use_color = terminal_has_color(stdout);
+        const char *c_bold = use_color ? ANSI_BOLD : "";
+        const char *c_cyan = use_color ? ANSI_CYAN : "";
+        const char *c_green = use_color ? ANSI_GREEN : "";
+        const char *reset = use_color ? ANSI_RESET : "";
+        printf("%s评分最优 IP:%s %s%s%s\n", c_bold, reset, c_cyan, results.items[0].ip, reset);
+        printf("%s最佳延迟:%s %s%d ms%s\n", c_bold, reset, c_green, results.items[0].latency_ms, reset);
+        printf("%s最佳丢包率:%s %s%d%%%s\n", c_bold, reset, c_green, results.items[0].loss_rate, reset);
         explain_selected_result(&results.items[0]);
     }
     free(results.items);
