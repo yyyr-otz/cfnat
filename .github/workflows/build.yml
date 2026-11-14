@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Release 标签版本（例如 v0.0.15，留空则自动从 cfnat.c 提取版本）'
+        description: 'Release 标签版本（例如 v0.0.x，留空则自动从 cfnat.c 提取版本）'
         required: false
         default: ''
       prerelease:
@@ -19,74 +19,6 @@ permissions:
   contents: write
 
 jobs:
-  build-linux-glibc:
-    name: Build ${{ matrix.name }} glibc dynamic
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: linux-amd64
-            artifact: cfnat-linux-amd64
-            packages: gcc libc6-dev
-            cc: gcc
-            cflags: ""
-            ldflags: ""
-          - name: linux-arm64
-            artifact: cfnat-linux-arm64
-            packages: gcc-aarch64-linux-gnu libc6-dev-arm64-cross
-            cc: aarch64-linux-gnu-gcc
-            cflags: ""
-            ldflags: ""
-
-    env:
-      SOURCE_FILE: cfnat.c
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 1
-          token: ${{ github.token }}
-
-      - name: Install compiler and tools
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            ${{ matrix.packages }} \
-            file \
-            ca-certificates
-
-      - name: Build Linux glibc dynamic
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p dist
-
-          if [ ! -f "$SOURCE_FILE" ]; then
-            echo "SOURCE_FILE '$SOURCE_FILE' not found" >&2
-            exit 1
-          fi
-
-          ${{ matrix.cc }} \
-            -O2 -pipe -std=c11 \
-            -Wall -Wextra -Wno-unused-parameter ${{ matrix.cflags }} \
-            "$SOURCE_FILE" -o "dist/${{ matrix.artifact }}" \
-            -pthread ${{ matrix.ldflags }}
-
-          strip "dist/${{ matrix.artifact }}" || true
-          file "dist/${{ matrix.artifact }}"
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v7
-        with:
-          name: ${{ matrix.artifact }}
-          path: dist/${{ matrix.artifact }}
-          if-no-files-found: error
-
-
   build-linux-musl:
     name: Build ${{ matrix.name }} musl static
     runs-on: ubuntu-latest
@@ -94,12 +26,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - name: linux-amd64-musl
-            artifact: cfnat-linux-amd64-musl
+          - name: linux-amd64
+            artifact: cfnat-linux-amd64
             zig_target: x86_64-linux-musl
             cflags: ""
-          - name: linux-arm64-musl
-            artifact: cfnat-linux-arm64-musl
+          - name: linux-arm64
+            artifact: cfnat-linux-arm64
             zig_target: aarch64-linux-musl
             cflags: ""
 
@@ -162,7 +94,7 @@ jobs:
 
           zig version
 
-          zig cc -target ${{ matrix.zig_target }} -O2 -pipe -std=c11 \
+          zig cc -target ${{ matrix.zig_target }} -O2 -pipe -std=c23 \
             -Wall -Wextra -Wno-unused-parameter ${{ matrix.cflags }} \
             "$SOURCE_FILE" -o "dist/${{ matrix.artifact }}" \
             -pthread -static -s
@@ -249,7 +181,7 @@ jobs:
           fi
 
           zig cc -target ${{ matrix.zig_target }} \
-            -O2 -pipe -std=c11 -D_WIN32_WINNT=0x0A00 \
+            -O2 -pipe -std=c23 -D_WIN32_WINNT=0x0A00 \
             -finput-charset=UTF-8 -fexec-charset=UTF-8 \
             -Wall -Wextra -Wno-unused-parameter \
             "$SOURCE_FILE" -o "dist/${{ matrix.artifact }}" \
@@ -313,7 +245,7 @@ jobs:
           STRIP="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
 
           "$CC" \
-            -O2 -pipe -std=c11 -Wall -Wextra -Wno-unused-parameter \
+            -O2 -pipe -std=c23 -Wall -Wextra -Wno-unused-parameter \
             -D__ANDROID__ \
             "$SOURCE_FILE" -o "dist/${{ matrix.artifact }}" \
             -pthread
@@ -332,7 +264,6 @@ jobs:
   release:
     name: Publish release
     needs:
-      - build-linux-glibc
       - build-linux-musl
       - build-windows
       - build-android
