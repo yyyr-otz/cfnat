@@ -39,7 +39,7 @@
 构建产物全面采用**纯静态（Pure Static）独立二进制**，无外部动态库依赖，开箱即用：
 - **Linux amd64 (x86_64)**：musl 纯静态独立二进制（`cfnat-linux-amd64`），仅需 Linux 3.10+ 内核，无视发行版差异（Ubuntu / Debian / Alpine / CentOS / OpenWrt / Arch 均可直接运行，彻底告别 `GLIBC_xxx not found` 动态库不兼容报错）
 - **Linux arm64 (aarch64)**：musl 纯静态独立二进制（`cfnat-linux-arm64`），适配各类 ARM VPS、树莓派及各类 OpenWrt 软路由
-- **Android Termux (arm64 & amd64)**：官方 NDK r26b 编译（`cfnat-android-arm64` / `cfnat-android-amd64`），适配 Bionic libc 与 Android 沙箱 seccomp 审计，Termux 免 root 开箱即用
+- **Android Termux (arm64 & amd64)**：官方最新 NDK r27c (LTS) 编译（`cfnat-android-arm64` / `cfnat-android-amd64`），适配 Bionic libc 与 Android 沙箱 seccomp 审计，Termux 免 root 开箱即用
 - **Windows 11 amd64 (x86_64)**：Win11 原生纯静态可执行文件（`cfnat-windows-amd64.exe`）
 - **Windows 11 arm64 (aarch64)**：Surface / 骁龙 X Elite / ARM 笔记本原生运行（`cfnat-windows-arm64.exe`）
 
