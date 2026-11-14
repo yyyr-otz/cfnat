@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.9"
+#define CFNAT_VERSION "0.0.17-c23"
 
 /* =========================================================================
  * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
@@ -28,6 +28,21 @@
     #define nullptr NULL
   #endif
   #include <stdbool.h>
+#endif
+
+/* C23 constexpr object support (Clang 18+, GCC 14+, or standard conforming C23 compiler) */
+#if defined(__has_extension)
+  #if __has_extension(c_constexpr)
+    #define CFNAT_CONSTEXPR constexpr
+  #else
+    #define CFNAT_CONSTEXPR static const
+  #endif
+#elif defined(__GNUC__) && (__GNUC__ >= 14)
+  #define CFNAT_CONSTEXPR constexpr
+#elif CFNAT_IS_C23 && !defined(__clang__)
+  #define CFNAT_CONSTEXPR constexpr
+#else
+  #define CFNAT_CONSTEXPR static const
 #endif
 
 #ifdef _WIN32
@@ -154,13 +169,8 @@ CFNAT_NODISCARD static int cfnat_poll_single(socket_t fd, int poll_type, int tim
 
 
 static const char *DEFAULT_BAIDU_DOMAIN = "cloudnproxy.baidu.com";
-#if CFNAT_IS_C23
-constexpr int DEFAULT_BAIDU_PORT = 443;
-constexpr int DEFAULT_BAIDU_IPNUM = 12;
-#else
-static const int DEFAULT_BAIDU_PORT = 443;
-static const int DEFAULT_BAIDU_IPNUM = 12;
-#endif
+CFNAT_CONSTEXPR int DEFAULT_BAIDU_PORT = 443;
+CFNAT_CONSTEXPR int DEFAULT_BAIDU_IPNUM = 12;
 static const char *DEFAULT_BAIDU_SCAN_TARGET = "myip.ipip.net:80";
 typedef struct {
     const char *label;
