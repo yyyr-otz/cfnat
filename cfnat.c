@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.17-c23"
+#define CFNAT_VERSION "0.0.9"
 
 /* =========================================================================
  * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
@@ -1648,7 +1648,7 @@ static void format_ipv6_full(const unsigned char bytes[16], char *out, size_t ou
              w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
 }
 
-static int ipv6_cidr_sample(const char *base_s, int prefix, char *out, size_t outsz) {
+CFNAT_UNUSED static int ipv6_cidr_sample(const char *base_s, int prefix, char *out, size_t outsz) {
     if (!base_s || !out || outsz == 0 || prefix < 0 || prefix > 128) return -1;
     unsigned char bytes[16];
     if (inet_pton(AF_INET6, base_s, bytes) != 1) return -1;
@@ -1715,7 +1715,7 @@ static int is_ip_literal(const char *s) {
     return inet_pton(AF_INET, s, &a4) == 1 || inet_pton(AF_INET6, s, &a6) == 1;
 }
 
-static void format_host_literal(const char *ip, char *out, size_t outsz) {
+CFNAT_UNUSED static void format_host_literal(const char *ip, char *out, size_t outsz) {
     if (!out || outsz == 0) return;
     if (ip && strchr(ip, ':')) snprintf(out, outsz, "[%s]", ip);
     else snprintf(out, outsz, "%s", ip ? ip : "");
@@ -3890,7 +3890,7 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
     return 1;
 }
 
-static int carrier_try_use_candidate_cache(CarrierRuntime *rt) {
+CFNAT_UNUSED static int carrier_try_use_candidate_cache(CarrierRuntime *rt) {
     return carrier_try_use_candidate_caches(rt);
 }
 
@@ -4546,7 +4546,7 @@ static int carrier_set_current_udp_candidate(CarrierRuntime *rt, size_t idx) {
     return 0;
 }
 
-CFNAT_NODISCARD static int carrier_select_valid_udp_ip(CarrierRuntime *rt) {
+CFNAT_UNUSED static int carrier_select_valid_udp_ip(CarrierRuntime *rt) {
     if (!rt) return 0;
     int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
     if (target_port <= 0) target_port = 443;
