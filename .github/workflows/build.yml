@@ -215,7 +215,6 @@ jobs:
 
     env:
       SOURCE_FILE: cfnat.c
-      NDK_VERSION: "26.1.10909125"
 
     steps:
       - name: Checkout repository
@@ -227,7 +226,7 @@ jobs:
       - name: Setup Android NDK
         uses: nttld/setup-ndk@v1
         with:
-          ndk-version: r26b
+          ndk-version: r27c
           add-to-path: true
 
       - name: Build Android Termux binary
