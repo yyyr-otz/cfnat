@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag_name:
-        description: 'Release 标签版本（例如 v0.0.x，留空则自动从 cfnat.c 提取版本）'
+        description: 'Release 标签版本（例如 v0.0.15，留空则自动从 cfnat.c 提取版本）'
         required: false
         default: ''
       prerelease:
