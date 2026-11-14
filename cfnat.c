@@ -1,4 +1,34 @@
-#define CFNAT_VERSION "0.0.8"
+#define CFNAT_VERSION "0.0.9"
+
+/* =========================================================================
+ * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
+ * ========================================================================= */
+#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
+#define CFNAT_IS_C23 1
+#else
+#define CFNAT_IS_C23 0
+#endif
+
+#if CFNAT_IS_C23
+  #define CFNAT_NODISCARD [[nodiscard]]
+  #define CFNAT_UNUSED    [[maybe_unused]]
+  #define CFNAT_NORETURN  [[noreturn]]
+#elif defined(__GNUC__) || defined(__clang__)
+  #define CFNAT_NODISCARD __attribute__((warn_unused_result))
+  #define CFNAT_UNUSED    __attribute__((unused))
+  #define CFNAT_NORETURN  __attribute__((noreturn))
+#else
+  #define CFNAT_NODISCARD
+  #define CFNAT_UNUSED
+  #define CFNAT_NORETURN
+#endif
+
+#if !CFNAT_IS_C23
+  #ifndef nullptr
+    #define nullptr NULL
+  #endif
+  #include <stdbool.h>
+#endif
 
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
@@ -22,6 +52,7 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <poll.h>
 #ifdef __linux__
 #include <sys/epoll.h>
 #endif
@@ -38,6 +69,7 @@
 #include <signal.h>
 #include <stdarg.h>
 #include <stdatomic.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -52,8 +84,8 @@
 #define strcasecmp _stricmp
 #define strncasecmp _strnicmp
 typedef SOCKET socket_t;
-static int cfnat_socket_valid(socket_t s) { return s != INVALID_SOCKET; }
-static int cfnat_socket_invalid(socket_t s) { return s == INVALID_SOCKET; }
+CFNAT_NODISCARD static inline int cfnat_socket_valid(socket_t s) { return s != INVALID_SOCKET; }
+CFNAT_NODISCARD static inline int cfnat_socket_invalid(socket_t s) { return s == INVALID_SOCKET; }
 #else
 typedef int socket_t;
 #ifndef INVALID_SOCKET
@@ -62,8 +94,45 @@ typedef int socket_t;
 #ifndef SOCKET_ERROR
 #define SOCKET_ERROR (-1)
 #endif
-static int cfnat_socket_valid(socket_t s) { return s >= 0; }
-static int cfnat_socket_invalid(socket_t s) { return s < 0; }
+CFNAT_NODISCARD static inline int cfnat_socket_valid(socket_t s) { return s >= 0; }
+CFNAT_NODISCARD static inline int cfnat_socket_invalid(socket_t s) { return s < 0; }
+#endif
+
+/* 跨平台单套接字超时轮询（替代 select，突破 FD_SETSIZE 1024 限制）
+ * poll_type: 1 = POLLIN (可读), 2 = POLLOUT (可写), 3 = 读写
+ * 返回值: >0 表示就绪, 0 表示超时, <0 表示出错 */
+#ifdef _WIN32
+CFNAT_NODISCARD static int cfnat_poll_single(socket_t fd, int poll_type, int timeout_ms) {
+    if (cfnat_socket_invalid(fd)) return -1;
+    WSAPOLLFD pfd;
+    pfd.fd = fd;
+    pfd.events = 0;
+    if (poll_type & 1) pfd.events |= POLLIN;
+    if (poll_type & 2) pfd.events |= POLLOUT;
+    pfd.revents = 0;
+    int rc = WSAPoll(&pfd, 1, timeout_ms);
+    if (rc <= 0) return rc;
+    if ((poll_type & 2) && (pfd.revents & (POLLOUT | POLLERR | POLLHUP))) return 1;
+    if ((poll_type & 1) && (pfd.revents & POLLIN)) return 1;
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
+    return 1;
+}
+#else
+CFNAT_NODISCARD static int cfnat_poll_single(socket_t fd, int poll_type, int timeout_ms) {
+    if (cfnat_socket_invalid(fd)) return -1;
+    struct pollfd pfd;
+    pfd.fd = fd;
+    pfd.events = 0;
+    if (poll_type & 1) pfd.events |= POLLIN;
+    if (poll_type & 2) pfd.events |= POLLOUT;
+    pfd.revents = 0;
+    int rc = poll(&pfd, 1, timeout_ms);
+    if (rc <= 0) return rc;
+    if ((poll_type & 2) && (pfd.revents & (POLLOUT | POLLERR | POLLHUP))) return 1;
+    if ((poll_type & 1) && (pfd.revents & POLLIN)) return 1;
+    if (pfd.revents & (POLLERR | POLLHUP | POLLNVAL)) return -1;
+    return 1;
+}
 #endif
 
 #define MAX_IP_LEN 64
@@ -71,7 +140,11 @@ static int cfnat_socket_invalid(socket_t s) { return s < 0; }
 #define MAX_REGION_LEN 64
 #define MAX_CITY_LEN 64
 #define MAX_LINE 512
+#if CFNAT_IS_C23
+#define COPY_BUF_SIZE 16'384
+#else
 #define COPY_BUF_SIZE 16384
+#endif
 #define MAX_ADDR_LEN 128
 #define MAX_NAME_LEN 64
 #define MAX_DOMAIN_LEN 256
@@ -81,9 +154,14 @@ static int cfnat_socket_invalid(socket_t s) { return s < 0; }
 
 
 static const char *DEFAULT_BAIDU_DOMAIN = "cloudnproxy.baidu.com";
+#if CFNAT_IS_C23
+constexpr int DEFAULT_BAIDU_PORT = 443;
+constexpr int DEFAULT_BAIDU_IPNUM = 12;
+#else
 static const int DEFAULT_BAIDU_PORT = 443;
-static const char *DEFAULT_BAIDU_SCAN_TARGET = "myip.ipip.net:80";
 static const int DEFAULT_BAIDU_IPNUM = 12;
+#endif
+static const char *DEFAULT_BAIDU_SCAN_TARGET = "myip.ipip.net:80";
 typedef struct {
     const char *label;
     const char *host;
@@ -94,14 +172,14 @@ typedef struct {
 static const DohResolver BAIDU_DOH_RESOLVERS[] = {
     { "AliDNS DoH", "dns.alidns.com", "223.5.5.5", "/resolve" },
     { "Cloudflare DoH", "cloudflare-dns.com", "1.1.1.1", "/dns-query" },
-    { NULL, NULL, NULL, NULL }
+    { nullptr, nullptr, nullptr, nullptr }
 };
 static const char *BAIDU_DNS_RESOLVERS[] = {
     "223.5.5.5",
     "119.29.29.29",
     "1.1.1.1",
     "8.8.8.8",
-    NULL
+    nullptr
 };
 static const char *BAIDU_PROXY_FALLBACK_IPS[] = {
     "110.242.70.68",
@@ -118,27 +196,36 @@ static const char *BAIDU_PROXY_FALLBACK_IPS[] = {
     "163.177.17.6",
     "163.177.17.189",
     "180.101.50.208",
-    NULL
+    nullptr
 };
 static const char *IPS_V4_URLS[] = {
     "https://cdn.jsdelivr.net/gh/fscarmen/cfnat@main/ips-v4.txt",
     "https://raw.githubusercontent.com/fscarmen/cfnat/main/ips-v4.txt",
-    NULL
+    nullptr
 };
 
 static const char *IPS_V6_URLS[] = {
     "https://cdn.jsdelivr.net/gh/fscarmen/cfnat@main/ips-v6.txt",
     "https://raw.githubusercontent.com/fscarmen/cfnat/main/ips-v6.txt",
-    NULL
+    nullptr
 };
 
 static const char *LOC_URLS[] = {
     "https://cdn.jsdelivr.net/gh/fscarmen/cfnat@main/locations.json",
     "https://raw.githubusercontent.com/fscarmen/cfnat/main/locations.json",
-    NULL
+    nullptr
 };
 
 
+#if CFNAT_IS_C23
+typedef enum : uint8_t {
+    LOG_SILENT = 0,
+    LOG_ERROR,
+    LOG_WARN,
+    LOG_INFO,
+    LOG_DEBUG
+} LogLevel;
+#else
 typedef enum {
     LOG_SILENT = 0,
     LOG_ERROR,
@@ -146,6 +233,7 @@ typedef enum {
     LOG_INFO,
     LOG_DEBUG
 } LogLevel;
+#endif
 
 typedef struct {
     int enabled;
@@ -175,6 +263,7 @@ typedef struct {
     int code, delay_ms, ipnum, ips_type, num, port, http_port, random_mode, task, health_log;
     int v6_split;             /* 全局 IPv6 细分子网前缀 (默认 54) */
     int use_baidu_proxy, baidu_port, baidu_ipnum;
+    int cli_mode;             /* 显式单次 CLI 测速模式 (-cli / -scan-only) */
     LogLevel log_level;
     ProfileConfig prof_v4;
     ProfileConfig prof_v6;
@@ -226,7 +315,7 @@ typedef struct {
 
 typedef struct {
     char **ips;
-    CidrList *cidrs;    /* v0.0.11: CIDR 惰性展开，NULL 时回退到 ips */
+    CidrList *cidrs;    /* v0.0.11: CIDR 惰性展开，nullptr 时回退到 ips */
     size_t total;
     atomic_size_t index;
     atomic_size_t completed;
@@ -315,10 +404,10 @@ static int evloop_add(EventLoop *el, socket_t fd, int events) {
         struct kevent kev[2];
         int n = 0;
         if (events & EV_READ)
-            EV_SET(&kev[n++], fd, EVFILT_READ, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, NULL);
+            EV_SET(&kev[n++], fd, EVFILT_READ, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, nullptr);
         if (events & EV_WRITE)
-            EV_SET(&kev[n++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, NULL);
-        return kevent(el->epoll_fd, kev, n, NULL, 0, NULL);
+            EV_SET(&kev[n++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, nullptr);
+        return kevent(el->epoll_fd, kev, n, nullptr, 0, nullptr);
     }
 #endif
     /* select fallback: 无需注册，wait 时动态构造 fd_set */
@@ -344,36 +433,25 @@ static int evloop_del(EventLoop *el, socket_t fd) {
     if (el->epoll_fd >= 0) {
         struct kevent kev[2];
         int n = 0;
-        EV_SET(&kev[n++], fd, EVFILT_READ, EV_DELETE, 0, 0, NULL);
-        EV_SET(&kev[n++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, NULL);
-        return kevent(el->epoll_fd, kev, n, NULL, 0, NULL);
+        EV_SET(&kev[n++], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
+        EV_SET(&kev[n++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
+        return kevent(el->epoll_fd, kev, n, nullptr, 0, nullptr);
     }
 #endif
     (void)fd;
     return 0;
 }
 
-/* select() 回退实现，支持 Windows/非 epoll 平台事件等待 */
+/* 跨平台事件轮询回退实现，支持 Windows/非 epoll 平台事件等待（突破 FD_SETSIZE 限制） */
 static int evloop_wait_select(EventLoop *el, struct evloop_event *evs, int maxevents, int timeout_ms) {
     if (!el || !evs || maxevents <= 0 || cfnat_socket_invalid(el->watched_fd)) return -1;
-    fd_set rfds, wfds;
-    FD_ZERO(&rfds);
-    FD_ZERO(&wfds);
-    if (el->watched_events & EV_READ)  FD_SET(el->watched_fd, &rfds);
-    if (el->watched_events & EV_WRITE) FD_SET(el->watched_fd, &wfds);
-    struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
-#ifdef _WIN32
-    int rc = select(0, (el->watched_events & EV_READ) ? &rfds : NULL,
-                       (el->watched_events & EV_WRITE) ? &wfds : NULL, NULL, &tv);
-#else
-    int rc = select(el->watched_fd + 1, (el->watched_events & EV_READ) ? &rfds : NULL,
-                                         (el->watched_events & EV_WRITE) ? &wfds : NULL, NULL, &tv);
-#endif
+    int ptype = 0;
+    if (el->watched_events & EV_READ)  ptype |= 1;
+    if (el->watched_events & EV_WRITE) ptype |= 2;
+    int rc = cfnat_poll_single(el->watched_fd, ptype, timeout_ms);
     if (rc <= 0) return rc;
     evs[0].fd = el->watched_fd;
-    evs[0].events = 0;
-    if ((el->watched_events & EV_READ) && FD_ISSET(el->watched_fd, &rfds)) evs[0].events |= EV_READ;
-    if ((el->watched_events & EV_WRITE) && FD_ISSET(el->watched_fd, &wfds)) evs[0].events |= EV_WRITE;
+    evs[0].events = el->watched_events;
     return 1;
 }
 
@@ -399,7 +477,7 @@ static int evloop_wait(EventLoop *el, struct evloop_event *evs, int maxevents, i
         struct timespec ts;
         ts.tv_sec = timeout_ms / 1000;
         ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
-        int n = kevent(el->epoll_fd, NULL, 0, kevs, maxevents > 64 ? 64 : maxevents, &ts);
+        int n = kevent(el->epoll_fd, nullptr, 0, kevs, maxevents > 64 ? 64 : maxevents, &ts);
         if (n < 0) return -1;
         for (int i = 0; i < n && i < maxevents; i++) {
             evs[i].fd = (socket_t)kevs[i].ident;
@@ -585,10 +663,11 @@ struct CarrierRuntime {
     pthread_t udp_tid;
     UdpSession *udp_sessions;
     pthread_mutex_t udp_mu;
+    atomic_int rescanning_lock;    /* 实例独享的自愈扫描互斥锁 (防跨协议阻塞) */
 };
 
 static Config g_cfg;
-static Location *g_locations = NULL;
+static Location *g_locations = nullptr;
 static size_t g_location_count = 0;
 static atomic_int g_running = 1;
 static atomic_int g_active_connections = 0;
@@ -597,7 +676,7 @@ static socket_t g_listen_fd = INVALID_SOCKET;
 
 static BaiduProxyPool g_default_proxy_pool = {0};
 
-static CarrierRuntime *g_carrier_runtimes = NULL;
+static CarrierRuntime *g_carrier_runtimes = nullptr;
 static size_t g_carrier_runtime_count = 0;
 static pthread_mutex_t g_log_mu = PTHREAD_MUTEX_INITIALIZER;
 
@@ -629,12 +708,12 @@ static int cfnat_get_console_handle(FILE *stream, HANDLE *out) {
 static int cfnat_write_utf8(FILE *stream, const char *text, size_t len) {
     if (!text || len == 0) return 0;
 
-    HANDLE handle = NULL;
+    HANDLE handle = nullptr;
     if (!cfnat_get_console_handle(stream, &handle)) {
         return (int)fwrite(text, 1, len, stream);
     }
 
-    int wlen = MultiByteToWideChar(CP_UTF8, 0, text, (int)len, NULL, 0);
+    int wlen = MultiByteToWideChar(CP_UTF8, 0, text, (int)len, nullptr, 0);
     if (wlen <= 0) {
         return (int)fwrite(text, 1, len, stream);
     }
@@ -648,7 +727,7 @@ static int cfnat_write_utf8(FILE *stream, const char *text, size_t len) {
     wide[wlen] = L'\0';
 
     DWORD written = 0;
-    BOOL ok = WriteConsoleW(handle, wide, (DWORD)wlen, &written, NULL);
+    BOOL ok = WriteConsoleW(handle, wide, (DWORD)wlen, &written, nullptr);
     free(wide);
 
     if (!ok) {
@@ -714,14 +793,14 @@ static int cfnat_fputc(int ch, FILE *stream) {
 static void init_windows_console_utf8(void) {
     setlocale(LC_ALL, "");
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
-    if (hOut != INVALID_HANDLE_VALUE && hOut != NULL) {
+    if (hOut != INVALID_HANDLE_VALUE && hOut != nullptr) {
         DWORD mode = 0;
         if (GetConsoleMode(hOut, &mode)) {
             SetConsoleMode(hOut, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
         }
     }
     HANDLE hErr = GetStdHandle(STD_ERROR_HANDLE);
-    if (hErr != INVALID_HANDLE_VALUE && hErr != NULL) {
+    if (hErr != INVALID_HANDLE_VALUE && hErr != nullptr) {
         DWORD mode = 0;
         if (GetConsoleMode(hErr, &mode)) {
             SetConsoleMode(hErr, mode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
@@ -803,7 +882,7 @@ static long now_ms(void) {
     return (long)GetTickCount64();
 #else
     struct timeval tv;
-    gettimeofday(&tv, NULL);
+    gettimeofday(&tv, nullptr);
     return (long)tv.tv_sec * 1000L + tv.tv_usec / 1000L;
 #endif
 }
@@ -850,7 +929,7 @@ static int parse_log_level(const char *v, LogLevel *out) {
 }
 
 static void vlog_line(const char *tag, const char *fmt, va_list ap) {
-    time_t t = time(NULL);
+    time_t t = time(nullptr);
     struct tm tmv;
 #ifdef _WIN32
     localtime_s(&tmv, &t);
@@ -924,7 +1003,7 @@ static int sleep_interruptible_ms(int ms) {
         struct timespec ts;
         ts.tv_sec = chunk / 1000;
         ts.tv_nsec = (long)(chunk % 1000) * 1000000L;
-        nanosleep(&ts, NULL);
+        nanosleep(&ts, nullptr);
 #endif
         left -= chunk;
     }
@@ -998,6 +1077,7 @@ static void usage(const char *p) {
     printf("  -random=value             是否随机生成 IP (default true)\n");
     printf("  -v6-split=value           IPv6 /48 细分抽样子网前缀，例如 54 (产生 64 个样本, default 54)\n");
     printf("  -task=value               并发扫描线程数 (default 200)\n");
+    printf("  -cli, -scan-only          仅单次 CLI 测速并打印结果表格，不启动本地端口监听\n");
     printf("  -log=value                日志级别: silent,error,warn,info,debug (default info)\n");
     printf("  注: 以上参数均支持 -v4- 或 -v6- 前缀实现精细化覆盖，如 -v6-code=200 -v4-delay=150\n");
 }
@@ -1045,6 +1125,7 @@ static void cfg_defaults(Config *c) {
     c->use_baidu_proxy = 0;
     c->baidu_port = DEFAULT_BAIDU_PORT;
     c->baidu_ipnum = DEFAULT_BAIDU_IPNUM;
+    c->cli_mode = 0;
     c->log_level = LOG_INFO;
 }
 
@@ -1086,7 +1167,7 @@ static void parse_args(Config *c, int argc, char **argv) {
         char *key = arg + 1;
         if (*key == '-') key++;
         char *eq = strchr(key, '=');
-        char *val = NULL;
+        char *val = nullptr;
         if (eq) {
             *eq = 0;
             val = eq + 1;
@@ -1173,6 +1254,7 @@ static void parse_args(Config *c, int argc, char **argv) {
         else if (!strcmp(key, "http-port") && val) c->http_port = atoi(val);
         else if (!strcmp(key, "random")) c->random_mode = parse_bool(val);
         else if (!strcmp(key, "task") && val) c->task = atoi(val);
+        else if (!strcmp(key, "cli") || !strcmp(key, "scan-only")) c->cli_mode = 1;
         else if (!strcmp(key, "health-log") && val) c->health_log = atoi(val);
     }
 
@@ -1180,7 +1262,7 @@ static void parse_args(Config *c, int argc, char **argv) {
     if (exclude_colo_buf[0]) {
         char tmp_ex[sizeof(exclude_colo_buf)];
         snprintf(tmp_ex, sizeof(tmp_ex), "%s", exclude_colo_buf);
-        char *save = NULL;
+        char *save = nullptr;
         char *tok = strtok_r(tmp_ex, ",", &save);
         while (tok) {
             trim_line(tok);
@@ -1189,7 +1271,7 @@ static void parse_args(Config *c, int argc, char **argv) {
                 if (c->colo[0]) snprintf(c->colo + strlen(c->colo), sizeof(c->colo) - strlen(c->colo), ",-%s", tok);
                 else snprintf(c->colo, sizeof(c->colo), "-%s", tok);
             }
-            tok = strtok_r(NULL, ",", &save);
+            tok = strtok_r(nullptr, ",", &save);
         }
     }
 
@@ -1206,7 +1288,7 @@ static void parse_args(Config *c, int argc, char **argv) {
        3. 若用户全都没指定，则默认仅开启 IPv4，监听 0.0.0.0:4443。
     */
     int any_explicit_listen = (has_v4_listen || has_v6_listen || has_baidu_listen || c->direct_listen[0]);
-    if (!any_explicit_listen) {
+    if (!any_explicit_listen && !c->cli_mode) {
         has_v4_listen = 1;
         snprintf(v4_listen_val, sizeof(v4_listen_val), "0.0.0.0:4443");
     }
@@ -1241,7 +1323,7 @@ static void parse_args(Config *c, int argc, char **argv) {
     if (v4_exclude_colo_buf[0]) {
         char tmp_ex[sizeof(v4_exclude_colo_buf)];
         snprintf(tmp_ex, sizeof(tmp_ex), "%s", v4_exclude_colo_buf);
-        char *save = NULL;
+        char *save = nullptr;
         char *tok = strtok_r(tmp_ex, ",", &save);
         while (tok) {
             trim_line(tok);
@@ -1250,7 +1332,7 @@ static void parse_args(Config *c, int argc, char **argv) {
                 if (c->prof_v4.colo[0]) snprintf(c->prof_v4.colo + strlen(c->prof_v4.colo), sizeof(c->prof_v4.colo) - strlen(c->prof_v4.colo), ",-%s", tok);
                 else snprintf(c->prof_v4.colo, sizeof(c->prof_v4.colo), "-%s", tok);
             }
-            tok = strtok_r(NULL, ",", &save);
+            tok = strtok_r(nullptr, ",", &save);
         }
     }
     c->prof_v4.use_baidu_proxy = 0;
@@ -1274,7 +1356,7 @@ static void parse_args(Config *c, int argc, char **argv) {
     if (v6_exclude_colo_buf[0]) {
         char tmp_ex[sizeof(v6_exclude_colo_buf)];
         snprintf(tmp_ex, sizeof(tmp_ex), "%s", v6_exclude_colo_buf);
-        char *save = NULL;
+        char *save = nullptr;
         char *tok = strtok_r(tmp_ex, ",", &save);
         while (tok) {
             trim_line(tok);
@@ -1283,7 +1365,7 @@ static void parse_args(Config *c, int argc, char **argv) {
                 if (c->prof_v6.colo[0]) snprintf(c->prof_v6.colo + strlen(c->prof_v6.colo), sizeof(c->prof_v6.colo) - strlen(c->prof_v6.colo), ",-%s", tok);
                 else snprintf(c->prof_v6.colo, sizeof(c->prof_v6.colo), "-%s", tok);
             }
-            tok = strtok_r(NULL, ",", &save);
+            tok = strtok_r(nullptr, ",", &save);
         }
     }
     c->prof_v6.use_baidu_proxy = 0;
@@ -1361,14 +1443,14 @@ static int file_exists(const char *path) {
 
 #ifdef _WIN32
 static wchar_t *utf8_to_wide_alloc(const char *s) {
-    if (!s) return NULL;
-    int len = MultiByteToWideChar(CP_UTF8, 0, s, -1, NULL, 0);
-    if (len <= 0) return NULL;
+    if (!s) return nullptr;
+    int len = MultiByteToWideChar(CP_UTF8, 0, s, -1, nullptr, 0);
+    if (len <= 0) return nullptr;
     wchar_t *w = (wchar_t *)calloc((size_t)len, sizeof(wchar_t));
-    if (!w) return NULL;
+    if (!w) return nullptr;
     if (MultiByteToWideChar(CP_UTF8, 0, s, -1, w, len) <= 0) {
         free(w);
-        return NULL;
+        return nullptr;
     }
     return w;
 }
@@ -1377,7 +1459,7 @@ static int download_file_wininet(const char *url, const char *filename) {
     wchar_t *wurl = utf8_to_wide_alloc(url);
     if (!wurl) return -1;
 
-    HINTERNET hnet = InternetOpenW(L"cfnat/1.0", INTERNET_OPEN_TYPE_PRECONFIG, NULL, NULL, 0);
+    HINTERNET hnet = InternetOpenW(L"cfnat/1.0", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
     if (!hnet) {
         free(wurl);
         return -1;
@@ -1388,7 +1470,7 @@ static int download_file_wininet(const char *url, const char *filename) {
         flags |= INTERNET_FLAG_SECURE | INTERNET_FLAG_IGNORE_CERT_CN_INVALID | INTERNET_FLAG_IGNORE_CERT_DATE_INVALID;
     }
 
-    HINTERNET hurl = InternetOpenUrlW(hnet, wurl, NULL, 0, flags, 0);
+    HINTERNET hurl = InternetOpenUrlW(hnet, wurl, nullptr, 0, flags, 0);
     free(wurl);
     if (!hurl) {
         InternetCloseHandle(hnet);
@@ -1471,18 +1553,18 @@ static int ensure_data_file(const char *expected, const char **urls) {
 
 static char *read_file_all(const char *path, size_t *out_len) {
     FILE *f = fopen(path, "rb");
-    if (!f) return NULL;
+    if (!f) return nullptr;
     fseek(f, 0, SEEK_END);
     long n = ftell(f);
     fseek(f, 0, SEEK_SET);
     if (n < 0) {
         fclose(f);
-        return NULL;
+        return nullptr;
     }
     char *b = malloc((size_t)n + 1);
     if (!b) {
         fclose(f);
-        return NULL;
+        return nullptr;
     }
     size_t r = fread(b, 1, (size_t)n, f);
     fclose(f);
@@ -1645,7 +1727,7 @@ static StringList load_ip_list(const char *filename, int random_mode, int v6_spl
     long start_ms = now_ms();
     size_t cidr_count = 0;
     int warned_ipv6_expand = 0;
-    srand((unsigned)time(NULL));
+    srand((unsigned)time(nullptr));
     while (fgets(line, sizeof(line), f)) {
         trim_line(line);
         if (!line[0]) continue;
@@ -1720,14 +1802,14 @@ static char *json_string_value(char *p, const char *key, char *out, size_t outsz
     char pat[64];
     snprintf(pat, sizeof(pat), "\"%s\"", key);
     char *k = strstr(p, pat);
-    if (!k) return NULL;
+    if (!k) return nullptr;
     char *colon = strchr(k + strlen(pat), ':');
-    if (!colon) return NULL;
+    if (!colon) return nullptr;
     char *q = strchr(colon, '\"');
-    if (!q) return NULL;
+    if (!q) return nullptr;
     q++;
     char *e = strchr(q, '\"');
-    if (!e) return NULL;
+    if (!e) return nullptr;
     size_t n = (size_t)(e - q);
     if (n >= outsz) n = outsz - 1;
     memcpy(out, q, n);
@@ -1770,7 +1852,7 @@ static void load_locations(void) {
 
 static Location *find_location(const char *iata) {
     for (size_t i = 0; i < g_location_count; i++) if (!strcasecmp(g_locations[i].iata, iata)) return &g_locations[i];
-    return NULL;
+    return nullptr;
 }
 
 static int colo_rule_allowed(const char *rule, const char *colo) {
@@ -1782,7 +1864,7 @@ static int colo_rule_allowed(const char *rule, const char *colo) {
     int has_include = 0;
     int matched_include = 0;
 
-    char *save = NULL;
+    char *save = nullptr;
     char *tok = strtok_r(tmp, ",", &save);
     while (tok) {
         trim_line(tok);
@@ -1800,7 +1882,7 @@ static int colo_rule_allowed(const char *rule, const char *colo) {
                 }
             }
         }
-        tok = strtok_r(NULL, ",", &save);
+        tok = strtok_r(nullptr, ",", &save);
     }
     return has_include ? matched_include : 1;
 }
@@ -1836,7 +1918,7 @@ static void set_tcp_nodelay(socket_t fd) {
 #endif
 }
 
-static socket_t tcp_connect(const char *ip, int port, int timeout_ms, int *latency_ms) {
+CFNAT_NODISCARD static socket_t tcp_connect(const char *ip, int port, int timeout_ms, int *latency_ms) {
     long start = now_ms();
     int family = strchr(ip, ':') ? AF_INET6 : AF_INET;
     socket_t fd = socket(family, SOCK_STREAM, 0);
@@ -1884,19 +1966,8 @@ static socket_t tcp_connect(const char *ip, int port, int timeout_ms, int *laten
         return INVALID_SOCKET;
     }
 #endif
-    fd_set wfds;
-    FD_ZERO(&wfds);
-    FD_SET(fd, &wfds);
-    struct timeval tv = {
-        timeout_ms / 1000,
-        (timeout_ms % 1000) * 1000
-    };
-#ifdef _WIN32
-    rc = select(0, NULL, &wfds, NULL, &tv);
-#else
-    rc = select(fd + 1, NULL, &wfds, NULL, &tv);
-#endif
-    if (rc <= 0) {
+    int pr = cfnat_poll_single(fd, 2, timeout_ms);
+    if (pr <= 0) {
         close(fd);
         return INVALID_SOCKET;
     }
@@ -1923,9 +1994,9 @@ static socket_t tcp_connect(const char *ip, int port, int timeout_ms, int *laten
 /* RFC 9000 规范的 1200 字节 QUIC Version Negotiation 轻量探针
  * 利用保留版本号 0x5A5A5A5A 触发 Cloudflare 边缘节点立即回包 Version Negotiation
  * 零密钥协商，零 CPU 加密开销，单包 1200 字节符合防放大攻击标准，精准测出 UDP 443 真实延迟 */
-static int quic_probe_ip(const char *ip, int port, int timeout_ms, int *latency_ms) {
+CFNAT_NODISCARD static int quic_probe_ip(const char *ip, int port, int timeout_ms, int *latency_ms) {
     if (!ip || !*ip || port <= 0) return 0;
-    int is_v6 = (strchr(ip, ':') != NULL);
+    int is_v6 = (strchr(ip, ':') != nullptr);
     socket_t fd = socket(is_v6 ? AF_INET6 : AF_INET, SOCK_DGRAM, 0);
     if (cfnat_socket_invalid(fd)) return 0;
 
@@ -1935,7 +2006,7 @@ static int quic_probe_ip(const char *ip, int port, int timeout_ms, int *latency_
 #endif
     BOOL bNewBehavior = FALSE;
     DWORD dwBytesReturned = 0;
-    WSAIoctl(fd, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), NULL, 0, &dwBytesReturned, NULL, NULL);
+    WSAIoctl(fd, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), nullptr, 0, &dwBytesReturned, nullptr, nullptr);
 #endif
 
     bind_socket_to_interface(fd, is_v6 ? AF_INET6 : AF_INET);
@@ -1974,14 +2045,7 @@ static int quic_probe_ip(const char *ip, int port, int timeout_ms, int *latency_
         return 0;
     }
 
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(fd, &rfds);
-    struct timeval tv;
-    tv.tv_sec = timeout_ms / 1000;
-    tv.tv_usec = (timeout_ms % 1000) * 1000;
-
-    int rc = select((int)(fd + 1), &rfds, NULL, NULL, &tv);
+    int rc = cfnat_poll_single(fd, 1, timeout_ms);
     if (rc <= 0) {
         close(fd);
         return 0;
@@ -2009,16 +2073,9 @@ static int recv_headers(socket_t fd, char *buf, size_t bufsz, int timeout_ms) {
     size_t used = 0;
     long deadline = now_ms() + timeout_ms;
     while (used + 1 < bufsz && now_ms() < deadline) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(fd, &rfds);
         int left = (int)(deadline - now_ms());
         if (left <= 0) break;
-        struct timeval tv = {
-            left / 1000,
-            (left % 1000) * 1000
-        };
-        int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
+        int rc = cfnat_poll_single(fd, 1, left);
         if (rc <= 0) break;
         ssize_t n = recv(fd, buf + used, bufsz - used - 1, 0);
         if (n <= 0) break;
@@ -2035,17 +2092,9 @@ static int send_all_timeout(socket_t fd, const void *buf, size_t len, int timeou
     size_t sent = 0;
     long deadline = now_ms() + timeout_ms;
     while (sent < len && now_ms() < deadline) {
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        FD_SET(fd, &wfds);
         int left = (int)(deadline - now_ms());
         if (left <= 0) break;
-        struct timeval tv = { left / 1000, (left % 1000) * 1000 };
-#ifdef _WIN32
-        int rc = select(0, NULL, &wfds, NULL, &tv);
-#else
-        int rc = select(fd + 1, NULL, &wfds, NULL, &tv);
-#endif
+        int rc = cfnat_poll_single(fd, 2, left);
         if (rc <= 0) break;
         ssize_t n = send(fd, p + sent, len - sent, 0);
         if (n <= 0) break;
@@ -2120,17 +2169,9 @@ static int tls_probe_host(socket_t fd, int timeout_ms, const char *sni_host) {
     unsigned char first = 0;
     long deadline = now_ms() + timeout_ms;
     while (now_ms() < deadline) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(fd, &rfds);
         int left = (int)(deadline - now_ms());
         if (left <= 0) break;
-        struct timeval tv = { left / 1000, (left % 1000) * 1000 };
-#ifdef _WIN32
-        int rc = select(0, &rfds, NULL, NULL, &tv);
-#else
-        int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
-#endif
+        int rc = cfnat_poll_single(fd, 1, left);
         if (rc <= 0) break;
         ssize_t n = recv(fd, (char *)&first, 1, 0);
         if (n <= 0) break;
@@ -2139,24 +2180,16 @@ static int tls_probe_host(socket_t fd, int timeout_ms, const char *sni_host) {
     return 0;
 }
 
-static int tls_probe(socket_t fd, int timeout_ms) {
+CFNAT_NODISCARD static int tls_probe(socket_t fd, int timeout_ms) {
     return tls_probe_host(fd, timeout_ms, "cloudflaremirrors.com");
 }
 
 static int recv_more_timeout(socket_t fd, unsigned char *buf, size_t *used, size_t need, size_t cap, int timeout_ms) {
     long deadline = now_ms() + timeout_ms;
     while (*used < need && *used < cap && now_ms() < deadline) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(fd, &rfds);
         int left = (int)(deadline - now_ms());
         if (left <= 0) break;
-        struct timeval tv = { left / 1000, (left % 1000) * 1000 };
-#ifdef _WIN32
-        int rc = select(0, &rfds, NULL, NULL, &tv);
-#else
-        int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
-#endif
+        int rc = cfnat_poll_single(fd, 1, left);
         if (rc <= 0) break;
         ssize_t n = recv(fd, (char *)buf + *used, cap - *used, 0);
         if (n <= 0) break;
@@ -2356,7 +2389,7 @@ static int recv_headers_ev(socket_t fd, char *buf, size_t bufsz, int timeout_ms,
 /* ── EventLoop 版 I/O 函数结束 ─────────────────────────────── */
 
 static char *cfnat_strcasestr(const char *haystack, const char *needle) {
-    if (!haystack || !needle) return NULL;
+    if (!haystack || !needle) return nullptr;
     size_t nl = strlen(needle);
     if (nl == 0) return (char *)haystack;
     for (const char *p = haystack; *p; p++) {
@@ -2364,7 +2397,7 @@ static char *cfnat_strcasestr(const char *haystack, const char *needle) {
         while (i < nl && p[i] && tolower((unsigned char)p[i]) == tolower((unsigned char)needle[i])) i++;
         if (i == nl) return (char *)p;
     }
-    return NULL;
+    return nullptr;
 }
 
 static int extract_cfray(const char *headers, char *colo, size_t sz) {
@@ -2372,7 +2405,7 @@ static int extract_cfray(const char *headers, char *colo, size_t sz) {
     if (!p) return -1;
     const char *line_end = strstr(p, "\r\n");
     if (!line_end) line_end = p + strlen(p);
-    const char *dash = NULL;
+    const char *dash = nullptr;
     for (const char *q = p; q < line_end; q++) if (*q == '-') dash = q;
     if (!dash || dash + 1 >= line_end) return -1;
     const char *s = dash + 1;
@@ -2439,10 +2472,10 @@ static int baidu_pool_add(BaiduProxyPool *pool, const char *addr) {
 static void baidu_pool_free(BaiduProxyPool *pool) {
     if (!pool) return;
     free(pool->nodes);
-    pool->nodes = NULL;
+    pool->nodes = nullptr;
     pool->len = 0;
     pool->cap = 0;
-    pool->cached_best = NULL;
+    pool->cached_best = nullptr;
     pool->cached_at_ms = 0;
 }
 
@@ -2455,7 +2488,7 @@ static long proxy_node_score(const BaiduProxyNode *node) {
 
 /* P0-CACHE: 代理节点选择，带 5 秒缓存 */
 static BaiduProxyNode *baidu_pool_pick(BaiduProxyPool *pool) {
-    if (!pool || pool->len == 0) return NULL;
+    if (!pool || pool->len == 0) return nullptr;
 
     /* 缓存有效期内直接返回缓存结果 */
     if (pool->cached_best && (now_ms() - pool->cached_at_ms) < 5000) {
@@ -2483,7 +2516,7 @@ static socket_t tcp_connect_via_baidu(const char *node_addr, const char *target_
     char host[MAX_ADDR_LEN] = {0};
     int port = 0;
     if (parse_addr(node_addr, host, sizeof(host), &port) != 0) return INVALID_SOCKET;
-    socket_t fd = tcp_connect(host, port, timeout_ms, NULL);
+    socket_t fd = tcp_connect(host, port, timeout_ms, nullptr);
     if (cfnat_socket_invalid(fd)) return INVALID_SOCKET;
     char req[1024];
     snprintf(req, sizeof(req),
@@ -2504,7 +2537,7 @@ static socket_t tcp_connect_via_baidu(const char *node_addr, const char *target_
         close(fd);
         return INVALID_SOCKET;
     }
-    if (strstr(hdr, " 200 ") == NULL) {
+    if (strstr(hdr, " 200 ") == nullptr) {
         char status[128];
         size_t status_len = strcspn(hdr, "\r\n");
         if (status_len >= sizeof(status)) status_len = sizeof(status) - 1;
@@ -2518,7 +2551,7 @@ static socket_t tcp_connect_via_baidu(const char *node_addr, const char *target_
     return fd;
 }
 
-static socket_t dial_target_with_proxy(const char *ip, int port, int timeout_ms, BaiduProxyPool *pool, int *latency_ms) {
+CFNAT_NODISCARD static socket_t dial_target_with_proxy(const char *ip, int port, int timeout_ms, BaiduProxyPool *pool, int *latency_ms) {
     if (!pool || pool->len == 0) return tcp_connect(ip, port, timeout_ms, latency_ms);
     char target[MAX_ADDR_LEN];
     format_addr_port(ip, port, target, sizeof(target));
@@ -2536,8 +2569,8 @@ static socket_t dial_target_with_proxy(const char *ip, int port, int timeout_ms,
     return fd;
 }
 
-static int parse_listen_modes(const Config *cfg, CarrierListenSpec **out_specs, size_t *out_len) {
-    *out_specs = NULL;
+CFNAT_NODISCARD static int parse_listen_modes(const Config *cfg, CarrierListenSpec **out_specs, size_t *out_len) {
+    *out_specs = nullptr;
     *out_len = 0;
     if (!cfg) return -1;
     size_t len = 0;
@@ -2669,9 +2702,9 @@ static int parse_json_ipv4_values(const char *json, StringList *out, int *saw_fa
     if (!json || !out) return -1;
     size_t before = out->len;
     const char *p = json;
-    while ((p = strstr(p, "\"data\"")) != NULL) {
+    while ((p = strstr(p, "\"data\"")) != nullptr) {
         const char *colon = strchr(p, ':');
-        const char *q1 = colon ? strchr(colon, '"') : NULL;
+        const char *q1 = colon ? strchr(colon, '"') : nullptr;
         if (!q1) {
             p += 6;
             continue;
@@ -2737,7 +2770,7 @@ static int strip_query_param(const char *query, const char *key, char *out, size
             used += n;
             first = 0;
         }
-        p = end ? end + 1 : NULL;
+        p = end ? end + 1 : nullptr;
     }
     out[used] = '\0';
     return 0;
@@ -2804,7 +2837,7 @@ static int doh_query_a_once(const DohResolver *resolver, const char *domain, int
         }
         FILE *fp = popen(cmd, "r");
         if (!fp) return -1;
-        char *json = NULL;
+        char *json = nullptr;
         size_t cap = 0, len = 0;
         char buf[512];
         while (fgets(buf, sizeof(buf), fp)) {
@@ -2876,14 +2909,7 @@ static int dns_query_a_once(const char *resolver, const char *domain, int timeou
         return -1;
     }
 
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(fd, &rfds);
-    struct timeval tv = {
-        timeout_ms / 1000,
-        (timeout_ms % 1000) * 1000
-    };
-    int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
+    int rc = cfnat_poll_single(fd, 1, timeout_ms);
     if (rc <= 0) {
         close(fd);
         return -1;
@@ -3014,9 +3040,9 @@ static int resolve_host_ips(const char *domain, StringList *out) {
     struct addrinfo hints;
     memset(&hints, 0, sizeof(hints));
     hints.ai_family = AF_INET;
-    struct addrinfo * res = NULL;
+    struct addrinfo * res = nullptr;
     int saw_fake_ip = 0;
-    if (getaddrinfo(domain, NULL, &hints, &res) == 0) {
+    if (getaddrinfo(domain, nullptr, &hints, &res) == 0) {
         for (struct addrinfo * ai = res; ai; ai = ai->ai_next) {
             char ip[INET_ADDRSTRLEN] = {0};
             struct sockaddr_in * sin = (struct sockaddr_in *) ai->ai_addr;
@@ -3094,7 +3120,7 @@ static int carrier_init_baidu_pool(CarrierRuntime *rt) {
     if (rt->proxy_pool) {
         baidu_pool_free(rt->proxy_pool);
         free(rt->proxy_pool);
-        rt->proxy_pool = NULL;
+        rt->proxy_pool = nullptr;
     }
     warn_msg("%s 百度代理池建立失败，无法启动百度前置监听", carrier_display_name(rt->spec.mode));
     return 0;
@@ -3167,7 +3193,7 @@ static void *scan_worker(void *arg) {
         if (ctx->cidrs) {
             if (cidrlist_get_ip(ctx->cidrs, idx, ip, sizeof(ip)) != 0) continue;
         } else {
-            /* 兼容旧模式：ctx->ips 不为 NULL */
+            /* 兼容旧模式：ctx->ips 不为 nullptr */
             snprintf(ip, sizeof(ip), "%s", ctx->ips[idx]);
         }
 
@@ -3194,17 +3220,11 @@ static void *scan_worker(void *arg) {
                     continue;
                 }
             }
+            const char *probe_domain = (ctx->cfg->domain[0]) ? ctx->cfg->domain : "cloudflaremirrors.com";
             char req[512];
-            if ((attempt % 2) == 0) {
-                snprintf(req, sizeof(req),
-                         "GET / HTTP/1.1\r\nHost: cloudflaremirrors.com\r\nUser-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n");
-            } else {
-                char host_value[MAX_IP_LEN + 2];
-                format_host_literal(ip, host_value, sizeof(host_value));
-                snprintf(req, sizeof(req),
-                         "GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n",
-                         host_value);
-            }
+            snprintf(req, sizeof(req),
+                     "HEAD / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n",
+                     probe_domain);
 
             long t_start = now_ms();
             send(fd, req, strlen(req), 0);
@@ -3219,6 +3239,12 @@ static void *scan_worker(void *arg) {
                 continue;
             }
             header_once = 1;
+
+            /* 如果服务端指示 Connection: close，关闭连接以供下次探测重新建立 */
+            if (cfnat_strcasestr(hdr, "Connection: close")) {
+                close(fd);
+                fd = INVALID_SOCKET;
+            }
 
             char colo[MAX_COLO_LEN] = {0};
             if (extract_cfray(hdr, colo, sizeof(colo)) != 0) {
@@ -3315,7 +3341,7 @@ static void *scan_worker(void *arg) {
             if (!req_domain[0]) snprintf(req_domain, sizeof(req_domain), "cloudflaremirrors.com");
             if (!req_path[0]) snprintf(req_path, sizeof(req_path), "/");
 
-            socket_t check_fd = dial_target_with_proxy(ip, check_port, ctx->cfg->delay_ms, ctx->proxy_pool, NULL);
+            socket_t check_fd = dial_target_with_proxy(ip, check_port, ctx->cfg->delay_ms, ctx->proxy_pool, nullptr);
             if (cfnat_socket_invalid(check_fd)) {
                 debug_msg("IP %s 状态码二次校验失败: 无法连接端口 %d", ip, check_port);
                 atomic_fetch_add(&ctx->http_code_mismatch, 1);
@@ -3386,7 +3412,7 @@ static void *scan_worker(void *arg) {
     /* 剩余结果 flush */
     flush_local_results(ctx->results, local_results, &local_count);
     evloop_destroy(&el);
-    return NULL;
+    return nullptr;
 }
 #undef LOCAL_MAX
 
@@ -3421,8 +3447,8 @@ static int cmp_result(const void *a, const void *b) {
 }
 
 
-static int health_check_ip(const char *ip, BaiduProxyPool *proxy_pool);
-static int carrier_health_check_ip(CarrierRuntime *rt, const char *ip);
+CFNAT_NODISCARD static int health_check_ip(const char *ip, BaiduProxyPool *proxy_pool);
+CFNAT_NODISCARD static int carrier_health_check_ip(CarrierRuntime *rt, const char *ip);
 static int carrier_set_current_candidate(CarrierRuntime *rt, size_t idx);
 static int carrier_set_current_udp_candidate(CarrierRuntime *rt, size_t idx);
 static void carrier_get_current_udp_ip(CarrierRuntime *rt, char *out, size_t sz);
@@ -3500,7 +3526,7 @@ static void save_env_cidr_records(int ips_type, const Result *items, size_t len)
     const char *env_file = (ips_type == 6) ? "ips-v6-env.txt" : "ips-v4-env.txt";
 
     // 收集已有行
-    char **lines = NULL;
+    char **lines = nullptr;
     size_t line_count = 0;
     size_t line_cap = 0;
 
@@ -3511,7 +3537,7 @@ static void save_env_cidr_records(int ips_type, const Result *items, size_t len)
             trim_line(buf);
             if (!buf[0] || buf[0] == '#') continue;
             // 严格按目标协议过滤已有行，自动清洗历史上混入的异构网段
-            int line_is_v6 = (strchr(buf, ':') != NULL);
+            int line_is_v6 = (strchr(buf, ':') != nullptr);
             if (ips_type == 6 && !line_is_v6) continue;
             if (ips_type == 4 && line_is_v6) continue;
             if (line_count >= line_cap) {
@@ -3529,7 +3555,7 @@ static void save_env_cidr_records(int ips_type, const Result *items, size_t len)
     for (size_t i = 0; i < len; i++) {
         const Result *r = &items[i];
         if (!r->ip[0]) continue;
-        int is_v6 = (strchr(r->ip, ':') != NULL);
+        int is_v6 = (strchr(r->ip, ':') != nullptr);
         if (ips_type == 6 && !is_v6) continue; // 坚决防止 IPv4 写入 IPv6 资产库
         if (ips_type == 4 && is_v6) continue;  // 坚决防止 IPv6 写入 IPv4 资产库
         char cidr[128];
@@ -3565,7 +3591,7 @@ static void save_env_cidr_records(int ips_type, const Result *items, size_t len)
     }
 
     size_t unique_count = 0;
-    const char *last = NULL;
+    const char *last = nullptr;
     for (size_t i = 0; i < line_count; i++) {
         if (last && strcmp(last, lines[i]) == 0) {
             continue; // 重复行跳过
@@ -3590,7 +3616,7 @@ static void save_candidate_cache(const char *path, const Result *items, size_t l
         return;
     }
     /* P0-EWMA: 缓存格式升级为 v2，增加 ewma_latency, jitter_ms, consecutive_fail */
-    fprintf(fp, "# cfnat-cache-v2 %ld\n", (long)time(NULL));
+    fprintf(fp, "# cfnat-cache-v2 %ld\n", (long)time(nullptr));
     size_t limit = len;
     if (g_cfg.ipnum > 0 && limit > (size_t)g_cfg.ipnum) limit = (size_t)g_cfg.ipnum;
     for (size_t i = 0; i < limit; i++) {
@@ -3614,7 +3640,7 @@ static void save_candidate_cache(const char *path, const Result *items, size_t l
 
 static ResultList load_candidate_cache_for_profile(const char *path, const ProfileConfig *prof) {
     ResultList rl = {0};
-    pthread_mutex_init(&rl.mu, NULL);
+    pthread_mutex_init(&rl.mu, nullptr);
     if (!path || !file_exists(path)) return rl;
 
     FILE *fp = fopen(path, "rb");
@@ -3685,7 +3711,7 @@ static ResultList load_candidate_cache_for_profile(const char *path, const Profi
 }
 
 static ResultList load_candidate_cache(const char *path) {
-    return load_candidate_cache_for_profile(path, NULL);
+    return load_candidate_cache_for_profile(path, nullptr);
 }
 
 static int try_use_candidate_cache(BaiduProxyPool *proxy_pool, ResultList *out) {
@@ -3715,7 +3741,7 @@ static int try_use_candidate_cache(BaiduProxyPool *proxy_pool, ResultList *out) 
 
 static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Result *tcp_results, size_t count, size_t target_ipnum) {
     ResultList udp_res = {0};
-    pthread_mutex_init(&udp_res.mu, NULL);
+    pthread_mutex_init(&udp_res.mu, nullptr);
     if (!tcp_results || count == 0 || target_ipnum == 0) return udp_res;
 
     size_t sample_count = count < target_ipnum * 2 ? count : target_ipnum * 2;
@@ -3790,6 +3816,7 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
 
     rt->candidates.items = cached_tcp.items;
     rt->candidates.len = cached_tcp.len;
+    pthread_mutex_destroy(&cached_tcp.mu);
     carrier_set_current_candidate(rt, first_good_tcp);
     atomic_store(&rt->candidates.cache_valid, 1);
 
@@ -3815,6 +3842,7 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
     if (first_good_udp != (size_t)-1) {
         rt->udp_candidates.items = cached_udp.items;
         rt->udp_candidates.len = cached_udp.len;
+        pthread_mutex_destroy(&cached_udp.mu);
         carrier_set_current_udp_candidate(rt, first_good_udp);
         atomic_store(&rt->udp_candidates.cache_valid, 1);
     } else {
@@ -3826,9 +3854,12 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
         if (fresh_udp.len > 0) {
             rt->udp_candidates.items = fresh_udp.items;
             rt->udp_candidates.len = fresh_udp.len;
+            pthread_mutex_destroy(&fresh_udp.mu);
             carrier_set_current_udp_candidate(rt, 0);
             atomic_store(&rt->udp_candidates.cache_valid, 1);
             save_candidate_cache(udp_path, fresh_udp.items, fresh_udp.len);
+        } else {
+            pthread_mutex_destroy(&fresh_udp.mu);
         }
     }
 
@@ -3861,7 +3892,7 @@ static void explain_selected_result(const Result *best) {
 
 static ResultList scan_ips(StringList *ips, CidrList *cidrs, Config *cfg, BaiduProxyPool *proxy_pool) {
     ResultList rl = {0};
-    pthread_mutex_init(&rl.mu, NULL);
+    pthread_mutex_init(&rl.mu, nullptr);
     uint64_t total_ips = cidrs ? cidrlist_total(cidrs) : (ips ? ips->len : 0);
     int threads = cfg->task;
     if ((uint64_t)threads > total_ips) threads = (int)total_ips;
@@ -3875,7 +3906,7 @@ static ResultList scan_ips(StringList *ips, CidrList *cidrs, Config *cfg, BaiduP
         return rl;
     }
     ScanCtx ctx = {
-        .ips = ips ? ips->items : NULL,
+        .ips = ips ? ips->items : nullptr,
         .cidrs = cidrs,
         .total = (size_t)total_ips,
         .results = &rl,
@@ -3894,10 +3925,10 @@ static ResultList scan_ips(StringList *ips, CidrList *cidrs, Config *cfg, BaiduP
             (unsigned long long)total_ips, threads, cfg->num > 0 ? cfg->num : 1, cfg->delay_ms);
     int created = 0;
     for (int i = 0; i < threads; i++) {
-        if (pthread_create(&tids[i], NULL, scan_worker, &ctx) != 0) break;
+        if (pthread_create(&tids[i], nullptr, scan_worker, &ctx) != 0) break;
         created++;
     }
-    for (int i = 0; i < created; i++) pthread_join(tids[i], NULL);
+    for (int i = 0; i < created; i++) pthread_join(tids[i], nullptr);
     free(tids);
     pthread_mutex_destroy(&rl.mu);
     qsort(rl.items, rl.len, sizeof(Result), cmp_result);
@@ -3920,20 +3951,16 @@ static ResultList scan_ips(StringList *ips, CidrList *cidrs, Config *cfg, BaiduP
     return rl;
 }
 
-static int http_probe(socket_t fd, int timeout_ms) {
+CFNAT_NODISCARD static int http_probe(socket_t fd, int timeout_ms) {
     // 发送 HTTP GET 请求探测数据通路是否正常
     const char *req = "GET / HTTP/1.0\r\nHost: cloudflaremirrors.com\r\nConnection: close\r\n\r\n";
     size_t reqlen = strlen(req);
     long deadline = now_ms() + timeout_ms;
     size_t sent = 0;
     while (sent < reqlen && now_ms() < deadline) {
-        fd_set wfds;
-        FD_ZERO(&wfds);
-        FD_SET(fd, &wfds);
         int left = (int)(deadline - now_ms());
         if (left <= 0) break;
-        struct timeval tv = { left / 1000, (left % 1000) * 1000 };
-        int rc = select(fd + 1, NULL, &wfds, NULL, &tv);
+        int rc = cfnat_poll_single(fd, 2, left);
         if (rc <= 0) break;
         ssize_t n = send(fd, req + sent, reqlen - sent, 0);
         if (n <= 0) break;
@@ -3944,13 +3971,9 @@ static int http_probe(socket_t fd, int timeout_ms) {
     char buf[256];
     size_t used = 0;
     while (used < sizeof(buf) - 1 && now_ms() < deadline) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(fd, &rfds);
         int left = (int)(deadline - now_ms());
         if (left <= 0) break;
-        struct timeval tv = { left / 1000, (left % 1000) * 1000 };
-        int rc = select(fd + 1, &rfds, NULL, NULL, &tv);
+        int rc = cfnat_poll_single(fd, 1, left);
         if (rc <= 0) break;
         ssize_t n = recv(fd, buf + used, sizeof(buf) - used - 1, 0);
         if (n <= 0) break;
@@ -3962,7 +3985,7 @@ static int http_probe(socket_t fd, int timeout_ms) {
 }
 
 /* P0-EWMA: 增强健康检查，更新候选池中对应 IP 的 EWMA 和连续失败计数 */
-static int health_check_ip(const char *ip, BaiduProxyPool *proxy_pool) {
+CFNAT_NODISCARD static int health_check_ip(const char *ip, BaiduProxyPool *proxy_pool) {
     int latency = 0;
     socket_t fd = dial_target_with_proxy(ip, g_cfg.port, g_cfg.delay_ms, proxy_pool, &latency);
     if (cfnat_socket_invalid(fd)) {
@@ -3986,19 +4009,20 @@ static void close_pair(socket_t a, socket_t b) {
     shutdown(b, SHUT_RDWR);
 }
 
-/* P1-2: 带超时的 recv，超时返回 -1，errno = ETIMEDOUT */
-static ssize_t recv_timeout(socket_t fd, void *buf, size_t len, int timeout_ms) {
-    if (timeout_ms <= 0) return recv(fd, buf, len, 0);
-    fd_set rfds;
-    FD_ZERO(&rfds);
-    FD_SET(fd, &rfds);
-    struct timeval tv = { timeout_ms / 1000, (timeout_ms % 1000) * 1000 };
-    int rc = select((int)(fd + 1), &rfds, NULL, NULL, &tv);
-    if (rc <= 0) {
-        if (rc == 0) errno = ETIMEDOUT;
-        return -1;
+/* P1-2: 带超时的 recv（支持 flags，如 MSG_PEEK），突破 FD_SETSIZE 限制 */
+static ssize_t recv_flags_timeout(socket_t fd, void *buf, size_t len, int timeout_ms, int flags) {
+    if (timeout_ms > 0) {
+        int rc = cfnat_poll_single(fd, 1, timeout_ms);
+        if (rc <= 0) {
+            if (rc == 0) errno = ETIMEDOUT;
+            return -1;
+        }
     }
-    return recv(fd, buf, len, 0);
+    return recv(fd, buf, len, flags);
+}
+
+static ssize_t recv_timeout(socket_t fd, void *buf, size_t len, int timeout_ms) {
+    return recv_flags_timeout(fd, buf, len, timeout_ms, 0);
 }
 
 #if defined(__linux__) && !defined(__ANDROID__)
@@ -4018,7 +4042,7 @@ static void *pipe_worker_fallback(PipeCtx *pc) {
         }
     }
     done : close_pair(pc->from, pc->to);
-    return NULL;
+    return nullptr;
 }
 
 static void *pipe_worker(void *arg) {
@@ -4028,10 +4052,10 @@ static void *pipe_worker(void *arg) {
         return pipe_worker_fallback(pc);
     }
     while (1) {
-        ssize_t n = splice(pc->from, NULL, pipefd[1], NULL, 65536, SPLICE_F_MOVE | SPLICE_F_MORE);
+        ssize_t n = splice(pc->from, nullptr, pipefd[1], nullptr, 65536, SPLICE_F_MOVE | SPLICE_F_MORE);
         if (n <= 0) break;
         while (n > 0) {
-            ssize_t w = splice(pipefd[0], NULL, pc->to, NULL, (size_t)n, SPLICE_F_MOVE | SPLICE_F_MORE);
+            ssize_t w = splice(pipefd[0], nullptr, pc->to, nullptr, (size_t)n, SPLICE_F_MOVE | SPLICE_F_MORE);
             if (w <= 0) goto done;
             n -= w;
         }
@@ -4040,7 +4064,7 @@ static void *pipe_worker(void *arg) {
     close(pipefd[0]);
     close(pipefd[1]);
     close_pair(pc->from, pc->to);
-    return NULL;
+    return nullptr;
 }
 #else
 /* 非 Linux 平台使用普通 recv/send 转发 */
@@ -4061,7 +4085,7 @@ static void *pipe_worker(void *arg) {
         }
     }
     done : close_pair(pc->from, pc->to);
-    return NULL;
+    return nullptr;
 }
 #endif
 
@@ -4076,20 +4100,35 @@ static int create_small_thread(pthread_t *tid, void *(*fn)(void *), void *arg) {
 
 
 
+static void set_socket_timeouts_and_keepalive(socket_t s, int timeout_sec) {
+    if (cfnat_socket_invalid(s)) return;
+#ifdef _WIN32
+    DWORD tv = (DWORD)(timeout_sec * 1000);
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char *)&tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
+    BOOL keepalive = TRUE;
+    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char *)&keepalive, sizeof(keepalive));
+#else
+    struct timeval tv;
+    tv.tv_sec = timeout_sec;
+    tv.tv_usec = 0;
+    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+    int keepalive = 1;
+    setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+#endif
+}
+
 static int relay_bidirectional(socket_t c, socket_t u) {
+    /* 为双向套接字设置 300 秒空闲超时及 KeepAlive，防止 Linux splice 及非阻塞管道永久卡死 */
+    set_socket_timeouts_and_keepalive(c, 300);
+    set_socket_timeouts_and_keepalive(u, 300);
     pthread_t t1, t2;
-    PipeCtx a = {
-        c,
-        u
-    }
-    , b = {
-        u,
-        c
-    };
+    PipeCtx a = { c, u }, b = { u, c };
     create_small_thread(&t1, pipe_worker, &a);
     create_small_thread(&t2, pipe_worker, &b);
-    pthread_join(t1, NULL);
-    pthread_join(t2, NULL);
+    pthread_join(t1, nullptr);
+    pthread_join(t2, nullptr);
     return 0;
 }
 
@@ -4099,15 +4138,16 @@ static void *connection_thread(void *arg) {
     socket_t upstream = INVALID_SOCKET;
     long conn_start_ms = now_ms();
     unsigned char first = 0;
-    /* P1-2: 首字节 recv 带 60 秒超时，防止空闲连接占用线程 */
-    ssize_t n = recv_timeout(client, (char *) & first, 1, 60000);
+    /* P1-2: 首字节使用 MSG_PEEK 嗅探协议类型，非 TLS 请求不消耗首字节，避免 1 字节拆包 */
+    ssize_t n = recv_flags_timeout(client, (char *)&first, 1, 60000, MSG_PEEK);
     if (n <= 0) goto out;
-    int is_tls = first == 0x16;
+    int is_tls = (first == 0x16);
     int target_port = is_tls ? cc->tls_port : cc->http_port;
     unsigned char client_hello[4096];
     size_t client_hello_len = 0;
     char sni_host[MAX_DOMAIN_LEN] = {0};
     if (is_tls) {
+        recv(client, (char *)&first, 1, 0); /* 确认为 TLS，提取消耗首字节 0x16 并读取完整 ClientHello */
         client_hello_len = read_tls_client_hello(client, first, client_hello, sizeof(client_hello), cc->delay_ms);
         parse_tls_sni(client_hello, client_hello_len, sni_host, sizeof(sni_host));
     }
@@ -4121,7 +4161,7 @@ static void *connection_thread(void *arg) {
         // 混合模式：先直连，不行再试百度前置
         for (int i = 0; i < cc->num; i++) {
             int lat = 0;
-            socket_t fd = dial_target_with_proxy(cc->ip, target_port, cc->delay_ms, NULL, &lat);
+            socket_t fd = dial_target_with_proxy(cc->ip, target_port, cc->delay_ms, nullptr, &lat);
             if (cfnat_socket_valid(fd)) {
                 upstream = fd;
                 best = lat;
@@ -4179,12 +4219,7 @@ static void *connection_thread(void *arg) {
     }
     if (is_tls && client_hello_len > 0) {
         if (!send_all_timeout(upstream, client_hello, client_hello_len, cc->delay_ms > 0 ? cc->delay_ms : 1000)) {
-        debug_msg("#%llu 转发客户端 ClientHello 失败，关闭连接", cc->conn_id);
-        goto out;
-    }
-    } else {
-        if (!send_all_timeout(upstream, (const char *)&first, 1, cc->delay_ms > 0 ? cc->delay_ms : 1000)) {
-            debug_msg("转发客户端首字节失败，关闭连接");
+            debug_msg("#%llu 转发客户端 ClientHello 失败，关闭连接", cc->conn_id);
             goto out;
         }
     }
@@ -4196,15 +4231,23 @@ static void *connection_thread(void *arg) {
     int active = atomic_fetch_sub(&g_active_connections, 1) - 1;
     conn_msg("#%llu 客户端连接关闭，当前活跃连接数: %d", cc->conn_id, active);
     free(cc);
-    return NULL;
+    return nullptr;
 }
 
 /* P1-HC: 健康检查级别 */
+#if CFNAT_IS_C23
+typedef enum : uint8_t {
+    HC_LIGHT = 0,   /* 仅 TCP 握手 */
+    HC_MEDIUM,      /* TCP + 首字节响应 */
+    HC_FULL         /* TCP + HTTP 完整探测 */
+} HealthCheckLevel;
+#else
 typedef enum {
     HC_LIGHT = 0,   /* 仅 TCP 握手 */
     HC_MEDIUM,      /* TCP + 首字节响应 */
     HC_FULL         /* TCP + HTTP 完整探测 */
 } HealthCheckLevel;
+#endif
 
 static int carrier_probe_and_check(CarrierRuntime *rt, socket_t fd, int timeout_ms) {
     int target_port = (rt && rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
@@ -4214,14 +4257,14 @@ static int carrier_probe_and_check(CarrierRuntime *rt, socket_t fd, int timeout_
 }
 
 /* P1-HC: 增强 carrier 健康检查，支持级别参数 */
-static int carrier_health_check_ip_level(CarrierRuntime *rt, const char *ip, HealthCheckLevel level) {
+CFNAT_NODISCARD static int carrier_health_check_ip_level(CarrierRuntime *rt, const char *ip, HealthCheckLevel level) {
     if (!rt || !ip || !*ip) return 0;
     int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
     int timeout_ms = (rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms;
     // 混合模式：先试直连，不行再试百度代理
     if (rt->spec.use_baidu_proxy == 2) {
         int latency = 0;
-        socket_t fd = dial_target_with_proxy(ip, target_port, timeout_ms, NULL, &latency);
+        socket_t fd = dial_target_with_proxy(ip, target_port, timeout_ms, nullptr, &latency);
         if (cfnat_socket_valid(fd)) {
             if (level == HC_LIGHT) {
                 close(fd);
@@ -4270,14 +4313,14 @@ static int carrier_health_check_ip_level(CarrierRuntime *rt, const char *ip, Hea
     return 0;
 }
 
-static int carrier_health_check_ip(CarrierRuntime *rt, const char *ip) {
+CFNAT_NODISCARD static int carrier_health_check_ip(CarrierRuntime *rt, const char *ip) {
     if (!rt || !ip || !*ip) return 0;
     int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
     int timeout_ms = (rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms;
     // 混合模式：先试直连，不行再试百度代理
     if (rt->spec.use_baidu_proxy == 2) {
         int latency = 0;
-        socket_t fd = dial_target_with_proxy(ip, target_port, timeout_ms, NULL, &latency);
+        socket_t fd = dial_target_with_proxy(ip, target_port, timeout_ms, nullptr, &latency);
         if (cfnat_socket_valid(fd)) {
             if (carrier_probe_and_check(rt, fd, timeout_ms)) {
                 debug_msg("%s 健康检查成功(直连): IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
@@ -4318,7 +4361,7 @@ static int carrier_tls_sni_check_ip(CarrierRuntime *rt, const char *ip, const ch
     int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
     int timeout_ms = (rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms;
     if (rt->spec.use_baidu_proxy == 2) {
-        fd = dial_target_with_proxy(ip, target_port, timeout_ms, NULL, &latency);
+        fd = dial_target_with_proxy(ip, target_port, timeout_ms, nullptr, &latency);
         if (cfnat_socket_valid(fd)) {
             int ok = tls_probe_host(fd, timeout_ms, sni_host);
             close(fd);
@@ -4408,11 +4451,23 @@ static int carrier_choose_ip_fast(CarrierRuntime *rt, char *out, size_t sz) {
 
 static int carrier_select_valid_ip(CarrierRuntime *rt) {
     if (!rt) return 0;
-    for (size_t i = 0; i < rt->candidates.len; i++) {
-        if (carrier_health_check_ip(rt, rt->candidates.items[i].ip)) {
-            carrier_set_current_candidate(rt, i);
+    char check_ips[32][MAX_IP_LEN];
+    size_t check_indices[32];
+    size_t count = 0;
+
+    pthread_mutex_lock(&rt->candidates.mu);
+    for (size_t i = 0; i < rt->candidates.len && count < 32; i++) {
+        snprintf(check_ips[count], sizeof(check_ips[count]), "%s", rt->candidates.items[i].ip);
+        check_indices[count] = i;
+        count++;
+    }
+    pthread_mutex_unlock(&rt->candidates.mu);
+
+    for (size_t i = 0; i < count; i++) {
+        if (carrier_health_check_ip(rt, check_ips[i])) {
+            carrier_set_current_candidate(rt, check_indices[i]);
             atomic_store(&rt->candidates.cache_valid, 1);  /* P0-1: 选中有效 IP */
-            log_msg("%s 可用 IP: %s (健康检查端口:%d)", carrier_display_name(rt->spec.mode), rt->candidates.items[i].ip, g_cfg.port);
+            log_msg("%s 可用 IP: %s (健康检查端口:%d)", carrier_display_name(rt->spec.mode), check_ips[i], g_cfg.port);
             return 1;
         }
     }
@@ -4421,30 +4476,39 @@ static int carrier_select_valid_ip(CarrierRuntime *rt) {
 
 static int carrier_switch_next_ip(CarrierRuntime *rt) {
     if (!rt) return 0;
+    char check_ips[32][MAX_IP_LEN];
+    size_t check_indices[32];
+    size_t count = 0;
+    size_t total_len = 0;
+
     pthread_mutex_lock(&rt->candidates.mu);
     size_t len = rt->candidates.len;
     size_t start = rt->candidates.current_index + 1;
-    pthread_mutex_unlock(&rt->candidates.mu);
-
-    if (len == 0) return 0;
-
-    /* 消耗比例阈值: 70% */
-    size_t threshold = (size_t)(len * 0.70);
-    if (threshold < 1) threshold = 1;
-
-    /* 1. 如果尚未达到 70% 消耗阈值，顺位尝试后面的备用候选 */
-    if (start < threshold) {
-        for (size_t i = start; i < threshold && i < len; i++) {
-            if (carrier_health_check_ip(rt, rt->candidates.items[i].ip)) {
-                carrier_set_current_candidate(rt, i);
-                atomic_store(&rt->candidates.cache_valid, 1);  /* P0-1: 新 IP 有效 */
-                log_msg("%s 顺位切换到下一个最优 TCP IP: %s (候选索引: %zu/%zu)", carrier_display_name(rt->spec.mode), rt->candidates.items[i].ip, i, len);
-                return 1;
+    total_len = len;
+    if (len > 0) {
+        size_t threshold = (size_t)(len * 0.70);
+        if (threshold < 1) threshold = 1;
+        if (start < threshold) {
+            for (size_t i = start; i < threshold && i < len && count < 32; i++) {
+                snprintf(check_ips[count], sizeof(check_ips[count]), "%s", rt->candidates.items[i].ip);
+                check_indices[count] = i;
+                count++;
             }
         }
     }
+    pthread_mutex_unlock(&rt->candidates.mu);
 
-    /* 2. 消耗达到或超过 70% 阈值，或在 threshold 范围内无可用 IP，交由上层执行测活与补齐 */
+    if (total_len == 0 || count == 0) return 0;
+
+    for (size_t i = 0; i < count; i++) {
+        if (carrier_health_check_ip(rt, check_ips[i])) {
+            carrier_set_current_candidate(rt, check_indices[i]);
+            atomic_store(&rt->candidates.cache_valid, 1);  /* P0-1: 新 IP 有效 */
+            log_msg("%s 顺位切换到下一个最优 TCP IP: %s (候选索引: %zu/%zu)",
+                    carrier_display_name(rt->spec.mode), check_ips[i], check_indices[i], total_len);
+            return 1;
+        }
+    }
     return 0;
 }
 
@@ -4472,52 +4536,77 @@ static int carrier_set_current_udp_candidate(CarrierRuntime *rt, size_t idx) {
     return 0;
 }
 
-static int carrier_select_valid_udp_ip(CarrierRuntime *rt) {
+CFNAT_NODISCARD static int carrier_select_valid_udp_ip(CarrierRuntime *rt) {
     if (!rt) return 0;
     int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
     if (target_port <= 0) target_port = 443;
     int delay_ms = (rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms;
     if (delay_ms < 1000) delay_ms = 1000;
-    for (size_t i = 0; i < rt->udp_candidates.len; i++) {
+
+    char check_ips[32][MAX_IP_LEN];
+    size_t check_indices[32];
+    size_t count = 0;
+
+    pthread_mutex_lock(&rt->udp_candidates.mu);
+    for (size_t i = 0; i < rt->udp_candidates.len && count < 32; i++) {
+        snprintf(check_ips[count], sizeof(check_ips[count]), "%s", rt->udp_candidates.items[i].ip);
+        check_indices[count] = i;
+        count++;
+    }
+    pthread_mutex_unlock(&rt->udp_candidates.mu);
+
+    for (size_t i = 0; i < count; i++) {
         int lat = 0;
-        if (quic_probe_ip(rt->udp_candidates.items[i].ip, target_port, delay_ms, &lat)) {
-            carrier_set_current_udp_candidate(rt, i);
+        if (quic_probe_ip(check_ips[i], target_port, delay_ms, &lat)) {
+            carrier_set_current_udp_candidate(rt, check_indices[i]);
             atomic_store(&rt->udp_candidates.cache_valid, 1);
             log_msg("%s 可用 UDP/H3 IP: %s (QUIC 延迟: %d ms)",
-                    carrier_display_name(rt->spec.mode), rt->udp_candidates.items[i].ip, lat);
+                    carrier_display_name(rt->spec.mode), check_ips[i], lat);
             return 1;
         }
     }
     return 0;
 }
 
-static int carrier_switch_next_udp_ip(CarrierRuntime *rt) {
+CFNAT_NODISCARD static int carrier_switch_next_udp_ip(CarrierRuntime *rt) {
     if (!rt) return 0;
-    pthread_mutex_lock(&rt->udp_candidates.mu);
-    size_t len = rt->udp_candidates.len;
-    size_t start = rt->udp_candidates.current_index + 1;
-    pthread_mutex_unlock(&rt->udp_candidates.mu);
-
-    if (len == 0) return 0;
-
-    size_t threshold = (size_t)(len * 0.70);
-    if (threshold < 1) threshold = 1;
-
     int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
     if (target_port <= 0) target_port = 443;
     int delay_ms = (rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms;
     if (delay_ms < 1000) delay_ms = 1000;
 
-    if (start < threshold) {
-        for (size_t i = start; i < threshold && i < len; i++) {
-            int lat = 0;
-            if (quic_probe_ip(rt->udp_candidates.items[i].ip, target_port, delay_ms, &lat)) {
-                carrier_set_current_udp_candidate(rt, i);
-                atomic_store(&rt->udp_candidates.cache_valid, 1);
-                log_msg("%s UDP 顺位切换到下一个最优 IP: %s (候选索引: %zu/%zu, 延迟 %d ms)",
-                        carrier_display_name(rt->spec.mode), rt->udp_candidates.items[i].ip, i, len, lat);
-                return 1;
+    char check_ips[32][MAX_IP_LEN];
+    size_t check_indices[32];
+    size_t count = 0;
+    size_t total_len = 0;
+
+    pthread_mutex_lock(&rt->udp_candidates.mu);
+    size_t len = rt->udp_candidates.len;
+    size_t start = rt->udp_candidates.current_index + 1;
+    total_len = len;
+    if (len > 0) {
+        size_t threshold = (size_t)(len * 0.70);
+        if (threshold < 1) threshold = 1;
+        if (start < threshold) {
+            for (size_t i = start; i < threshold && i < len && count < 32; i++) {
+                snprintf(check_ips[count], sizeof(check_ips[count]), "%s", rt->udp_candidates.items[i].ip);
+                check_indices[count] = i;
+                count++;
             }
+        }
+    }
+    pthread_mutex_unlock(&rt->udp_candidates.mu);
+
+    if (total_len == 0 || count == 0) return 0;
+
+    for (size_t i = 0; i < count; i++) {
+        int lat = 0;
+        if (quic_probe_ip(check_ips[i], target_port, delay_ms, &lat)) {
+            carrier_set_current_udp_candidate(rt, check_indices[i]);
+            atomic_store(&rt->udp_candidates.cache_valid, 1);
+            log_msg("%s UDP 顺位切换到下一个最优 IP: %s (候选索引: %zu/%zu, 延迟 %d ms)",
+                    carrier_display_name(rt->spec.mode), check_ips[i], check_indices[i], total_len, lat);
+            return 1;
         }
     }
     return 0;
@@ -4549,7 +4638,7 @@ static void carrier_note_connection_result(CarrierRuntime *rt, const char *ip, l
     }
 }
 
-static int carrier_choose_ip_for_connection(CarrierRuntime *rt, char *out, size_t sz) {
+CFNAT_NODISCARD static int carrier_choose_ip_for_connection(CarrierRuntime *rt, char *out, size_t sz) {
     if (!rt || !out || sz == 0) return 0;
     out[0] = '\0';
 
@@ -4582,9 +4671,8 @@ static int carrier_choose_ip_for_connection(CarrierRuntime *rt, char *out, size_
  * 提取现有 TCP 与 UDP 的存活火种，与扫描新 IP 合并大排序，TCP 取前 ipnum，UDP 取前 2*ipnum 精筛 */
 static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
     if (!rt) return 0;
-    static atomic_int s_rescanning_lock = 0;
     int expected = 0;
-    if (!atomic_compare_exchange_strong(&s_rescanning_lock, &expected, 1)) {
+    if (!atomic_compare_exchange_strong(&rt->rescanning_lock, &expected, 1)) {
         debug_msg("%s 自愈补充扫描已在进行中，跳过并发触发", carrier_display_name(rt->spec.mode));
         return 1;
     }
@@ -4642,12 +4730,12 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
         if (retest_cfg.ipnum < (int)pool_ips.len) retest_cfg.ipnum = (int)pool_ips.len;
         if (retest_cfg.task > (int)pool_ips.len) retest_cfg.task = (int)pool_ips.len;
         if (rt->spec.use_baidu_proxy == 2) {
-            ResultList direct_res = scan_ips(&pool_ips, NULL, &retest_cfg, NULL);
+            ResultList direct_res = scan_ips(&pool_ips, nullptr, &retest_cfg, nullptr);
             ResultList baidu_res = {0};
             if (rt->proxy_pool && rt->proxy_pool->len > 0) {
-                baidu_res = scan_ips(&pool_ips, NULL, &retest_cfg, rt->proxy_pool);
+                baidu_res = scan_ips(&pool_ips, nullptr, &retest_cfg, rt->proxy_pool);
             }
-            pthread_mutex_init(&survivors.mu, NULL);
+            pthread_mutex_init(&survivors.mu, nullptr);
             for (size_t j = 0; j < direct_res.len; j++) resultlist_add(&survivors, &direct_res.items[j]);
             for (size_t j = 0; j < baidu_res.len; j++) {
                 int exists = 0;
@@ -4660,13 +4748,13 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
             free(baidu_res.items);
             if (survivors.len > 0) qsort(survivors.items, survivors.len, sizeof(Result), cmp_result);
         } else {
-            survivors = scan_ips(&pool_ips, NULL, &retest_cfg, rt->proxy_pool);
+            survivors = scan_ips(&pool_ips, nullptr, &retest_cfg, rt->proxy_pool);
         }
         strlist_free(&pool_ips);
     }
 
     ResultList all_candidates = {0};
-    pthread_mutex_init(&all_candidates.mu, NULL);
+    pthread_mutex_init(&all_candidates.mu, nullptr);
 
     /* 2. 判定原地测活存活数量:
        若存活数量达到双轨满编门槛 (>= target_ipnum * 2)，直接原地重排自愈，无需全局扫描！ */
@@ -4702,12 +4790,12 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
         if (ips.len > 0) {
             ResultList fresh_results = {0};
             if (rt->spec.use_baidu_proxy == 2) {
-                ResultList results_direct = scan_ips(&ips, NULL, &fresh_cfg, NULL);
+                ResultList results_direct = scan_ips(&ips, nullptr, &fresh_cfg, nullptr);
                 ResultList results_baidu = {0};
                 if (rt->proxy_pool && rt->proxy_pool->len > 0) {
-                    results_baidu = scan_ips(&ips, NULL, &fresh_cfg, rt->proxy_pool);
+                    results_baidu = scan_ips(&ips, nullptr, &fresh_cfg, rt->proxy_pool);
                 }
-                pthread_mutex_init(&fresh_results.mu, NULL);
+                pthread_mutex_init(&fresh_results.mu, nullptr);
                 for (size_t j = 0; j < results_direct.len; j++) resultlist_add(&fresh_results, &results_direct.items[j]);
                 for (size_t j = 0; j < results_baidu.len; j++) {
                     int exists = 0;
@@ -4720,7 +4808,7 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
                 free(results_baidu.items);
                 if (fresh_results.len > 0) qsort(fresh_results.items, fresh_results.len, sizeof(Result), cmp_result);
             } else {
-                fresh_results = scan_ips(&ips, NULL, &fresh_cfg, rt->proxy_pool);
+                fresh_results = scan_ips(&ips, nullptr, &fresh_cfg, rt->proxy_pool);
             }
             strlist_free(&ips);
 
@@ -4743,7 +4831,7 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
 
     if (all_candidates.len == 0) {
         pthread_mutex_destroy(&all_candidates.mu);
-        atomic_store(&s_rescanning_lock, 0);
+        atomic_store(&rt->rescanning_lock, 0);
         warn_msg("%s 补充扫描后仍未发现有效 IP", carrier_display_name(rt->spec.mode));
         return 0;
     }
@@ -4791,7 +4879,7 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
             rt->candidates.current_ip, rt->candidates.items ? rt->candidates.items[0].latency_ms : 0,
             rt->udp_candidates.current_ip, rt->udp_candidates.items ? rt->udp_candidates.items[0].latency_ms : 0);
 
-    atomic_store(&s_rescanning_lock, 0);
+    atomic_store(&rt->rescanning_lock, 0);
     return 1;
 }
 
@@ -4836,13 +4924,13 @@ static void *carrier_health_thread(void *arg) {
                 log_msg("%s TCP 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护双轨候选池", carrier_display_name(rt->spec.mode));
                 if (!carrier_rescan_dual_pools(rt)) {
                     atomic_store(&g_running, 0);
-                    return NULL;
+                    return nullptr;
                 }
             }
             fail = 0;
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 /* UDP/H3 定时轻量 QUIC 探针健康检查线程 */
@@ -4889,7 +4977,7 @@ static void *carrier_udp_health_thread(void *arg) {
             fail = 0;
         }
     }
-    return NULL;
+    return nullptr;
 }
 
 static void *carrier_accept_thread(void *arg) {
@@ -4955,7 +5043,7 @@ static void *carrier_accept_thread(void *arg) {
         create_small_thread(&tid, connection_thread, cc);
         pthread_detach(tid);
     }
-    return NULL;
+    return nullptr;
 }
 
 static int parse_addr(const char *addr, char *host, size_t hostsz, int *port) {
@@ -5097,7 +5185,7 @@ static socket_t listen_udp(const char *addr) {
 #endif
         BOOL bNewBehavior = FALSE;
         DWORD dwBytesReturned = 0;
-        WSAIoctl(fd, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), NULL, 0, &dwBytesReturned, NULL, NULL);
+        WSAIoctl(fd, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), nullptr, 0, &dwBytesReturned, nullptr, nullptr);
 #endif
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const void *)&yes, sizeof(yes));
 #ifdef SO_REUSEPORT
@@ -5127,7 +5215,7 @@ static socket_t listen_udp(const char *addr) {
 #endif
     BOOL bNewBehavior = FALSE;
     DWORD dwBytesReturned = 0;
-    WSAIoctl(fd, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), NULL, 0, &dwBytesReturned, NULL, NULL);
+    WSAIoctl(fd, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), nullptr, 0, &dwBytesReturned, nullptr, nullptr);
 #endif
     setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, (const void *)&yes, sizeof(yes));
 #ifdef SO_REUSEPORT
@@ -5151,7 +5239,7 @@ static socket_t listen_udp(const char *addr) {
 
 static socket_t udp_connect_upstream(const char *ip, int port) {
     if (!ip || !*ip || port <= 0) return INVALID_SOCKET;
-    int is_v6 = (strchr(ip, ':') != NULL);
+    int is_v6 = (strchr(ip, ':') != nullptr);
     socket_t fd = socket(is_v6 ? AF_INET6 : AF_INET, SOCK_DGRAM, 0);
     if (cfnat_socket_invalid(fd)) return INVALID_SOCKET;
 
@@ -5161,7 +5249,7 @@ static socket_t udp_connect_upstream(const char *ip, int port) {
 #endif
     BOOL bNewBehavior = FALSE;
     DWORD dwBytesReturned = 0;
-    WSAIoctl(fd, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), NULL, 0, &dwBytesReturned, NULL, NULL);
+    WSAIoctl(fd, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), nullptr, 0, &dwBytesReturned, nullptr, nullptr);
 #endif
 
     bind_socket_to_interface(fd, is_v6 ? AF_INET6 : AF_INET);
@@ -5198,23 +5286,20 @@ static socket_t udp_connect_upstream(const char *ip, int port) {
 }
 
 static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct sockaddr_storage *client_addr, socklen_t client_len, const char *target_ip, int target_port) {
-    if (!rt || !client_addr || !target_ip || !*target_ip) return NULL;
+    if (!rt || !client_addr || !target_ip || !*target_ip) return nullptr;
 
     UdpSession *s = rt->udp_sessions;
     size_t count = 0;
     while (s) {
         count++;
         if (sockaddr_equal(&s->client_addr, client_addr)) {
-            // 已有会话，检查目标优选 IP 是否变动（故障转移/自愈更新）
-            if (strcmp(s->target_ip, target_ip) != 0 || s->target_port != target_port) {
-                if (cfnat_socket_valid(s->upstream_fd)) {
-                    close(s->upstream_fd);
-                }
+            /* 会话保持粘性 (Session Stickiness): QUIC/H3 具有强加密连接状态与 Connection ID，
+             * 只要现有 socket 仍有效活跃，不可中途突变目标 IP，避免客户端遭遇连接重置 (Stateless Reset)。
+             * 仅在 upstream_fd 失效时才重新连接新优选 IP。 */
+            if (!cfnat_socket_valid(s->upstream_fd)) {
                 s->upstream_fd = udp_connect_upstream(target_ip, target_port);
                 snprintf(s->target_ip, sizeof(s->target_ip), "%s", target_ip);
                 s->target_port = target_port;
-                log_msg("%s UDP/H3 会话故障转移，平滑切换至新优选 IP: %s:%d",
-                        carrier_display_name(rt->spec.mode), target_ip, target_port);
             }
             return s;
         }
@@ -5224,12 +5309,12 @@ static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct s
     // 会话数量上限保护 (淘汰最久未活跃的一项)
     if (count >= UDP_MAX_SESSIONS) {
         long oldest_time = 0;
-        UdpSession *oldest = NULL;
-        UdpSession *prev_oldest = NULL;
-        UdpSession *prev = NULL;
+        UdpSession *oldest = nullptr;
+        UdpSession *prev_oldest = nullptr;
+        UdpSession *prev = nullptr;
         s = rt->udp_sessions;
         while (s) {
-            if (oldest == NULL || s->last_active_ms < oldest_time) {
+            if (oldest == nullptr || s->last_active_ms < oldest_time) {
                 oldest_time = s->last_active_ms;
                 oldest = s;
                 prev_oldest = prev;
@@ -5247,13 +5332,13 @@ static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct s
 
     // 创建新会话
     UdpSession *new_sess = (UdpSession *)calloc(1, sizeof(UdpSession));
-    if (!new_sess) return NULL;
+    if (!new_sess) return nullptr;
     memcpy(&new_sess->client_addr, client_addr, client_len);
     new_sess->client_addr_len = client_len;
     new_sess->upstream_fd = udp_connect_upstream(target_ip, target_port);
     if (cfnat_socket_invalid(new_sess->upstream_fd)) {
         free(new_sess);
-        return NULL;
+        return nullptr;
     }
     snprintf(new_sess->target_ip, sizeof(new_sess->target_ip), "%s", target_ip);
     new_sess->target_port = target_port;
@@ -5268,7 +5353,7 @@ static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct s
 static void prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
     if (!rt) return;
     pthread_mutex_lock(&rt->udp_mu);
-    UdpSession *prev = NULL;
+    UdpSession *prev = nullptr;
     UdpSession *s = rt->udp_sessions;
     while (s) {
         if (cur_ms - s->last_active_ms > UDP_SESSION_TIMEOUT_MS) {
@@ -5293,35 +5378,47 @@ static void prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
 
 static void *carrier_udp_thread(void *arg) {
     CarrierRuntime *rt = (CarrierRuntime *)arg;
-    if (!rt || cfnat_socket_invalid(rt->udp_listen_fd)) return NULL;
+    if (!rt || cfnat_socket_invalid(rt->udp_listen_fd)) return nullptr;
 
     char *buf = (char *)malloc(UDP_BUF_SIZE);
-    if (!buf) return NULL;
+    if (!buf) return nullptr;
 
     long last_prune_ms = now_ms();
 
     while (atomic_load(&g_running)) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(rt->udp_listen_fd, &rfds);
-        socket_t max_fd = rt->udp_listen_fd;
+#ifdef _WIN32
+        WSAPOLLFD pfds[UDP_MAX_SESSIONS + 1];
+#else
+        struct pollfd pfds[UDP_MAX_SESSIONS + 1];
+#endif
+        UdpSession *p_sess[UDP_MAX_SESSIONS + 1];
+        size_t npfd = 0;
+
+        pfds[0].fd = rt->udp_listen_fd;
+        pfds[0].events = POLLIN;
+        pfds[0].revents = 0;
+        p_sess[0] = nullptr;
+        npfd = 1;
 
         pthread_mutex_lock(&rt->udp_mu);
         UdpSession *s = rt->udp_sessions;
-        while (s) {
+        while (s && npfd <= UDP_MAX_SESSIONS) {
             if (cfnat_socket_valid(s->upstream_fd)) {
-                FD_SET(s->upstream_fd, &rfds);
-                if (s->upstream_fd > max_fd) max_fd = s->upstream_fd;
+                pfds[npfd].fd = s->upstream_fd;
+                pfds[npfd].events = POLLIN;
+                pfds[npfd].revents = 0;
+                p_sess[npfd] = s;
+                npfd++;
             }
             s = s->next;
         }
         pthread_mutex_unlock(&rt->udp_mu);
 
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = 100000; /* 100ms 超时 */
-
-        int nready = select((int)(max_fd + 1), &rfds, NULL, NULL, &tv);
+#ifdef _WIN32
+        int nready = WSAPoll(pfds, (ULONG)npfd, 100);
+#else
+        int nready = poll(pfds, (nfds_t)npfd, 100);
+#endif
         if (nready < 0) {
             if (!atomic_load(&g_running)) break;
             sleep_interruptible_ms(10);
@@ -5337,7 +5434,7 @@ static void *carrier_udp_thread(void *arg) {
         if (nready == 0) continue;
 
         /* 1. 监听端口接收客户端 (如 Xray) 发来的 UDP / QUIC 报文 */
-        if (FD_ISSET(rt->udp_listen_fd, &rfds)) {
+        if (pfds[0].revents & POLLIN) {
             while (1) {
                 struct sockaddr_storage client_ss;
 #ifdef _WIN32
@@ -5370,23 +5467,30 @@ static void *carrier_udp_thread(void *arg) {
 
         /* 2. 检查各 upstream_fd 是否有来自 Cloudflare 的 UDP 回包 */
         pthread_mutex_lock(&rt->udp_mu);
-        s = rt->udp_sessions;
-        while (s) {
-            if (cfnat_socket_valid(s->upstream_fd) && FD_ISSET(s->upstream_fd, &rfds)) {
-                while (1) {
-                    ssize_t n = recv(s->upstream_fd, buf, UDP_BUF_SIZE, 0);
-                    if (n <= 0) break;
-                    s->last_active_ms = cur_ms;
-                    sendto(rt->udp_listen_fd, buf, (size_t)n, 0, (struct sockaddr *)&s->client_addr, s->client_addr_len);
+        for (size_t i = 1; i < npfd; i++) {
+            if (pfds[i].revents & POLLIN) {
+                UdpSession *sess = p_sess[i];
+                UdpSession *chk = rt->udp_sessions;
+                int valid = 0;
+                while (chk) {
+                    if (chk == sess && chk->upstream_fd == pfds[i].fd) { valid = 1; break; }
+                    chk = chk->next;
+                }
+                if (valid && cfnat_socket_valid(sess->upstream_fd)) {
+                    while (1) {
+                        ssize_t n = recv(sess->upstream_fd, buf, UDP_BUF_SIZE, 0);
+                        if (n <= 0) break;
+                        sess->last_active_ms = cur_ms;
+                        sendto(rt->udp_listen_fd, buf, (size_t)n, 0, (struct sockaddr *)&sess->client_addr, sess->client_addr_len);
+                    }
                 }
             }
-            s = s->next;
         }
         pthread_mutex_unlock(&rt->udp_mu);
     }
 
     free(buf);
-    return NULL;
+    return nullptr;
 }
 
 static socket_t accept_interruptible(socket_t listen_fd, struct sockaddr *addr,
@@ -5397,25 +5501,17 @@ static socket_t accept_interruptible(socket_t listen_fd, struct sockaddr *addr,
 #endif
 ) {
     while (atomic_load(&g_running)) {
-        fd_set rfds;
-        FD_ZERO(&rfds);
-        FD_SET(listen_fd, &rfds);
-
-        struct timeval tv = {1, 0};
+        int rc = cfnat_poll_single(listen_fd, 1, 1000);
+        if (rc < 0) {
 #ifdef _WIN32
-        int rc = select(0, &rfds, NULL, NULL, &tv);
-        if (rc == SOCKET_ERROR) {
             int err = WSAGetLastError();
             if (err == WSAEINTR) continue;
             return INVALID_SOCKET;
-        }
 #else
-        int rc = select(listen_fd + 1, &rfds, NULL, NULL, &tv);
-        if (rc < 0) {
             if (errno == EINTR) continue;
             return INVALID_SOCKET;
-        }
 #endif
+        }
         if (rc == 0) continue;
 
         socket_t cfd = accept(listen_fd, addr, addrlen);
@@ -5464,8 +5560,8 @@ static void install_signals(void) {
     sa.sa_handler = on_signal;
     sigemptyset(&sa.sa_mask);
     sa.sa_flags = 0;
-    sigaction(SIGINT, &sa, NULL);
-    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, nullptr);
+    sigaction(SIGTERM, &sa, nullptr);
     signal(SIGPIPE, SIG_IGN);
     signal(SIGHUP, SIG_IGN);
 #endif
@@ -5491,7 +5587,7 @@ int main(int argc, char **argv) {
     }
     install_signals();
     if (g_cfg.bind_if[0]) log_msg("出站连接绑定网络接口: %s", g_cfg.bind_if);
-    CarrierListenSpec *carrier_specs = NULL;
+    CarrierListenSpec *carrier_specs = nullptr;
     size_t carrier_spec_len = 0;
     if (parse_listen_modes(&g_cfg, &carrier_specs, &carrier_spec_len) != 0) {
         log_msg("解析监听模式失败");
@@ -5548,13 +5644,14 @@ int main(int argc, char **argv) {
             CarrierRuntime *rt = &g_carrier_runtimes[i];
             rt->listen_fd = INVALID_SOCKET;
             rt->udp_listen_fd = INVALID_SOCKET;
-            rt->udp_sessions = NULL;
-            pthread_mutex_init(&rt->udp_mu, NULL);
+            rt->udp_sessions = nullptr;
+            pthread_mutex_init(&rt->udp_mu, nullptr);
             rt->spec = carrier_specs[i];
-            pthread_mutex_init(&rt->candidates.mu, NULL);
+            pthread_mutex_init(&rt->candidates.mu, nullptr);
             atomic_init(&rt->candidates.cache_valid, 0);  /* P0-1: 初始时缓存无效 */
-            pthread_mutex_init(&rt->udp_candidates.mu, NULL);
+            pthread_mutex_init(&rt->udp_candidates.mu, nullptr);
             atomic_init(&rt->udp_candidates.cache_valid, 0);
+            atomic_init(&rt->rescanning_lock, 0);
         }
         int baidu_pool_ok = 1;
         for (size_t i = 0; i < carrier_spec_len; i++) {
@@ -5583,11 +5680,11 @@ int main(int argc, char **argv) {
                 }
             }
             free(g_carrier_runtimes);
-            g_carrier_runtimes = NULL;
+            g_carrier_runtimes = nullptr;
             g_carrier_runtime_count = 0;
             baidu_pool_free(&g_default_proxy_pool);
             free(g_locations);
-            g_locations = NULL;
+            g_locations = nullptr;
             g_location_count = 0;
 #ifdef _WIN32
             WSACleanup();
@@ -5609,10 +5706,10 @@ int main(int argc, char **argv) {
                         rt->udp_listen_fd = INVALID_SOCKET;
                     }
                     free(rt->candidates.items);
-                    rt->candidates.items = NULL;
+                    rt->candidates.items = nullptr;
                     rt->candidates.len = 0;
                     free(rt->udp_candidates.items);
-                    rt->udp_candidates.items = NULL;
+                    rt->udp_candidates.items = nullptr;
                     rt->udp_candidates.len = 0;
                     continue;
                 }
@@ -5659,13 +5756,13 @@ int main(int argc, char **argv) {
             snprintf(scan_cfg.colo, sizeof(scan_cfg.colo), "%s", rt->spec.prof.colo);
 
             if (rt->spec.use_baidu_proxy == 2) {
-                ResultList results_direct = scan_ips(&profile_ips, NULL, &scan_cfg, NULL);
+                ResultList results_direct = scan_ips(&profile_ips, nullptr, &scan_cfg, nullptr);
                 ResultList results_baidu = {0};
                 if (rt->proxy_pool && rt->proxy_pool->len > 0) {
-                    results_baidu = scan_ips(&profile_ips, NULL, &scan_cfg, rt->proxy_pool);
+                    results_baidu = scan_ips(&profile_ips, nullptr, &scan_cfg, rt->proxy_pool);
                 }
 
-                pthread_mutex_init(&carrier_results.mu, NULL);
+                pthread_mutex_init(&carrier_results.mu, nullptr);
                 for (size_t j = 0; j < results_direct.len; j++) {
                     resultlist_add(&carrier_results, &results_direct.items[j]);
                 }
@@ -5688,7 +5785,7 @@ int main(int argc, char **argv) {
                     qsort(carrier_results.items, carrier_results.len, sizeof(Result), cmp_result);
                 }
             } else {
-                carrier_results = scan_ips(&profile_ips, NULL, &scan_cfg, rt->proxy_pool);
+                carrier_results = scan_ips(&profile_ips, nullptr, &scan_cfg, rt->proxy_pool);
             }
             strlist_free(&profile_ips);
 
@@ -5726,10 +5823,10 @@ int main(int argc, char **argv) {
             if (!carrier_select_valid_ip(rt)) {
                 warn_msg("%s TCP 候选 IP 健康检查全部失败", carrier_display_name(rt->spec.mode));
                 free(rt->candidates.items);
-                rt->candidates.items = NULL;
+                rt->candidates.items = nullptr;
                 rt->candidates.len = 0;
                 free(rt->udp_candidates.items);
-                rt->udp_candidates.items = NULL;
+                rt->udp_candidates.items = nullptr;
                 rt->udp_candidates.len = 0;
                 continue;
             }
@@ -5742,10 +5839,10 @@ int main(int argc, char **argv) {
                     rt->udp_listen_fd = INVALID_SOCKET;
                 }
                 free(rt->candidates.items);
-                rt->candidates.items = NULL;
+                rt->candidates.items = nullptr;
                 rt->candidates.len = 0;
                 free(rt->udp_candidates.items);
-                rt->udp_candidates.items = NULL;
+                rt->udp_candidates.items = nullptr;
                 rt->udp_candidates.len = 0;
                 continue;
             }
@@ -5781,11 +5878,11 @@ int main(int argc, char **argv) {
                 }
             }
             free(g_carrier_runtimes);
-            g_carrier_runtimes = NULL;
+            g_carrier_runtimes = nullptr;
             g_carrier_runtime_count = 0;
             baidu_pool_free(&g_default_proxy_pool);
             free(g_locations);
-            g_locations = NULL;
+            g_locations = nullptr;
             g_location_count = 0;
             return 1;
         }
@@ -5805,10 +5902,10 @@ int main(int argc, char **argv) {
         }
         for (size_t i = 0; i < g_carrier_runtime_count; i++) {
             CarrierRuntime *rt = &g_carrier_runtimes[i];
-            if (rt->health_tid) pthread_join(rt->health_tid, NULL);
-            if (rt->udp_health_tid) pthread_join(rt->udp_health_tid, NULL);
-            if (rt->accept_tid) pthread_join(rt->accept_tid, NULL);
-            if (rt->udp_tid) pthread_join(rt->udp_tid, NULL);
+            if (rt->health_tid) pthread_join(rt->health_tid, nullptr);
+            if (rt->udp_health_tid) pthread_join(rt->udp_health_tid, nullptr);
+            if (rt->accept_tid) pthread_join(rt->accept_tid, nullptr);
+            if (rt->udp_tid) pthread_join(rt->udp_tid, nullptr);
             pthread_mutex_lock(&rt->udp_mu);
             UdpSession *s = rt->udp_sessions;
             while (s) {
@@ -5817,29 +5914,29 @@ int main(int argc, char **argv) {
                 free(s);
                 s = next;
             }
-            rt->udp_sessions = NULL;
+            rt->udp_sessions = nullptr;
             pthread_mutex_unlock(&rt->udp_mu);
             pthread_mutex_destroy(&rt->udp_mu);
             free(rt->candidates.items);
-            rt->candidates.items = NULL;
+            rt->candidates.items = nullptr;
             rt->candidates.len = 0;
             pthread_mutex_destroy(&rt->candidates.mu);
             free(rt->udp_candidates.items);
-            rt->udp_candidates.items = NULL;
+            rt->udp_candidates.items = nullptr;
             rt->udp_candidates.len = 0;
             pthread_mutex_destroy(&rt->udp_candidates.mu);
             if (rt->proxy_pool) {
                 baidu_pool_free(rt->proxy_pool);
                 free(rt->proxy_pool);
-                rt->proxy_pool = NULL;
+                rt->proxy_pool = nullptr;
             }
         }
         free(g_carrier_runtimes);
-        g_carrier_runtimes = NULL;
+        g_carrier_runtimes = nullptr;
         g_carrier_runtime_count = 0;
         baidu_pool_free(&g_default_proxy_pool);
         free(g_locations);
-        g_locations = NULL;
+        g_locations = nullptr;
         g_location_count = 0;
         return 0;
     }
@@ -5854,9 +5951,9 @@ int main(int argc, char **argv) {
     }
     // 先尝试读取候选缓存，如果命中且健康检查通过则跳过完整扫描
     ResultList results = {0};
-    int cache_hit = try_use_candidate_cache(NULL, &results);
+    int cache_hit = try_use_candidate_cache(nullptr, &results);
     if (!cache_hit) {
-        results = scan_ips(&ips, NULL, &g_cfg, NULL);
+        results = scan_ips(&ips, nullptr, &g_cfg, nullptr);
         if (results.len > 0) {
             save_candidate_cache(candidate_cache_file("direct"), results.items, results.len);
             save_env_cidr_records(g_cfg.ips_type, results.items, results.len);
@@ -5878,9 +5975,10 @@ int main(int argc, char **argv) {
         explain_selected_result(&results.items[0]);
     }
     free(results.items);
+    pthread_mutex_destroy(&results.mu);
     baidu_pool_free(&g_default_proxy_pool);
     free(g_locations);
-    g_locations = NULL;
+    g_locations = nullptr;
     g_location_count = 0;
 #ifdef _WIN32
     WSACleanup();
