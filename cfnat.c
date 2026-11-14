@@ -3173,26 +3173,26 @@ static void *scan_worker(void *arg) {
 
         int probes = ctx->cfg->num > 0 ? ctx->cfg->num : 1;
         int success_count = 0;
+        int total_latency = 0;
         int best_latency = 0;
         int ewma_latency = 0;
         int jitter_ms = 0;
+        int prev_latency = 0;
         char best_colo[MAX_COLO_LEN] = {0};
         int header_once = 0;
         int cfray_missing_once = 0;
 
         /* Keep-Alive 复用连接 */
         socket_t fd = INVALID_SOCKET;
-        int latency = 0;
+        int conn_lat = 0;
         for (int attempt = 0; atomic_load(&g_running) && attempt < probes; attempt++) {
             if (cfnat_socket_invalid(fd)) {
-                latency = 0;
-                fd = dial_target_with_proxy(ip, 80, ctx->cfg->delay_ms, ctx->proxy_pool, &latency);
+                conn_lat = 0;
+                fd = dial_target_with_proxy(ip, 80, ctx->cfg->delay_ms, ctx->proxy_pool, &conn_lat);
                 if (cfnat_socket_invalid(fd)) {
                     atomic_fetch_add(&ctx->connect_fail, 1);
                     continue;
                 }
-                /* 记录首次连接延迟 */
-                if (best_latency == 0 || latency < best_latency) best_latency = latency;
             }
             char req[512];
             if ((attempt % 2) == 0) {
@@ -3206,11 +3206,13 @@ static void *scan_worker(void *arg) {
                          host_value);
             }
 
+            long t_start = now_ms();
             send(fd, req, strlen(req), 0);
             char hdr[4096];
             int n = recv_headers_ev(fd, hdr, sizeof(hdr), ctx->cfg->delay_ms > 2000 ? ctx->cfg->delay_ms : 2000, &el);
+            long t_end = now_ms();
             if (n <= 0) {
-                /* 连接断开，关闭后下次重连 */
+                /* 连接断开或超时，关闭后下次重连 */
                 close(fd);
                 fd = INVALID_SOCKET;
                 atomic_fetch_add(&ctx->header_fail, 1);
@@ -3228,25 +3230,40 @@ static void *scan_worker(void *arg) {
                 atomic_fetch_add(&ctx->colo_skip, 1);
                 continue;
             }
+
+            int cur_latency = (int)(t_end - t_start);
+            if (cur_latency <= 0) cur_latency = conn_lat > 0 ? conn_lat : 1;
+
             success_count++;
-            /* P0-EWMA: 更新平滑延迟和抖动 */
-            if (ewma_latency <= 0) {
-                ewma_latency = best_latency > 0 ? best_latency : ctx->cfg->delay_ms;
-                jitter_ms = 0;
-            } else {
-                int diff = abs(best_latency - ewma_latency);
-                jitter_ms = (jitter_ms * 7 + diff) / 8;
-                ewma_latency = (ewma_latency * 7 + best_latency) / 8;
+            total_latency += cur_latency;
+            if (best_latency == 0 || cur_latency < best_latency) {
+                best_latency = cur_latency;
             }
-            if (!best_colo[0] || best_latency == 0 || latency <= best_latency) {
+
+            /* P0-EWMA: 真实样本抖动与平滑延迟更新 */
+            if (success_count == 1) {
+                ewma_latency = cur_latency;
+                jitter_ms = 0;
+                prev_latency = cur_latency;
+            } else {
+                int diff = abs(cur_latency - prev_latency);
+                jitter_ms = (jitter_ms * 7 + diff) / 8;
+                ewma_latency = (ewma_latency * 7 + cur_latency) / 8;
+                prev_latency = cur_latency;
+            }
+
+            if (!best_colo[0] || cur_latency <= best_latency) {
                 snprintf(best_colo, sizeof(best_colo), "%s", colo);
             }
         }
         if (cfnat_socket_valid(fd)) close(fd);
 
+        int avg_latency = success_count > 0 ? (total_latency / success_count) : 0;
+
         if (success_count <= 0 && header_once && cfray_missing_once && !ctx->cfg->colo[0] && (!ctx->proxy_pool || ctx->proxy_pool->len == 0)) {
             success_count = 1;
             if (best_latency == 0) best_latency = ctx->cfg->delay_ms > 0 ? ctx->cfg->delay_ms : 1;
+            if (avg_latency <= 0) avg_latency = best_latency;
             if (ewma_latency <= 0) ewma_latency = best_latency;
             snprintf(best_colo, sizeof(best_colo), "%s", "UNK");
             debug_msg("%s HTTP 响应缺少 CF-RAY，作为 UNK 候选交给健康检查确认", ip);
@@ -3274,7 +3291,7 @@ static void *scan_worker(void *arg) {
                 pthread_mutex_unlock(&g_log_mu);
             }
         }
-        if (success_count <= 0 || !best_colo[0] || best_latency <= 0) continue;
+        if (success_count <= 0 || !best_colo[0] || avg_latency <= 0 || (ctx->cfg->delay_ms > 0 && avg_latency > ctx->cfg->delay_ms)) continue;
 
         /* 若显式指定了 code (code > 0)，在测试延迟获得可连通 IP 后，对候选 IP 测试目标 HTTP 状态码；缺省 code <= 0 时不测 */
         if (ctx->cfg->code > 0) {
@@ -3329,11 +3346,11 @@ static void *scan_worker(void *arg) {
         memset(&r, 0, sizeof(r));
         snprintf(r.ip, sizeof(r.ip), "%s", ip);
         snprintf(r.data_center, sizeof(r.data_center), "%s", best_colo);
-        r.latency_ms = best_latency;
+        r.latency_ms = avg_latency;
         r.probe_count = probes;
         r.success_count = success_count;
         r.loss_rate = (probes - success_count) * 100 / probes;
-        r.ewma_latency = ewma_latency > 0 ? ewma_latency : best_latency;
+        r.ewma_latency = ewma_latency > 0 ? ewma_latency : avg_latency;
         r.jitter_ms = jitter_ms;
         r.consecutive_fail = 0;
         Location *loc = find_location(best_colo);
@@ -4592,10 +4609,6 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
     size_t target_ipnum = (size_t)scan_cfg.ipnum;
     if (target_ipnum == 0) target_ipnum = 20;
 
-    size_t min_survivors = target_ipnum * 25 / 100;
-    if (min_survivors < 3) min_survivors = 3;
-    if (min_survivors > target_ipnum) min_survivors = target_ipnum;
-
     /* 1. 提取当前 TCP 池与 UDP 池中的所有 IP，合并去重进行原地测活 (In-place Re-test) */
     StringList pool_ips = {0};
     pthread_mutex_lock(&rt->candidates.mu);
@@ -4625,6 +4638,8 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
     ResultList survivors = {0};
     if (pool_ips.len > 0) {
         Config retest_cfg = scan_cfg;
+        retest_cfg.ipnum = (int)(target_ipnum * 2);
+        if (retest_cfg.ipnum < (int)pool_ips.len) retest_cfg.ipnum = (int)pool_ips.len;
         if (retest_cfg.task > (int)pool_ips.len) retest_cfg.task = (int)pool_ips.len;
         if (rt->spec.use_baidu_proxy == 2) {
             ResultList direct_res = scan_ips(&pool_ips, NULL, &retest_cfg, NULL);
@@ -4654,16 +4669,16 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
     pthread_mutex_init(&all_candidates.mu, NULL);
 
     /* 2. 判定原地测活存活数量:
-       若存活数量达到门槛 (>= min_survivors)，直接原地重排自愈，无需全局扫描！ */
-    if (survivors.len >= min_survivors) {
-        log_msg("%s 双轨候选池原地测活完成: 存活 %zu 个 (>= 门槛 %zu)，成功自愈，开始双轨装填",
-                carrier_display_name(rt->spec.mode), survivors.len, min_survivors);
+       若存活数量达到双轨满编门槛 (>= target_ipnum * 2)，直接原地重排自愈，无需全局扫描！ */
+    if (survivors.len >= target_ipnum * 2) {
+        log_msg("%s 双轨候选池原地测活完成: 存活 %zu 个 (>= 双轨满编 %zu)，成功自愈，开始双轨装填",
+                carrier_display_name(rt->spec.mode), survivors.len, target_ipnum * 2);
         for (size_t j = 0; j < survivors.len; j++) {
             resultlist_add(&all_candidates, &survivors.items[j]);
         }
         free(survivors.items);
     } else {
-        /* 存活数量不足 (< min_survivors)，执行带电增量补充扫描 */
+        /* 存活数量不足双轨满编 (< target_ipnum * 2)，执行带电增量补充扫描 */
         if (survivors.len > 0) {
             pthread_mutex_lock(&rt->candidates.mu);
             snprintf(rt->candidates.current_ip, sizeof(rt->candidates.current_ip), "%s", survivors.items[0].ip);
@@ -4671,14 +4686,15 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
             pthread_mutex_unlock(&rt->candidates.mu);
             atomic_store(&rt->candidates.cache_valid, 1);
 
-            log_msg("%s 存活候选较少 (%zu < 门槛 %zu)，保持最优存活 IP %s 维持正常转发，后台启动补充扫描...",
-                    carrier_display_name(rt->spec.mode), survivors.len, min_survivors, survivors.items[0].ip);
+            log_msg("%s 存活候选 %zu 个 (< 双轨满编 %zu)，维持最优存活 IP %s 正常转发，后台启动补充扫描...",
+                    carrier_display_name(rt->spec.mode), survivors.len, target_ipnum * 2, survivors.items[0].ip);
         } else {
             warn_msg("%s 候选池已全部失效，启动扫描寻找可用候选 IP", carrier_display_name(rt->spec.mode));
             atomic_store(&rt->candidates.cache_valid, 0);
         }
 
         Config fresh_cfg = scan_cfg;
+        fresh_cfg.ipnum = (int)(target_ipnum * 2);
         if (fresh_cfg.task > 60) fresh_cfg.task = 50;
 
         int cur_v6_split = (rt->spec.prof.enabled && rt->spec.prof.v6_split > 0) ? rt->spec.prof.v6_split : g_cfg.v6_split;
@@ -5632,7 +5648,9 @@ int main(int argc, char **argv) {
             scan_cfg.http_port = rt->spec.prof.http_port;
             scan_cfg.delay_ms = rt->spec.prof.delay_ms;
             scan_cfg.task = rt->spec.prof.task;
-            scan_cfg.ipnum = rt->spec.prof.ipnum;
+            size_t target_ipnum = (size_t)(rt->spec.prof.ipnum > 0 ? rt->spec.prof.ipnum : g_cfg.ipnum);
+            if (target_ipnum == 0) target_ipnum = 20;
+            scan_cfg.ipnum = (int)(target_ipnum * 2);
             scan_cfg.num = rt->spec.prof.num;
             scan_cfg.random_mode = rt->spec.prof.random_mode;
             scan_cfg.v6_split = cur_v6_split;
@@ -5679,9 +5697,6 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            size_t target_ipnum = (size_t)(rt->spec.prof.ipnum > 0 ? rt->spec.prof.ipnum : g_cfg.ipnum);
-            if (target_ipnum == 0) target_ipnum = 20;
-
             // 1. 设置 TCP 候选池 (取前 target_ipnum 个)
             size_t tcp_count = carrier_results.len > target_ipnum ? target_ipnum : carrier_results.len;
             rt->candidates.items = calloc(tcp_count, sizeof(Result));
@@ -5713,6 +5728,9 @@ int main(int argc, char **argv) {
                 free(rt->candidates.items);
                 rt->candidates.items = NULL;
                 rt->candidates.len = 0;
+                free(rt->udp_candidates.items);
+                rt->udp_candidates.items = NULL;
+                rt->udp_candidates.len = 0;
                 continue;
             }
             rt->listen_fd = listen_tcp(rt->spec.addr);
