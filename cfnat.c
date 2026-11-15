@@ -790,12 +790,6 @@ static int cfnat_printf(const char *fmt, ...) {
     return rc;
 }
 
-static int cfnat_fputc(int ch, FILE *stream) {
-    char c = (char)ch;
-    cfnat_write_utf8(stream, &c, 1);
-    return ch;
-}
-
 #ifndef ENABLE_VIRTUAL_TERMINAL_PROCESSING
 #define ENABLE_VIRTUAL_TERMINAL_PROCESSING 0x0004
 #endif
@@ -821,7 +815,6 @@ static void init_windows_console_utf8(void) {
 #define printf cfnat_printf
 #define fprintf cfnat_fprintf
 #define vfprintf cfnat_vfprintf
-#define fputc cfnat_fputc
 
 #endif
 
@@ -2728,7 +2721,8 @@ static const char *bind_if_label(void) {
     return g_cfg.bind_if[0] ? g_cfg.bind_if : "default";
 }
 
-static int shell_token_is_safe(const char *s, const char *extra_allowed) {
+#ifndef _WIN32
+CFNAT_UNUSED static int shell_token_is_safe(const char *s, const char *extra_allowed) {
     if (!s || !*s) return 0;
     for (const unsigned char *p = (const unsigned char *)s; *p; p++) {
         if (isalnum(*p)) continue;
@@ -2739,7 +2733,7 @@ static int shell_token_is_safe(const char *s, const char *extra_allowed) {
     return 1;
 }
 
-static int parse_json_ipv4_values(const char *json, StringList *out, int *saw_fake_ip) {
+CFNAT_UNUSED static int parse_json_ipv4_values(const char *json, StringList *out, int *saw_fake_ip) {
     if (!json || !out) return -1;
     size_t before = out->len;
     const char *p = json;
@@ -2771,6 +2765,7 @@ static int parse_json_ipv4_values(const char *json, StringList *out, int *saw_fa
     }
     return out->len > before ? 0 : -1;
 }
+#endif
 
 static int extract_query_param_value(const char *query, const char *key, char *out, size_t outsz) {
     if (!query || !key || !out || outsz == 0) return -1;
