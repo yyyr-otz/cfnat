@@ -872,7 +872,8 @@ static int terminal_has_color(FILE *stream) {
 
 static void print_results_table(const Result *items, size_t count, long duration_sec) {
     if (!items || count == 0) return;
-    int use_color = terminal_has_color(stdout);
+    pthread_mutex_lock(&g_log_mu);
+    int use_color = terminal_has_color(stderr);
     const char *c_ip = use_color ? (ANSI_CYAN ANSI_BOLD) : "";
     const char *c_colo = use_color ? (ANSI_YELLOW ANSI_BOLD) : "";
     const char *c_reg = use_color ? (ANSI_MAGENTA ANSI_BOLD) : "";
@@ -884,24 +885,26 @@ static void print_results_table(const Result *items, size_t count, long duration
     const char *c_bold = use_color ? ANSI_BOLD : "";
     const char *reset = use_color ? ANSI_RESET : "";
 
-    printf("\n%sIP 地址%s          | %s数据中心%s | %s地区%s          | %s城市%s        | %s延迟%s\n",
-           c_ip, reset, c_colo, reset, c_reg, reset, c_city, reset, c_lat, reset);
-    printf("-----------------+----------+---------------+---------------+---------\n");
+    fprintf(stderr, "\n%sIP 地址%s          | %s数据中心%s | %s地区%s          | %s城市%s        | %s延迟%s\n",
+            c_ip, reset, c_colo, reset, c_reg, reset, c_city, reset, c_lat, reset);
+    fprintf(stderr, "-----------------+----------+---------------+---------------+---------\n");
     for (size_t i = 0; i < count; i++) {
         const Result *r = &items[i];
         const char *lat_color = c_val_green;
         if (r->latency_ms > 250) lat_color = c_val_red;
         else if (r->latency_ms > 150) lat_color = c_val_yellow;
 
-        printf("%-16s | %-8s | %-13s | %-13s | %s%3d ms%s\n",
-               r->ip,
-               r->data_center[0] ? r->data_center : "UNK",
-               r->region[0] ? r->region : "-",
-               r->city[0] ? r->city : "-",
-               lat_color, r->latency_ms, reset);
+        fprintf(stderr, "%-16s | %-8s | %-13s | %-13s | %s%3d ms%s\n",
+                r->ip,
+                r->data_center[0] ? r->data_center : "UNK",
+                r->region[0] ? r->region : "-",
+                r->city[0] ? r->city : "-",
+                lat_color, r->latency_ms, reset);
     }
-    printf("\n%s%s成功提取 %zu 个有效IP，耗时 %ld秒%s\n\n",
-           c_bold, c_val_green, count, duration_sec, reset);
+    fprintf(stderr, "\n%s%s成功提取 %zu 个有效IP，耗时 %ld秒%s\n\n",
+            c_bold, c_val_green, count, duration_sec, reset);
+    fflush(stderr);
+    pthread_mutex_unlock(&g_log_mu);
 }
 
 static long now_ms(void) {
@@ -995,8 +998,14 @@ static void vlog_line(const char *tag, const char *fmt, va_list ap) {
     /* 视觉可读性与色彩差异化：[TCP/H2] 为高亮青色，[UDP/H3] 为高亮洋红 */
     if (use_color) {
         const char *p = raw_msg;
-        while (*p && out_len + 32 < sizeof(line_buf)) {
-            if (strncmp(p, "[TCP/H2]", 8) == 0) {
+        while (*p && out_len + 64 < sizeof(line_buf)) {
+            if (*p == '\n') {
+                line_buf[out_len++] = '\n';
+                p++;
+                int plen = snprintf(line_buf + out_len, sizeof(line_buf) - out_len, "%s%s%s [%s%s%s] ",
+                                    time_color, ts, reset, tag_color, tag, reset);
+                if (plen > 0) out_len += (size_t)plen;
+            } else if (strncmp(p, "[TCP/H2]", 8) == 0) {
                 const char *tcp_colored = ANSI_CYAN ANSI_BOLD "[TCP/H2]" ANSI_RESET;
                 size_t clen = strlen(tcp_colored);
                 if (out_len + clen < sizeof(line_buf) - 2) {
@@ -1017,10 +1026,16 @@ static void vlog_line(const char *tag, const char *fmt, va_list ap) {
             }
         }
     } else {
-        size_t raw_len = strlen(raw_msg);
-        if (out_len + raw_len < sizeof(line_buf) - 2) {
-            memcpy(line_buf + out_len, raw_msg, raw_len);
-            out_len += raw_len;
+        const char *p = raw_msg;
+        while (*p && out_len + 64 < sizeof(line_buf)) {
+            if (*p == '\n') {
+                line_buf[out_len++] = '\n';
+                p++;
+                int plen = snprintf(line_buf + out_len, sizeof(line_buf) - out_len, "%s [%s] ", ts, tag);
+                if (plen > 0) out_len += (size_t)plen;
+            } else {
+                line_buf[out_len++] = *p++;
+            }
         }
     }
 
@@ -3457,6 +3472,7 @@ static void *scan_worker(void *arg) {
                 fd = dial_target_with_proxy(ip, probe_port, ctx->cfg->delay_ms, ctx->proxy_pool, &conn_lat);
                 if (cfnat_socket_invalid(fd)) {
                     atomic_fetch_add(&ctx->connect_fail, 1);
+                    if (attempt == 0) break; /* 首轮 TCP 握手失败直接判定死节点，避免对死 IP 无效重复等待 */
                     continue;
                 }
             }
@@ -4268,12 +4284,16 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
         }
     }
 
-    log_msg("[%s] 命中双轨候选缓存快速启动: [TCP/H2] 最优: %s (%d ms), [UDP/H3] 最优: %s (%d ms)",
+    log_msg("[%s] 命中双轨候选缓存快速启动:\n"
+            "  ├─ [TCP/H2] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)\n"
+            "  └─ [UDP/H3] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
             carrier_display_name(rt->spec.mode),
             rt->candidates.current_ip,
             rt->candidates.items ? rt->candidates.items[0].latency_ms : 0,
+            rt->candidates.len,
             rt->udp_candidates.current_ip[0] ? rt->udp_candidates.current_ip : rt->candidates.current_ip,
-            rt->udp_candidates.items ? rt->udp_candidates.items[0].latency_ms : 0);
+            rt->udp_candidates.items ? rt->udp_candidates.items[0].latency_ms : 0,
+            rt->udp_candidates.len);
     if (g_cfg.log_level >= LOG_DEBUG) {
         debug_msg("[TCP/H2] [%s] 已载入缓存的候选 IP 列表 (共 %zu 个):", carrier_display_name(rt->spec.mode), rt->candidates.len);
         print_results_table(rt->candidates.items, rt->candidates.len, 0);
@@ -5313,10 +5333,13 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
 
     free(all_candidates.items);
 
-    log_msg("[%s] 双轨补充自愈完成: [TCP/H2] 最优: %s (%d ms), [UDP/H3] 最优: %s (%d ms)",
+    log_msg("[%s] 双轨补充自愈完成:\n"
+            "  ├─ [TCP/H2] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)\n"
+            "  └─ [UDP/H3] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
             carrier_display_name(rt->spec.mode),
-            rt->candidates.current_ip, rt->candidates.items ? rt->candidates.items[0].latency_ms : 0,
-            rt->udp_candidates.current_ip, rt->udp_candidates.items ? rt->udp_candidates.items[0].latency_ms : 0);
+            rt->candidates.current_ip, rt->candidates.items ? rt->candidates.items[0].latency_ms : 0, rt->candidates.len,
+            rt->udp_candidates.current_ip[0] ? rt->udp_candidates.current_ip : rt->candidates.current_ip,
+            rt->udp_candidates.items ? rt->udp_candidates.items[0].latency_ms : 0, rt->udp_candidates.len);
 
     atomic_store(&rt->rescanning_lock, 0);
     return 1;
@@ -6188,11 +6211,6 @@ int main(int argc, char **argv) {
                 log_msg("[%s] 正在监听 %s (双轨分流: TCP/H2 + UDP/H3)，TLS目标端口：%d，非TLS目标端口：%d",
                         carrier_display_name(rt->spec.mode), rt->spec.addr,
                         rt->spec.prof.port, rt->spec.prof.http_port);
-                log_msg("  ├─ [TCP/H2] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
-                        rt->candidates.current_ip, rt->candidates.items ? rt->candidates.items[0].latency_ms : 0, rt->candidates.len);
-                log_msg("  └─ [UDP/H3] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
-                        rt->udp_candidates.current_ip[0] ? rt->udp_candidates.current_ip : rt->candidates.current_ip,
-                        rt->udp_candidates.items ? rt->udp_candidates.items[0].latency_ms : 0, rt->udp_candidates.len);
                 create_small_thread(&rt->health_tid, carrier_health_thread, rt);
                 create_small_thread(&rt->udp_health_tid, carrier_udp_health_thread, rt);
                 create_small_thread(&rt->accept_tid, carrier_accept_thread, rt);
@@ -6321,12 +6339,12 @@ int main(int argc, char **argv) {
                 rt->udp_candidates.len = 0;
                 continue;
             }
-            log_msg("[%s] 正在监听 %s (双轨分流: TCP/H2 + UDP/H3)，TLS目标端口：%d，非TLS目标端口：%d",
+            log_msg("[%s] 正在监听 %s (双轨分流: TCP/H2 + UDP/H3)，TLS目标端口：%d，非TLS目标端口：%d\n"
+                    "  ├─ [TCP/H2] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)\n"
+                    "  └─ [UDP/H3] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
                     carrier_display_name(rt->spec.mode), rt->spec.addr,
-                    rt->spec.prof.port, rt->spec.prof.http_port);
-            log_msg("  ├─ [TCP/H2] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
-                    rt->candidates.current_ip, rt->candidates.items ? rt->candidates.items[0].latency_ms : 0, rt->candidates.len);
-            log_msg("  └─ [UDP/H3] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
+                    rt->spec.prof.port, rt->spec.prof.http_port,
+                    rt->candidates.current_ip, rt->candidates.items ? rt->candidates.items[0].latency_ms : 0, rt->candidates.len,
                     rt->udp_candidates.current_ip[0] ? rt->udp_candidates.current_ip : rt->candidates.current_ip,
                     rt->udp_candidates.items ? rt->udp_candidates.items[0].latency_ms : 0, rt->udp_candidates.len);
 
