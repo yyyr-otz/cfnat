@@ -652,7 +652,7 @@ typedef struct {
     size_t len;
     size_t current_index;
     char current_ip[MAX_IP_LEN];
-    int fast_fail_count;
+    atomic_int fast_fail_count;
     pthread_mutex_t mu;
     atomic_int cache_valid;  /* P0-1: 1=当前 IP 可直接使用，0=需要重新选择 */
 } CandidatePool;
@@ -871,10 +871,10 @@ static int terminal_has_color(FILE *stream) {
     return isatty(fd);
 }
 
-static void print_results_table(const Result *items, size_t count, long duration_sec) {
-    if (!items || count == 0) return;
+static void print_results_table_stream(FILE *stream, const Result *items, size_t count, long duration_sec) {
+    if (!items || count == 0 || !stream) return;
     pthread_mutex_lock(&g_log_mu);
-    int use_color = terminal_has_color(stderr);
+    int use_color = terminal_has_color(stream);
     const char *c_ip = use_color ? (ANSI_CYAN ANSI_BOLD) : "";
     const char *c_colo = use_color ? (ANSI_YELLOW ANSI_BOLD) : "";
     const char *c_reg = use_color ? (ANSI_MAGENTA ANSI_BOLD) : "";
@@ -886,26 +886,30 @@ static void print_results_table(const Result *items, size_t count, long duration
     const char *c_bold = use_color ? ANSI_BOLD : "";
     const char *reset = use_color ? ANSI_RESET : "";
 
-    fprintf(stderr, "\n%sIP 地址%s          | %s数据中心%s | %s地区%s          | %s城市%s        | %s延迟%s\n",
+    fprintf(stream, "\n%sIP 地址%s          | %s数据中心%s | %s地区%s          | %s城市%s        | %s延迟%s\n",
             c_ip, reset, c_colo, reset, c_reg, reset, c_city, reset, c_lat, reset);
-    fprintf(stderr, "-----------------+----------+---------------+---------------+---------\n");
+    fprintf(stream, "-----------------+----------+---------------+---------------+---------\n");
     for (size_t i = 0; i < count; i++) {
         const Result *r = &items[i];
         const char *lat_color = c_val_green;
         if (r->latency_ms > 250) lat_color = c_val_red;
         else if (r->latency_ms > 150) lat_color = c_val_yellow;
 
-        fprintf(stderr, "%-16s | %-8s | %-13s | %-13s | %s%3d ms%s\n",
+        fprintf(stream, "%-16s | %-8s | %-13s | %-13s | %s%3d ms%s\n",
                 r->ip,
                 r->data_center[0] ? r->data_center : "UNK",
                 r->region[0] ? r->region : "-",
                 r->city[0] ? r->city : "-",
                 lat_color, r->latency_ms, reset);
     }
-    fprintf(stderr, "\n%s%s成功提取 %zu 个有效IP，耗时 %ld秒%s\n\n",
+    fprintf(stream, "\n%s%s成功提取 %zu 个有效IP，耗时 %ld秒%s\n\n",
             c_bold, c_val_green, count, duration_sec, reset);
-    fflush(stderr);
+    fflush(stream);
     pthread_mutex_unlock(&g_log_mu);
+}
+
+static void print_results_table(const Result *items, size_t count, long duration_sec) {
+    print_results_table_stream(stderr, items, count, duration_sec);
 }
 
 static long now_ms(void) {
@@ -1730,12 +1734,24 @@ static void u32_to_ipv4(uint32_t v, char *out, size_t sz) {
     inet_ntop(AF_INET, &a, out, sz);
 }
 
+#if CFNAT_IS_C23
+static thread_local uint64_t g_tl_rng_state = 0;
+#elif defined(_MSC_VER)
+static __declspec(thread) uint64_t g_tl_rng_state = 0;
+#elif defined(__GNUC__) || defined(__clang__)
+static __thread uint64_t g_tl_rng_state = 0;
+#else
+static _Thread_local uint64_t g_tl_rng_state = 0;
+#endif
+
 static uint64_t rand_u64(void) {
-    uint64_t v = 0;
-    for (int i = 0; i < 5; i++) {
-        v = (v << 15) ^ (uint64_t)(rand() & 0x7fff);
+    if (g_tl_rng_state == 0) {
+        g_tl_rng_state = ((uint64_t)now_ms() << 16) ^ (uintptr_t)&g_tl_rng_state ^ 0x9e3779b97f4a7c15ULL;
     }
-    return v;
+    uint64_t z = (g_tl_rng_state += 0x9e3779b97f4a7c15ULL);
+    z = (z ^ (z >> 30)) * 0xbf58476d1ce4e5b9ULL;
+    z = (z ^ (z >> 27)) * 0x94d049bb133111ebULL;
+    return z ^ (z >> 31);
 }
 
 /* 将 16 字节 IPv6 二进制地址转换为完全展开的 8 段 16 进制格式 (例如 2606:4700:9a68:1591:f76d:d848:b5de:8e02) */
@@ -2272,6 +2288,7 @@ CFNAT_NODISCARD static int quic_probe_ip(const char *ip, int port, int timeout_m
 
 static int recv_headers(socket_t fd, char *buf, size_t bufsz, int timeout_ms) {
     size_t used = 0;
+    size_t search_pos = 0;
     long deadline = now_ms() + timeout_ms;
     while (used + 1 < bufsz && now_ms() < deadline) {
         int left = (int)(deadline - now_ms());
@@ -2279,10 +2296,15 @@ static int recv_headers(socket_t fd, char *buf, size_t bufsz, int timeout_ms) {
         int rc = cfnat_poll_single(fd, 1, left);
         if (rc <= 0) break;
         ssize_t n = recv(fd, buf + used, bufsz - used - 1, 0);
-        if (n <= 0) break;
+        if (n <= 0) {
+            if (n < 0 && errno == EINTR) continue;
+            break;
+        }
         used += (size_t)n;
         buf[used] = 0;
-        if (strstr(buf, "\r\n\r\n")) return (int)used;
+        char *found = strstr(buf + search_pos, "\r\n\r\n");
+        if (found) return (int)(found - buf + 4);
+        search_pos = used > 3 ? used - 3 : 0;
     }
     buf[used] = 0;
     return (int)used;
@@ -2545,53 +2567,10 @@ static socket_t tcp_connect_ev(const char *ip, int port, int timeout_ms, int *la
     return fd;
 }
 
-/* 基于 EventLoop 的 HTTP 响应头接收，带 O(n²) 防护 */
-static int recv_headers_ev(socket_t fd, char *buf, size_t bufsz, int timeout_ms, EventLoop *el) {
-#if defined(__linux__) || defined(__APPLE__)
-    if (!el || el->epoll_fd < 0) {
-        return recv_headers(fd, buf, bufsz, timeout_ms);
-    }
-    if (evloop_add(el, fd, EV_READ) != 0) {
-        return recv_headers(fd, buf, bufsz, timeout_ms);
-    }
-#else
+/* 单套接字 HTTP 响应头接收，单轮单 FD 直接使用 cfnat_poll_single 杜绝 epoll_ctl ADD/DEL 额外系统调用 */
+static inline int recv_headers_ev(socket_t fd, char *buf, size_t bufsz, int timeout_ms, EventLoop *el) {
+    (void)el;
     return recv_headers(fd, buf, bufsz, timeout_ms);
-#endif
-    size_t used = 0;
-    size_t search_pos = 0;  /* 避免 O(n²) 退化 */
-    long deadline = now_ms() + timeout_ms;
-    int result = 0;
-    while (used + 1 < bufsz && now_ms() < deadline) {
-        struct evloop_event ev;
-        int left = (int)(deadline - now_ms());
-        if (left <= 0) break;
-        int n = evloop_wait(el, &ev, 1, left);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        if (n == 0) break;
-        if (ev.fd != fd || !(ev.events & EV_READ)) continue;
-        ssize_t nread = recv(fd, buf + used, bufsz - used - 1, 0);
-        if (nread <= 0) {
-            if (nread < 0 && errno == EINTR) continue;
-            break;
-        }
-        used += (size_t)nread;
-        buf[used] = 0;
-        /* 只从 search_pos 开始搜索，避免 O(n²) */
-        char *found = strstr(buf + search_pos, "\r\n\r\n");
-        if (found) {
-            result = (int)(found - buf + 4);  /* 包含 \r\n\r\n */
-            break;
-        }
-        search_pos = used > 3 ? used - 3 : 0;  /* 保留末尾 3 字节防止跨边界 */
-    }
-    buf[used] = 0;
-#if defined(__linux__) || defined(__APPLE__)
-    evloop_del(el, fd);
-#endif
-    return result > 0 ? result : (int)used;
 }
 
 /* ── EventLoop 版 I/O 函数结束 ─────────────────────────────── */
@@ -3525,6 +3504,17 @@ static void *scan_worker(void *arg) {
             int cur_latency = (int)(t_end - t_start);
             if (cur_latency <= 0) cur_latency = conn_lat > 0 ? conn_lat : 1;
 
+            /* 慢节点早剪枝 (Perf 3)：首轮握手+探测延迟已超标 (> delay_ms * 2 且 > 250ms)，直接放弃后续探测 */
+            if (attempt == 0 && ctx->cfg->delay_ms > 0 && cur_latency > ctx->cfg->delay_ms * 2 && cur_latency > 250) {
+                success_count++;
+                total_latency += cur_latency;
+                best_latency = cur_latency;
+                ewma_latency = cur_latency;
+                jitter_ms = 0;
+                snprintf(best_colo, sizeof(best_colo), "%s", colo);
+                break;
+            }
+
             success_count++;
             total_latency += cur_latency;
             if (best_latency == 0 || cur_latency < best_latency) {
@@ -3752,10 +3742,7 @@ static void save_candidate_cache(const char *path, const Result *items, size_t l
     }
     /* P0-EWMA: 缓存格式升级为 v2，增加 ewma_latency, jitter_ms, consecutive_fail */
     fprintf(fp, "# cfnat-cache-v2 %ld\n", (long)time(nullptr));
-    size_t limit = len;
-    size_t max_save = (g_cfg.ipnum > 0) ? (size_t)g_cfg.ipnum * 2 : 40;
-    if (limit > max_save) limit = max_save;
-    for (size_t i = 0; i < limit; i++) {
+    for (size_t i = 0; i < len; i++) {
         const Result *r = &items[i];
         fprintf(fp, "%s|%s|%s|%s|%d|%d|%d|%d|%d|%d|%d\n",
                 r->ip,
@@ -3771,7 +3758,7 @@ static void save_candidate_cache(const char *path, const Result *items, size_t l
                 r->consecutive_fail);
     }
     fclose(fp);
-    debug_msg("候选缓存已写入 %s，共 %zu 个", path, limit);
+    debug_msg("候选缓存已写入 %s，共 %zu 个", path, len);
 }
 
 static ResultList load_candidate_cache_for_profile(const char *path, const ProfileConfig *prof) {
@@ -4462,18 +4449,18 @@ static ssize_t recv_timeout(socket_t fd, void *buf, size_t len, int timeout_ms) 
 /* P1-4: Linux 零拷贝转发，使用 splice() 避免用户态内存拷贝 */
 static void *pipe_worker_fallback(PipeCtx *pc) {
     char buf[COPY_BUF_SIZE];
-    while (1) {
+    while (atomic_load(&g_running)) {
         ssize_t n = recv_timeout(pc->from, buf, sizeof(buf), 300000);
         if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && errno == EINTR && atomic_load(&g_running)) continue;
             break;
         }
         char *p = buf;
         ssize_t left = n;
-        while (left > 0) {
+        while (left > 0 && atomic_load(&g_running)) {
             ssize_t w = send(pc->to, p, (size_t)left, 0);
             if (w <= 0) {
-                if (w < 0 && errno == EINTR) continue;
+                if (w < 0 && errno == EINTR && atomic_load(&g_running)) continue;
                 goto err;
             }
             p += w;
@@ -4494,18 +4481,18 @@ static void *pipe_worker(void *arg) {
     if (pipe(pipefd) != 0) {
         return pipe_worker_fallback(pc);
     }
-    while (1) {
+    while (atomic_load(&g_running)) {
         /* 去除 SPLICE_F_MORE，彻底杜绝尾包延迟引入的 40~200ms 卡顿 */
         ssize_t n = splice(pc->from, nullptr, pipefd[1], nullptr, 65536, SPLICE_F_MOVE);
         if (n < 0) {
-            if (errno == EINTR) continue;
+            if (errno == EINTR && atomic_load(&g_running)) continue;
             goto err;
         }
         if (n == 0) break; /* 读到 EOF */
-        while (n > 0) {
+        while (n > 0 && atomic_load(&g_running)) {
             ssize_t w = splice(pipefd[0], nullptr, pc->to, nullptr, (size_t)n, SPLICE_F_MOVE);
             if (w < 0) {
-                if (errno == EINTR) continue;
+                if (errno == EINTR && atomic_load(&g_running)) continue;
                 goto err;
             }
             if (w == 0) goto err;
@@ -4529,19 +4516,19 @@ err:
 static void *pipe_worker(void *arg) {
     PipeCtx *pc = (PipeCtx *)arg;
     char buf[COPY_BUF_SIZE];
-    while (1) {
+    while (atomic_load(&g_running)) {
         /* P1-2: recv 带 300 秒超时，防止空闲连接永久阻塞 */
         ssize_t n = recv_timeout(pc->from, buf, sizeof(buf), 300000);
         if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
+            if (n < 0 && errno == EINTR && atomic_load(&g_running)) continue;
             break;
         }
         char *p = buf;
         ssize_t left = n;
-        while (left > 0) {
+        while (left > 0 && atomic_load(&g_running)) {
             ssize_t w = send(pc->to, p, (size_t)left, 0);
             if (w <= 0) {
-                if (w < 0 && errno == EINTR) continue;
+                if (w < 0 && errno == EINTR && atomic_load(&g_running)) continue;
                 goto err;
             }
             p += w;
@@ -4903,13 +4890,17 @@ static int carrier_choose_ip_for_sni(CarrierRuntime *rt, const char *sni_host, c
 }
 
 static int carrier_set_current_candidate(CarrierRuntime *rt, size_t idx) {
-    if (!rt || idx >= rt->candidates.len) return 0;
+    if (!rt) return 0;
     pthread_mutex_lock(&rt->candidates.mu);
-    snprintf(rt->candidates.current_ip, sizeof(rt->candidates.current_ip), "%s", rt->candidates.items[idx].ip);
-    rt->candidates.current_index = idx;
-    rt->candidates.fast_fail_count = 0;
+    if (idx < rt->candidates.len) {
+        snprintf(rt->candidates.current_ip, sizeof(rt->candidates.current_ip), "%s", rt->candidates.items[idx].ip);
+        rt->candidates.current_index = idx;
+        atomic_store_explicit(&rt->candidates.fast_fail_count, 0, memory_order_relaxed);
+        pthread_mutex_unlock(&rt->candidates.mu);
+        return 1;
+    }
     pthread_mutex_unlock(&rt->candidates.mu);
-    return 1;
+    return 0;
 }
 
 static void carrier_get_current_ip(CarrierRuntime *rt, char *out, size_t sz) {
@@ -5015,7 +5006,7 @@ static int carrier_set_current_udp_candidate(CarrierRuntime *rt, size_t idx) {
     if (idx < rt->udp_candidates.len) {
         rt->udp_candidates.current_index = idx;
         snprintf(rt->udp_candidates.current_ip, sizeof(rt->udp_candidates.current_ip), "%s", rt->udp_candidates.items[idx].ip);
-        rt->udp_candidates.fast_fail_count = 0;
+        atomic_store_explicit(&rt->udp_candidates.fast_fail_count, 0, memory_order_relaxed);
         pthread_mutex_unlock(&rt->udp_candidates.mu);
         return 1;
     }
@@ -5109,14 +5100,13 @@ static void carrier_note_connection_result(CarrierRuntime *rt, const char *ip, l
     }
     if (strcmp(rt->candidates.current_ip, ip) == 0) {
         if (lifetime_ms > 0 && lifetime_ms < 3000) {
-            rt->candidates.fast_fail_count++;
-            if (rt->candidates.fast_fail_count >= 2) {
+            if (atomic_fetch_add_explicit(&rt->candidates.fast_fail_count, 1, memory_order_relaxed) + 1 >= 2) {
                 atomic_store(&rt->candidates.cache_valid, 0);
                 should_switch = 1;
-                rt->candidates.fast_fail_count = 0;
+                atomic_store_explicit(&rt->candidates.fast_fail_count, 0, memory_order_relaxed);
             }
         } else {
-            rt->candidates.fast_fail_count = 0;
+            atomic_store_explicit(&rt->candidates.fast_fail_count, 0, memory_order_relaxed);
         }
     }
     pthread_mutex_unlock(&rt->candidates.mu);
@@ -5248,27 +5238,49 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
     pthread_mutex_init(&all_candidates.mu, nullptr);
 
     /* 2. 判定原地测活存活数量:
-       若存活数量达到门槛 (>= 25% target_ipnum)，直接原地重排自愈，无需全局扫描！ */
+       若存活数量达到充足标准 (>= target_ipnum) 且 UDP (若开启) 也具备充足候选，才跳过全局扫描 */
     size_t heal_threshold = (target_ipnum * 25 + 99) / 100;
     if (heal_threshold < 1) heal_threshold = 1;
-    if (survivors.len >= heal_threshold) {
-        log_msg("[%s] 双轨候选池原地测活完成: 存活 %zu 个 (>= 25%%门槛 %zu 个)，成功原地自愈，重排装填",
-                carrier_display_name(rt->spec.mode), survivors.len, heal_threshold);
+
+    int can_heal_inplace = 0;
+    ResultList inplace_udp = {0};
+    pthread_mutex_init(&inplace_udp.mu, nullptr);
+    if (survivors.len >= target_ipnum) {
+        if (cfnat_socket_valid(rt->udp_listen_fd)) {
+            ResultList test_udp = filter_udp_candidates_from_tcp(rt, survivors.items, survivors.len, target_ipnum);
+            if (test_udp.len >= heal_threshold) {
+                can_heal_inplace = 1;
+                inplace_udp = test_udp;
+            } else {
+                pthread_mutex_destroy(&test_udp.mu);
+                free(test_udp.items);
+            }
+        } else {
+            can_heal_inplace = 1;
+        }
+    }
+
+    if (can_heal_inplace) {
+        log_msg("[%s] 双轨候选池原地测活完成: 存活 %zu 个 (>= 目标数 %zu 个)，成功原地自愈，重排装填",
+                carrier_display_name(rt->spec.mode), survivors.len, target_ipnum);
         for (size_t j = 0; j < survivors.len; j++) {
             resultlist_add(&all_candidates, &survivors.items[j]);
         }
         free(survivors.items);
     } else {
-        /* 存活数量不足 25% 门槛，执行带电增量补充扫描 */
+        pthread_mutex_destroy(&inplace_udp.mu);
+        memset(&inplace_udp, 0, sizeof(inplace_udp));
+        /* 存活数量不足或 UDP 池候选不足，维持最优存活 IP，执行带电增量补充扫描 */
         if (survivors.len > 0) {
             pthread_mutex_lock(&rt->candidates.mu);
             snprintf(rt->candidates.current_ip, sizeof(rt->candidates.current_ip), "%s", survivors.items[0].ip);
-            rt->candidates.fast_fail_count = 0;
+            rt->candidates.current_index = 0;
+            atomic_store_explicit(&rt->candidates.fast_fail_count, 0, memory_order_relaxed);
             pthread_mutex_unlock(&rt->candidates.mu);
             atomic_store(&rt->candidates.cache_valid, 1);
 
-            log_msg("[%s] 存活候选 %zu 个 (< 25%%门槛 %zu 个)，维持最优存活 IP %s 正常转发，后台启动补充扫描...",
-                    carrier_display_name(rt->spec.mode), survivors.len, heal_threshold, survivors.items[0].ip);
+            log_msg("[%s] 存活候选 %zu 个 (< 目标数 %zu 个或需补充 UDP)，维持最优存活 IP %s 正常转发，后台启动补充扫描...",
+                    carrier_display_name(rt->spec.mode), survivors.len, target_ipnum, survivors.items[0].ip);
         } else {
             warn_msg("[%s] 候选池已全部失效，启动扫描寻找可用候选 IP", carrier_display_name(rt->spec.mode));
             atomic_store(&rt->candidates.cache_valid, 0);
@@ -5344,14 +5356,15 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
         rt->candidates.len = tcp_count;
         rt->candidates.current_index = 0;
         snprintf(rt->candidates.current_ip, sizeof(rt->candidates.current_ip), "%s", new_tcp_items[0].ip);
-        rt->candidates.fast_fail_count = 0;
+        atomic_store_explicit(&rt->candidates.fast_fail_count, 0, memory_order_relaxed);
         pthread_mutex_unlock(&rt->candidates.mu);
         atomic_store(&rt->candidates.cache_valid, 1);
         save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), new_tcp_items, tcp_count);
     }
 
     /* 4. 分发给 UDP 候选池 (多轮滑动检验 + 网段裂变衍生) */
-    ResultList udp_res = filter_udp_candidates_from_tcp(rt, all_candidates.items, all_candidates.len, target_ipnum);
+    ResultList udp_res = (inplace_udp.len > 0) ? inplace_udp :
+        filter_udp_candidates_from_tcp(rt, all_candidates.items, all_candidates.len, target_ipnum);
     if (udp_res.len > 0) {
         pthread_mutex_lock(&rt->udp_candidates.mu);
         free(rt->udp_candidates.items);
@@ -5359,11 +5372,12 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
         rt->udp_candidates.len = udp_res.len;
         rt->udp_candidates.current_index = 0;
         snprintf(rt->udp_candidates.current_ip, sizeof(rt->udp_candidates.current_ip), "%s", udp_res.items[0].ip);
-        rt->udp_candidates.fast_fail_count = 0;
+        atomic_store_explicit(&rt->udp_candidates.fast_fail_count, 0, memory_order_relaxed);
         pthread_mutex_unlock(&rt->udp_candidates.mu);
         atomic_store(&rt->udp_candidates.cache_valid, 1);
         save_candidate_cache(candidate_cache_file_for_profile_udp(rt->spec.mode, rt->spec.prof.ips_type), udp_res.items, udp_res.len);
     }
+    pthread_mutex_destroy(&udp_res.mu);
 
     free(all_candidates.items);
 
@@ -5878,6 +5892,23 @@ static void prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
     UdpSession *prev = nullptr;
     UdpSession *s = rt->udp_sessions;
     while (s) {
+        /* 快速失效黑洞检测：若会话建立 >= 5s 且已发送报文 (>= 1200字节) 但从未收到任何回包 */
+        if (cur_ms - s->created_ms >= 5000 && s->bytes_up >= 1200 && s->bytes_down == 0) {
+            pthread_mutex_lock(&rt->udp_candidates.mu);
+            if (strcmp(rt->udp_candidates.current_ip, s->target_ip) == 0) {
+                if (atomic_fetch_add_explicit(&rt->udp_candidates.fast_fail_count, 1, memory_order_relaxed) + 1 >= 2) {
+                    atomic_store_explicit(&rt->udp_candidates.fast_fail_count, 0, memory_order_relaxed);
+                    atomic_store(&rt->udp_candidates.cache_valid, 0);
+                    should_switch_udp = 1;
+                }
+            }
+            pthread_mutex_unlock(&rt->udp_candidates.mu);
+            if (cfnat_socket_valid(s->upstream_fd)) {
+                close(s->upstream_fd);
+                s->upstream_fd = INVALID_SOCKET;
+            }
+        }
+
         if (cur_ms - s->last_active_ms > UDP_SESSION_TIMEOUT_MS) {
             UdpSession *del = s;
             if (rt->last_udp_sess == del) rt->last_udp_sess = nullptr;
@@ -5897,20 +5928,6 @@ static void prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
             format_bytes(del->bytes_down, down_s, sizeof(down_s));
             conn_msg("[UDP/H3] #%llu [%s] 客户端会话关闭 (空闲超时, 存活 %lds, 上行 %s, 下行 %s, 当前活跃: %d)",
                      del->sess_id, carrier_display_name(rt->spec.mode), lifetime_s > 0 ? lifetime_s : 0, up_s, down_s, active);
-
-            /* 快速失效感知：若已发送报文但从未收到任何回包（可能遭遇运营商 UDP QoS 或阻断） */
-            if (del->bytes_up >= 1200 && del->bytes_down == 0) {
-                pthread_mutex_lock(&rt->udp_candidates.mu);
-                if (strcmp(rt->udp_candidates.current_ip, del->target_ip) == 0) {
-                    rt->udp_candidates.fast_fail_count++;
-                    if (rt->udp_candidates.fast_fail_count >= 2) {
-                        rt->udp_candidates.fast_fail_count = 0;
-                        atomic_store(&rt->udp_candidates.cache_valid, 0);
-                        should_switch_udp = 1;
-                    }
-                }
-                pthread_mutex_unlock(&rt->udp_candidates.mu);
-            }
             free(del);
         } else {
             prev = s;
@@ -5987,42 +6004,39 @@ static void *carrier_udp_thread(void *arg) {
 
         /* 1. 监听端口接收客户端 (如 Xray) 发来的 UDP / QUIC 报文 */
         if (pfds[0].revents & POLLIN) {
-            while (1) {
-                struct sockaddr_storage client_ss;
+            char cur_target_ip[MAX_IP_LEN] = {0};
+            carrier_get_current_udp_ip(rt, cur_target_ip, sizeof(cur_target_ip));
+            int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
+            if (target_port <= 0) target_port = 443;
+
+            /* 严禁降级回退到未通过 QUIC 验证的 TCP IP，确保 UDP 通路纯净 */
+            if (cur_target_ip[0]) {
+                pthread_mutex_lock(&rt->udp_mu);
+                while (1) {
+                    struct sockaddr_storage client_ss;
 #ifdef _WIN32
-                int client_len = (int)sizeof(client_ss);
+                    int client_len = (int)sizeof(client_ss);
 #else
-                socklen_t client_len = sizeof(client_ss);
+                    socklen_t client_len = sizeof(client_ss);
 #endif
-                ssize_t n = recvfrom(rt->udp_listen_fd, buf, UDP_BUF_SIZE, 0, (struct sockaddr *)&client_ss, &client_len);
-                if (n <= 0) break;
+                    ssize_t n = recvfrom(rt->udp_listen_fd, buf, UDP_BUF_SIZE, 0, (struct sockaddr *)&client_ss, &client_len);
+                    if (n <= 0) break;
 
-                char cur_target_ip[MAX_IP_LEN] = {0};
-                carrier_get_current_udp_ip(rt, cur_target_ip, sizeof(cur_target_ip));
-                /* 严禁降级回退到未通过 QUIC 验证的 TCP IP，确保 UDP 通路纯净 */
-                if (!cur_target_ip[0]) {
-                    continue;
-                }
-                int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
-                if (target_port <= 0) target_port = 443;
-
-                if (cur_target_ip[0]) {
-                    pthread_mutex_lock(&rt->udp_mu);
                     UdpSession *sess = find_or_create_udp_session(rt, &client_ss, (socklen_t)client_len, cur_target_ip, target_port, (uint8_t)buf[0]);
                     if (sess && cfnat_socket_valid(sess->upstream_fd)) {
                         sess->last_active_ms = cur_ms;
                         sess->bytes_up += (uint64_t)n;
                         send(sess->upstream_fd, buf, (size_t)n, 0);
                     }
-                    pthread_mutex_unlock(&rt->udp_mu);
                 }
+                pthread_mutex_unlock(&rt->udp_mu);
             }
         }
 
-        /* 2. 检查各 upstream_fd 是否有来自 Cloudflare 的 UDP 回包 */
+        /* 2. 检查各 upstream_fd 是否有来自 Cloudflare 的 UDP 回包或错误事件 */
         pthread_mutex_lock(&rt->udp_mu);
         for (size_t i = 1; i < npfd; i++) {
-            if (pfds[i].revents & POLLIN) {
+            if (pfds[i].revents & (POLLIN | POLLERR | POLLHUP)) {
                 UdpSession *sess = p_sess[i];
                 UdpSession *chk = rt->udp_sessions;
                 int valid = 0;
@@ -6031,14 +6045,18 @@ static void *carrier_udp_thread(void *arg) {
                     chk = chk->next;
                 }
                 if (valid && cfnat_socket_valid(sess->upstream_fd)) {
+                    if (pfds[i].revents & (POLLERR | POLLHUP)) {
+                        /* 触发 ICMP 不可达等套接字致命错误，关闭并失效上游 FD，杜绝 100% CPU 空转 */
+                        close(sess->upstream_fd);
+                        sess->upstream_fd = INVALID_SOCKET;
+                        continue;
+                    }
                     while (1) {
                         ssize_t n = recv(sess->upstream_fd, buf, UDP_BUF_SIZE, 0);
                         if (n <= 0) break;
                         sess->last_active_ms = cur_ms;
                         sess->bytes_down += (uint64_t)n;
-                        pthread_mutex_lock(&rt->udp_candidates.mu);
-                        rt->udp_candidates.fast_fail_count = 0;
-                        pthread_mutex_unlock(&rt->udp_candidates.mu);
+                        atomic_store_explicit(&rt->udp_candidates.fast_fail_count, 0, memory_order_relaxed);
                         sendto(rt->udp_listen_fd, buf, (size_t)n, 0, (struct sockaddr *)&sess->client_addr, sess->client_addr_len);
                     }
                 }
@@ -6342,7 +6360,7 @@ int main(int argc, char **argv) {
                 rt->candidates.len = tcp_count;
                 rt->candidates.current_index = 0;
                 snprintf(rt->candidates.current_ip, sizeof(rt->candidates.current_ip), "%s", rt->candidates.items[0].ip);
-                rt->candidates.fast_fail_count = 0;
+                atomic_store_explicit(&rt->candidates.fast_fail_count, 0, memory_order_relaxed);
                 atomic_store(&rt->candidates.cache_valid, 1);
                 save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), rt->candidates.items, rt->candidates.len);
             }
@@ -6359,6 +6377,7 @@ int main(int argc, char **argv) {
                 warn_msg("[%s] 经过多轮滑动检验，未捕获到有效 UDP/QUIC 节点（当地网络可能阻断境外 UDP 443），绝不使用假节点降级，等待自愈重扫",
                          carrier_display_name(rt->spec.mode));
             }
+            pthread_mutex_destroy(&udp_res.mu);
 
             free(carrier_results.items);
 
@@ -6512,7 +6531,7 @@ int main(int argc, char **argv) {
     }
     strlist_free(&ips);
     if (!cache_hit || g_cfg.log_level >= LOG_DEBUG) {
-        print_results_table(results.items, results.len, (now_ms() - start) / 1000);
+        print_results_table_stream(stdout, results.items, results.len, (now_ms() - start) / 1000);
     }
     if (results.len > 0) {
         int use_color = terminal_has_color(stdout);
