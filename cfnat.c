@@ -3797,7 +3797,7 @@ static ResultList load_candidate_cache_for_profile(const char *path, const Profi
 
     int delay_limit = (prof && prof->delay_ms > 0) ? prof->delay_ms : (g_cfg.delay_ms > 0 ? g_cfg.delay_ms : 300);
     int num_probes = (prof && prof->num > 0) ? prof->num : (g_cfg.num > 0 ? g_cfg.num : 5);
-    int max_ips = (prof && prof->ipnum > 0) ? prof->ipnum * 2 : (g_cfg.ipnum > 0 ? g_cfg.ipnum * 2 : 40);
+    int max_ips = (prof && prof->ipnum > 0) ? prof->ipnum : (g_cfg.ipnum > 0 ? g_cfg.ipnum : 20);
     const char *colo_rule = (prof && prof->colo[0]) ? prof->colo : g_cfg.colo;
 
     while (fgets(line, sizeof(line), fp)) {
@@ -4047,7 +4047,7 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
     pthread_mutex_init(&udp_res.mu, nullptr);
     if (!tcp_results || count == 0 || target_ipnum == 0) return udp_res;
 
-    size_t desired_count = target_ipnum * 2;
+    size_t desired_count = target_ipnum;
     if (desired_count > 64) desired_count = 64;
     if (desired_count < 2) desired_count = 2;
 
@@ -5245,7 +5245,7 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
     ResultList survivors = {0};
     if (pool_ips.len > 0) {
         Config retest_cfg = scan_cfg;
-        retest_cfg.ipnum = (int)(target_ipnum * 2);
+        retest_cfg.ipnum = (int)target_ipnum;
         if (retest_cfg.ipnum < (int)pool_ips.len) retest_cfg.ipnum = (int)pool_ips.len;
         if (retest_cfg.task > (int)pool_ips.len) retest_cfg.task = (int)pool_ips.len;
         if (rt->spec.use_baidu_proxy == 2) {
@@ -5276,14 +5276,16 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
     pthread_mutex_init(&all_candidates.mu, nullptr);
 
     /* 2. 判定原地测活存活数量:
-       若存活数量达到充足标准 (>= target_ipnum) 且 UDP (若开启) 也具备充足候选，才跳过全局扫描 */
+       若存活数量达到充足标准 (>= tcp_heal_min) 且 UDP (若开启) 也具备充足候选，才跳过全局扫描 */
     size_t heal_threshold = (target_ipnum * 25 + 99) / 100;
     if (heal_threshold < 1) heal_threshold = 1;
+    size_t tcp_heal_min = (target_ipnum * 60 + 99) / 100;
+    if (tcp_heal_min < 1) tcp_heal_min = 1;
 
     int can_heal_inplace = 0;
     ResultList inplace_udp = {0};
     pthread_mutex_init(&inplace_udp.mu, nullptr);
-    if (survivors.len >= target_ipnum) {
+    if (survivors.len >= tcp_heal_min) {
         if (cfnat_socket_valid(rt->udp_listen_fd)) {
             ResultList test_udp = filter_udp_candidates_from_tcp(rt, survivors.items, survivors.len, target_ipnum);
             if (test_udp.len >= heal_threshold) {
@@ -5299,8 +5301,8 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
     }
 
     if (can_heal_inplace) {
-        log_msg("[%s] 双轨候选池原地测活完成: 存活 %zu 个 (>= 目标数 %zu 个)，成功原地自愈，重排装填",
-                carrier_display_name(rt->spec.mode), survivors.len, target_ipnum);
+        log_msg("[%s] 双轨候选池原地测活完成: 存活 %zu 个 (>= 达标线 %zu 个)，成功原地自愈，重排装填",
+                carrier_display_name(rt->spec.mode), survivors.len, tcp_heal_min);
         for (size_t j = 0; j < survivors.len; j++) {
             resultlist_add(&all_candidates, &survivors.items[j]);
         }
@@ -5317,15 +5319,15 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
             pthread_mutex_unlock(&rt->candidates.mu);
             atomic_store(&rt->candidates.cache_valid, 1);
 
-            log_msg("[%s] 存活候选 %zu 个 (< 目标数 %zu 个或需补充 UDP)，维持最优存活 IP %s 正常转发，后台启动补充扫描...",
-                    carrier_display_name(rt->spec.mode), survivors.len, target_ipnum, survivors.items[0].ip);
+            log_msg("[%s] 存活候选 %zu 个 (< 达标线 %zu 个或需补充 UDP)，维持最优存活 IP %s 正常转发，后台启动补充扫描...",
+                    carrier_display_name(rt->spec.mode), survivors.len, tcp_heal_min, survivors.items[0].ip);
         } else {
             warn_msg("[%s] 候选池已全部失效，启动扫描寻找可用候选 IP", carrier_display_name(rt->spec.mode));
             atomic_store(&rt->candidates.cache_valid, 0);
         }
 
         Config fresh_cfg = scan_cfg;
-        fresh_cfg.ipnum = (int)(target_ipnum * 2);
+        fresh_cfg.ipnum = (int)target_ipnum;
         if (fresh_cfg.task > 60) fresh_cfg.task = 50;
 
         int cur_v6_split = (rt->spec.prof.enabled && rt->spec.prof.v6_split > 0) ? rt->spec.prof.v6_split : g_cfg.v6_split;
@@ -5382,8 +5384,8 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
     pthread_mutex_destroy(&all_candidates.mu);
     qsort(all_candidates.items, all_candidates.len, sizeof(Result), cmp_result);
 
-    /* 3. 分发给 TCP 候选池 (取前 target_ipnum * 2 个扩容池) */
-    size_t tcp_target = target_ipnum * 2;
+    /* 3. 分发给 TCP 候选池 (精准截取前 target_ipnum 个) */
+    size_t tcp_target = target_ipnum;
     size_t tcp_count = all_candidates.len > tcp_target ? tcp_target : all_candidates.len;
     Result *new_tcp_items = calloc(tcp_count, sizeof(Result));
     if (new_tcp_items) {
@@ -6341,7 +6343,7 @@ int main(int argc, char **argv) {
             scan_cfg.task = rt->spec.prof.task;
             size_t target_ipnum = (size_t)(rt->spec.prof.ipnum > 0 ? rt->spec.prof.ipnum : g_cfg.ipnum);
             if (target_ipnum == 0) target_ipnum = 20;
-            scan_cfg.ipnum = (int)(target_ipnum * 2);
+            scan_cfg.ipnum = (int)target_ipnum;
             scan_cfg.num = rt->spec.prof.num;
             scan_cfg.random_mode = rt->spec.prof.random_mode;
             scan_cfg.v6_split = cur_v6_split;
@@ -6388,8 +6390,8 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            // 1. 设置 TCP 候选池 (取前 target_ipnum * 2 个扩容池)
-            size_t tcp_target = target_ipnum * 2;
+            // 1. 设置 TCP 候选池 (精准截取前 target_ipnum 个)
+            size_t tcp_target = target_ipnum;
             size_t tcp_count = carrier_results.len > tcp_target ? tcp_target : carrier_results.len;
             rt->candidates.items = calloc(tcp_count, sizeof(Result));
             if (rt->candidates.items) {
