@@ -47,7 +47,7 @@
 
 #ifdef _WIN32
 #ifndef _WIN32_WINNT
-#define _WIN32_WINNT 0x0601
+#define _WIN32_WINNT 0x0A00
 #endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -2001,7 +2001,7 @@ CFNAT_NODISCARD static socket_t tcp_connect(const char *ip, int port, int timeou
     return fd;
 }
 
-static inline int sockaddr_equal(const struct sockaddr_storage *a, const struct sockaddr_storage *b) {
+static inline int sockaddr_ip_equal(const struct sockaddr_storage *a, const struct sockaddr_storage *b) {
     if (!a || !b || a->ss_family != b->ss_family) return 0;
     if (a->ss_family == AF_INET) {
         const struct sockaddr_in *a4 = (const struct sockaddr_in *)a;
@@ -2011,6 +2011,22 @@ static inline int sockaddr_equal(const struct sockaddr_storage *a, const struct 
         const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *)a;
         const struct sockaddr_in6 *b6 = (const struct sockaddr_in6 *)b;
         return memcmp(&a6->sin6_addr, &b6->sin6_addr, sizeof(struct in6_addr)) == 0;
+    }
+    return 0;
+}
+
+static inline int sockaddr_equal(const struct sockaddr_storage *a, const struct sockaddr_storage *b) {
+    if (!a || !b || a->ss_family != b->ss_family) return 0;
+    if (a->ss_family == AF_INET) {
+        const struct sockaddr_in *a4 = (const struct sockaddr_in *)a;
+        const struct sockaddr_in *b4 = (const struct sockaddr_in *)b;
+        return (a4->sin_port == b4->sin_port &&
+                a4->sin_addr.s_addr == b4->sin_addr.s_addr);
+    } else if (a->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *)a;
+        const struct sockaddr_in6 *b6 = (const struct sockaddr_in6 *)b;
+        return (a6->sin6_port == b6->sin6_port &&
+                memcmp(&a6->sin6_addr, &b6->sin6_addr, sizeof(struct in6_addr)) == 0);
     }
     return 0;
 }
@@ -2929,7 +2945,7 @@ static int dns_query_a_once(const char *resolver, const char *domain, int timeou
         close(fd);
         return -1;
     }
-    if (sendto(fd, query, qlen, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+    if (sendto(fd, (const char *)query, (int)qlen, 0, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
         close(fd);
         return -1;
     }
@@ -2941,7 +2957,7 @@ static int dns_query_a_once(const char *resolver, const char *domain, int timeou
     }
 
     unsigned char resp[1500];
-    ssize_t n = recv(fd, resp, sizeof(resp), 0);
+    ssize_t n = recv(fd, (char *)resp, sizeof(resp), 0);
     close(fd);
     if (n < 12) return -1;
     size_t rlen = (size_t)n;
@@ -3859,7 +3875,7 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
                 long r_now = now_ms();
                 for (size_t i = 0; i < sample_count; i++) {
                     if (items[i].responded) continue;
-                    if (sockaddr_equal(&from, &items[i].addr)) {
+                    if (sockaddr_ip_equal(&from, &items[i].addr)) {
                         items[i].responded = 1;
                         int lat = (int)(r_now - items[i].send_time);
                         if (lat <= 0) lat = 1;
@@ -5278,22 +5294,6 @@ struct UdpSession {
     long last_active_ms;
     struct UdpSession *next;
 };
-
-static int sockaddr_equal(const struct sockaddr_storage *a, const struct sockaddr_storage *b) {
-    if (!a || !b || a->ss_family != b->ss_family) return 0;
-    if (a->ss_family == AF_INET) {
-        struct sockaddr_in *a4 = (struct sockaddr_in *)a;
-        struct sockaddr_in *b4 = (struct sockaddr_in *)b;
-        return (a4->sin_port == b4->sin_port &&
-                a4->sin_addr.s_addr == b4->sin_addr.s_addr);
-    } else if (a->ss_family == AF_INET6) {
-        struct sockaddr_in6 *a6 = (struct sockaddr_in6 *)a;
-        struct sockaddr_in6 *b6 = (struct sockaddr_in6 *)b;
-        return (a6->sin6_port == b6->sin6_port &&
-                memcmp(&a6->sin6_addr, &b6->sin6_addr, sizeof(struct in6_addr)) == 0);
-    }
-    return 0;
-}
 
 static socket_t listen_udp(const char *addr) {
     char host[128];
