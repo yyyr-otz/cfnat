@@ -686,6 +686,7 @@ struct CarrierRuntime {
     pthread_t accept_tid;
     pthread_t udp_tid;
     UdpSession *udp_sessions;
+    UdpSession *last_udp_sess;     /* P0-MRU: 单级热点会话缓存 (为 H3 多路复用提供 O(1) 检索) */
     pthread_mutex_t udp_mu;
     atomic_int rescanning_lock;    /* 实例独享的自愈扫描互斥锁 (防跨协议阻塞) */
 };
@@ -4573,6 +4574,17 @@ static int create_small_thread(pthread_t *tid, void *(*fn)(void *), void *arg) {
     return rc;
 }
 
+#ifdef _WIN32
+#ifndef SIO_KEEPALIVE_VALS
+#define SIO_KEEPALIVE_VALS _WSAIOW(IOC_VENDOR, 4)
+struct tcp_keepalive {
+    u_long onoff;
+    u_long keepalivetime;
+    u_long keepaliveinterval;
+};
+#endif
+#endif
+
 static void set_socket_timeouts_and_keepalive(socket_t s, int timeout_sec) {
     if (cfnat_socket_invalid(s)) return;
 #ifdef _WIN32
@@ -4581,6 +4593,13 @@ static void set_socket_timeouts_and_keepalive(socket_t s, int timeout_sec) {
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char *)&tv, sizeof(tv));
     BOOL keepalive = TRUE;
     setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, (const char *)&keepalive, sizeof(keepalive));
+    struct tcp_keepalive ka = {
+        .onoff = 1,
+        .keepalivetime = 45000,     /* 45s 对齐 Xray/Chrome H2 空闲保活周期 */
+        .keepaliveinterval = 10000  /* 10s 重试间隔 */
+    };
+    DWORD dwBytes = 0;
+    WSAIoctl(s, SIO_KEEPALIVE_VALS, &ka, sizeof(ka), nullptr, 0, &dwBytes, nullptr, nullptr);
 #else
     struct timeval tv;
     tv.tv_sec = timeout_sec;
@@ -4589,6 +4608,21 @@ static void set_socket_timeouts_and_keepalive(socket_t s, int timeout_sec) {
     setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
     int keepalive = 1;
     setsockopt(s, SOL_SOCKET, SO_KEEPALIVE, &keepalive, sizeof(keepalive));
+#ifdef TCP_KEEPIDLE
+    int keepidle = 45; /* 45s 对齐 Xray/Chrome H2 空闲保活周期 */
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPIDLE, &keepidle, sizeof(keepidle));
+#elif defined(TCP_KEEPALIVE)
+    int keepidle = 45;
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPALIVE, &keepidle, sizeof(keepidle));
+#endif
+#ifdef TCP_KEEPINTVL
+    int keepintvl = 10;
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPINTVL, &keepintvl, sizeof(keepintvl));
+#endif
+#ifdef TCP_KEEPCNT
+    int keepcnt = 3;
+    setsockopt(s, IPPROTO_TCP, TCP_KEEPCNT, &keepcnt, sizeof(keepcnt));
+#endif
 #endif
 }
 
@@ -5745,6 +5779,17 @@ static socket_t udp_connect_upstream(const char *ip, int port) {
 static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct sockaddr_storage *client_addr, socklen_t client_len, const char *target_ip, int target_port, uint8_t first_byte) {
     if (!rt || !client_addr || !target_ip || !*target_ip) return nullptr;
 
+    /* P0-MRU 协同加速：Xray XMUX H3 多路复用下，>95% 数据报来自同一客户端端口，优先 O(1) 命中缓存 */
+    UdpSession *fast = rt->last_udp_sess;
+    if (fast && sockaddr_equal(&fast->client_addr, client_addr)) {
+        if (!cfnat_socket_valid(fast->upstream_fd)) {
+            fast->upstream_fd = udp_connect_upstream(target_ip, target_port);
+            snprintf(fast->target_ip, sizeof(fast->target_ip), "%s", target_ip);
+            fast->target_port = target_port;
+        }
+        return fast;
+    }
+
     UdpSession *s = rt->udp_sessions;
     size_t count = 0;
     while (s) {
@@ -5758,6 +5803,7 @@ static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct s
                 snprintf(s->target_ip, sizeof(s->target_ip), "%s", target_ip);
                 s->target_port = target_port;
             }
+            rt->last_udp_sess = s;
             return s;
         }
         s = s->next;
@@ -5780,6 +5826,7 @@ static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct s
             s = s->next;
         }
         if (oldest) {
+            if (rt->last_udp_sess == oldest) rt->last_udp_sess = nullptr;
             if (prev_oldest) prev_oldest->next = oldest->next;
             else rt->udp_sessions = oldest->next;
             if (cfnat_socket_valid(oldest->upstream_fd)) close(oldest->upstream_fd);
@@ -5813,6 +5860,7 @@ static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct s
     int active = atomic_fetch_add(&g_active_udp_sessions, 1) + 1;
     new_sess->next = rt->udp_sessions;
     rt->udp_sessions = new_sess;
+    rt->last_udp_sess = new_sess;
 
     int is_quic = ((first_byte & 0x80) != 0 && (first_byte & 0x40) != 0);
     conn_msg("[UDP/H3] #%llu [%s] 客户端连接建立 (当前活跃: %d)",
@@ -5832,6 +5880,7 @@ static void prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
     while (s) {
         if (cur_ms - s->last_active_ms > UDP_SESSION_TIMEOUT_MS) {
             UdpSession *del = s;
+            if (rt->last_udp_sess == del) rt->last_udp_sess = nullptr;
             if (prev) {
                 prev->next = s->next;
             } else {
@@ -6417,6 +6466,7 @@ int main(int argc, char **argv) {
                 s = next;
             }
             rt->udp_sessions = nullptr;
+            rt->last_udp_sess = nullptr;
             pthread_mutex_unlock(&rt->udp_mu);
             pthread_mutex_destroy(&rt->udp_mu);
             free(rt->candidates.items);
