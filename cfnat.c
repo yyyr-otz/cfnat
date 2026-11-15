@@ -2344,25 +2344,41 @@ static size_t build_tls_client_hello(unsigned char *buf, size_t cap, const char 
     if (!buf || cap < 256 || !sni_host || !*sni_host) return 0;
     unsigned char body[384];
     size_t p = 0;
-    body[p++] = 0x03; body[p++] = 0x03;
+    body[p++] = 0x03; body[p++] = 0x03; /* TLS 1.2 */
     for (int i = 0; i < 32; i++) body[p++] = (unsigned char)(0xa0 + i);
-    body[p++] = 0x00;
-    body[p++] = 0x00; body[p++] = 0x08;
-    body[p++] = 0x13; body[p++] = 0x01;
-    body[p++] = 0x13; body[p++] = 0x02;
-    body[p++] = 0x13; body[p++] = 0x03;
-    body[p++] = 0x00; body[p++] = 0x2f;
-    body[p++] = 0x01; body[p++] = 0x00;
+    body[p++] = 0x00; /* Session ID len = 0 */
+    /* 同时提供 ECDHE_ECDSA 与 ECDHE_RSA 套件，兼容所有 Cloudflare Workers 边缘证书 */
+    body[p++] = 0x00; body[p++] = 0x0a;
+    body[p++] = 0xc0; body[p++] = 0x2b; /* TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 */
+    body[p++] = 0xc0; body[p++] = 0x2f; /* TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 */
+    body[p++] = 0xc0; body[p++] = 0x2c; /* TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384 */
+    body[p++] = 0xc0; body[p++] = 0x30; /* TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384 */
+    body[p++] = 0x00; body[p++] = 0x9c; /* TLS_RSA_WITH_AES_128_GCM_SHA256 */
+    body[p++] = 0x01; body[p++] = 0x00; /* Compression: null */
 
     unsigned char exts[256];
     size_t e = 0;
     e = append_tls_ext_sni(exts, e, sizeof(exts), sni_host);
-    if (e == 0) return 0;
-    if (e + 8 <= sizeof(exts)) {
-        exts[e++] = 0x00; exts[e++] = 0x0b;
-        exts[e++] = 0x00; exts[e++] = 0x02;
-        exts[e++] = 0x01; exts[e++] = 0x00;
-    }
+    if (e == 0 || e + 32 > sizeof(exts)) return 0;
+    /* ec_point_formats (0x000b) */
+    exts[e++] = 0x00; exts[e++] = 0x0b;
+    exts[e++] = 0x00; exts[e++] = 0x02;
+    exts[e++] = 0x01; exts[e++] = 0x00;
+    /* supported_groups (0x000a): x25519 (0x001d), secp256r1 (0x0017), secp384r1 (0x0018) */
+    exts[e++] = 0x00; exts[e++] = 0x0a;
+    exts[e++] = 0x00; exts[e++] = 0x08;
+    exts[e++] = 0x00; exts[e++] = 0x06;
+    exts[e++] = 0x00; exts[e++] = 0x1d;
+    exts[e++] = 0x00; exts[e++] = 0x17;
+    exts[e++] = 0x00; exts[e++] = 0x18;
+    /* signature_algorithms (0x000d) */
+    exts[e++] = 0x00; exts[e++] = 0x0d;
+    exts[e++] = 0x00; exts[e++] = 0x08;
+    exts[e++] = 0x00; exts[e++] = 0x06;
+    exts[e++] = 0x04; exts[e++] = 0x03; /* ecdsa_secp256r1_sha256 */
+    exts[e++] = 0x08; exts[e++] = 0x04; /* rsa_pss_rsae_sha256 */
+    exts[e++] = 0x04; exts[e++] = 0x01; /* rsa_pkcs1_sha256 */
+
     if (p + 2 + e > sizeof(body)) return 0;
     body[p++] = (unsigned char)(e >> 8); body[p++] = (unsigned char)e;
     memcpy(body + p, exts, e);
@@ -4686,13 +4702,35 @@ static void *connection_thread(void *arg) {
             }
         }
     } else {
-        // 普通模式
+        // 普通模式：首轮试当前 IP，若失败则立即顺位尝试候选池中的备用 IP，不原地死磕
         for (int i = 0; i < cc->num; i++) {
+            char try_ip[MAX_IP_LEN];
+            size_t try_idx = 0;
+            if (i == 0 || !cc->runtime || !atomic_load(&g_running)) {
+                snprintf(try_ip, sizeof(try_ip), "%s", cc->ip);
+            } else {
+                pthread_mutex_lock(&cc->runtime->candidates.mu);
+                size_t len = cc->runtime->candidates.len;
+                if (len > 1) {
+                    try_idx = (cc->runtime->candidates.current_index + (size_t)i) % len;
+                    snprintf(try_ip, sizeof(try_ip), "%s", cc->runtime->candidates.items[try_idx].ip);
+                } else {
+                    snprintf(try_ip, sizeof(try_ip), "%s", cc->ip);
+                }
+                pthread_mutex_unlock(&cc->runtime->candidates.mu);
+            }
             int lat = 0;
-            socket_t fd = dial_target_with_proxy(cc->ip, target_port, cc->delay_ms, cc->proxy_pool, &lat);
+            socket_t fd = dial_target_with_proxy(try_ip, target_port, cc->delay_ms, cc->proxy_pool, &lat);
             if (cfnat_socket_valid(fd)) {
                 upstream = fd;
                 best = lat;
+                if (i > 0 && cc->runtime && atomic_load(&g_running) && strcmp(try_ip, cc->ip) != 0) {
+                    snprintf(cc->ip, sizeof(cc->ip), "%s", try_ip);
+                    carrier_set_current_candidate(cc->runtime, try_idx);
+                    atomic_store(&cc->runtime->candidates.cache_valid, 1);
+                    log_msg("[TCP/H2] [%s] 首选节点握手超时，已实时无缝切换至备用 IP: %s (延迟 %d ms)",
+                            carrier_name, try_ip, best);
+                }
                 conn_msg("[TCP/H2] #%llu [%s] 选择连接: %s:%d (延迟 %d ms)", cc->conn_id, carrier_name, cc->ip, target_port, best);
                 break;
             }
@@ -5893,7 +5931,8 @@ static void prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
     UdpSession *s = rt->udp_sessions;
     while (s) {
         /* 快速失效黑洞检测：若会话建立 >= 5s 且已发送报文 (>= 1200字节) 但从未收到任何回包 */
-        if (cur_ms - s->created_ms >= 5000 && s->bytes_up >= 1200 && s->bytes_down == 0) {
+        int is_blackhole = (cur_ms - s->created_ms >= 5000 && s->bytes_up >= 1200 && s->bytes_down == 0);
+        if (is_blackhole) {
             pthread_mutex_lock(&rt->udp_candidates.mu);
             if (strcmp(rt->udp_candidates.current_ip, s->target_ip) == 0) {
                 if (atomic_fetch_add_explicit(&rt->udp_candidates.fast_fail_count, 1, memory_order_relaxed) + 1 >= 2) {
@@ -5903,13 +5942,9 @@ static void prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
                 }
             }
             pthread_mutex_unlock(&rt->udp_candidates.mu);
-            if (cfnat_socket_valid(s->upstream_fd)) {
-                close(s->upstream_fd);
-                s->upstream_fd = INVALID_SOCKET;
-            }
         }
 
-        if (cur_ms - s->last_active_ms > UDP_SESSION_TIMEOUT_MS) {
+        if (is_blackhole || cur_ms - s->last_active_ms > UDP_SESSION_TIMEOUT_MS) {
             UdpSession *del = s;
             if (rt->last_udp_sess == del) rt->last_udp_sess = nullptr;
             if (prev) {
@@ -5926,8 +5961,10 @@ static void prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
             char up_s[32] = {0}, down_s[32] = {0};
             format_bytes(del->bytes_up, up_s, sizeof(up_s));
             format_bytes(del->bytes_down, down_s, sizeof(down_s));
-            conn_msg("[UDP/H3] #%llu [%s] 客户端会话关闭 (空闲超时, 存活 %lds, 上行 %s, 下行 %s, 当前活跃: %d)",
-                     del->sess_id, carrier_display_name(rt->spec.mode), lifetime_s > 0 ? lifetime_s : 0, up_s, down_s, active);
+            conn_msg("[UDP/H3] #%llu [%s] 客户端会话关闭 (%s, 存活 %lds, 上行 %s, 下行 %s, 当前活跃: %d)",
+                     del->sess_id, carrier_display_name(rt->spec.mode),
+                     is_blackhole ? "黑洞剔除" : "空闲超时",
+                     lifetime_s > 0 ? lifetime_s : 0, up_s, down_s, active);
             free(del);
         } else {
             prev = s;
