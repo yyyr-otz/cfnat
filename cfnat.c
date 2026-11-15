@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.11"
+#define CFNAT_VERSION "0.0.10"
 
 /* =========================================================================
  * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
@@ -95,15 +95,7 @@
 
 #ifdef _WIN32
 #define close closesocket
-#ifndef SHUT_RD
-#define SHUT_RD SD_RECEIVE
-#endif
-#ifndef SHUT_WR
-#define SHUT_WR SD_SEND
-#endif
-#ifndef SHUT_RDWR
 #define SHUT_RDWR SD_BOTH
-#endif
 #define strcasecmp _stricmp
 #define strncasecmp _strnicmp
 typedef SOCKET socket_t;
@@ -185,9 +177,6 @@ typedef struct {
     const char *host;
     const char *ip;
     const char *path;
-    char storage_host[MAX_DOMAIN_LEN];
-    char storage_ip[MAX_RESOLVER_LEN];
-    char storage_path[MAX_RESOLVER_SPEC_LEN];
 } DohResolver;
 
 static const DohResolver BAIDU_DOH_RESOLVERS[] = {
@@ -417,7 +406,7 @@ static int evloop_add(EventLoop *el, socket_t fd, int events) {
         ev.data.fd = fd;
         if (events & EV_READ)  ev.events |= EPOLLIN;
         if (events & EV_WRITE) ev.events |= EPOLLOUT;
-        /* 水平触发：兼容阻塞与非阻塞模式，杜绝事件遗漏与挂起 */
+        ev.events |= EPOLLET;  /* 边缘触发，配合非阻塞 I/O */
         return epoll_ctl(el->epoll_fd, EPOLL_CTL_ADD, fd, &ev);
     }
 #elif defined(__APPLE__)
@@ -425,9 +414,9 @@ static int evloop_add(EventLoop *el, socket_t fd, int events) {
         struct kevent kev[2];
         int n = 0;
         if (events & EV_READ)
-            EV_SET(&kev[n++], fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, nullptr);
+            EV_SET(&kev[n++], fd, EVFILT_READ, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, nullptr);
         if (events & EV_WRITE)
-            EV_SET(&kev[n++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, nullptr);
+            EV_SET(&kev[n++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE | EV_CLEAR, 0, 0, nullptr);
         return kevent(el->epoll_fd, kev, n, nullptr, 0, nullptr);
     }
 #endif
@@ -639,9 +628,9 @@ struct BaiduProxyPool {
     BaiduProxyNode *nodes;
     size_t len;
     size_t cap;
-    /* P0-CACHE: 缓存最优节点索引，5 秒有效期，原子无锁并发安全 */
-    atomic_int cached_best_idx;
-    atomic_long cached_at_ms;
+    /* P0-CACHE: 缓存最优节点，5 秒有效期 */
+    BaiduProxyNode *cached_best;
+    long cached_at_ms;
 };
 
 typedef struct {
@@ -691,10 +680,8 @@ static Config g_cfg;
 static Location *g_locations = nullptr;
 static size_t g_location_count = 0;
 static atomic_int g_running = 1;
-static atomic_int g_active_tcp_conns = 0;
-static atomic_ullong g_tcp_conn_seq = 0;
-static atomic_int g_active_udp_sessions = 0;
-static atomic_ullong g_udp_sess_seq = 0;
+static atomic_int g_active_connections = 0;
+static atomic_ullong g_conn_seq = 0;
 static socket_t g_listen_fd = INVALID_SOCKET;
 
 static BaiduProxyPool g_default_proxy_pool = {0};
@@ -969,57 +956,10 @@ static void vlog_line(const char *tag, const char *fmt, va_list ap) {
         else tag_color = ANSI_CYAN;
     }
 
-    char raw_msg[4096];
-    int n = vsnprintf(raw_msg, sizeof(raw_msg), fmt, ap);
-    if (n < 0) return;
-
-    /* 单一完整行缓冲输出，彻底杜绝并发日志交错与字符截断 */
-    char line_buf[8192];
-    size_t out_len = 0;
-
-    int prefix_len = snprintf(line_buf, sizeof(line_buf), "%s%s%s [%s%s%s] ",
-                              time_color, ts, reset, tag_color, tag, reset);
-    if (prefix_len > 0) out_len = (size_t)prefix_len;
-
-    /* 视觉可读性与色彩差异化：[TCP/H2] 为高亮青色，[UDP/H3] 为高亮洋红 */
-    if (use_color) {
-        const char *p = raw_msg;
-        while (*p && out_len + 32 < sizeof(line_buf)) {
-            if (strncmp(p, "[TCP/H2]", 8) == 0) {
-                const char *tcp_colored = ANSI_CYAN ANSI_BOLD "[TCP/H2]" ANSI_RESET;
-                size_t clen = strlen(tcp_colored);
-                if (out_len + clen < sizeof(line_buf) - 2) {
-                    memcpy(line_buf + out_len, tcp_colored, clen);
-                    out_len += clen;
-                }
-                p += 8;
-            } else if (strncmp(p, "[UDP/H3]", 8) == 0) {
-                const char *udp_colored = ANSI_MAGENTA ANSI_BOLD "[UDP/H3]" ANSI_RESET;
-                size_t clen = strlen(udp_colored);
-                if (out_len + clen < sizeof(line_buf) - 2) {
-                    memcpy(line_buf + out_len, udp_colored, clen);
-                    out_len += clen;
-                }
-                p += 8;
-            } else {
-                line_buf[out_len++] = *p++;
-            }
-        }
-    } else {
-        size_t raw_len = strlen(raw_msg);
-        if (out_len + raw_len < sizeof(line_buf) - 2) {
-            memcpy(line_buf + out_len, raw_msg, raw_len);
-            out_len += raw_len;
-        }
-    }
-
-    if (out_len + 2 < sizeof(line_buf)) {
-        line_buf[out_len++] = '\n';
-        line_buf[out_len] = '\0';
-    }
-
     pthread_mutex_lock(&g_log_mu);
-    cfnat_write_utf8(stderr, line_buf, out_len);
+    fprintf(stderr, "%s%s%s [%s%s%s] ", time_color, ts, reset, tag_color, tag, reset);
+    vfprintf(stderr, fmt, ap);
+    fprintf(stderr, "%s\n", reset);
     fflush(stderr);
     pthread_mutex_unlock(&g_log_mu);
 }
@@ -1071,17 +1011,6 @@ static int sleep_interruptible_ms(int ms) {
         left -= chunk;
     }
     return atomic_load(&g_running) ? 0 : -1;
-}
-
-static void sleep_ms_raw(int ms) {
-#ifdef _WIN32
-    Sleep((DWORD)ms);
-#else
-    struct timespec ts;
-    ts.tv_sec = ms / 1000;
-    ts.tv_nsec = (long)(ms % 1000) * 1000000L;
-    nanosleep(&ts, nullptr);
-#endif
 }
 
 static int bind_socket_to_interface(socket_t fd, int family) {
@@ -1245,17 +1174,7 @@ static void parse_args(Config *c, int argc, char **argv) {
         if (eq) {
             *eq = 0;
             val = eq + 1;
-        } else if (i + 1 < argc) {
-            if (argv[i + 1][0] != '-') {
-                val = argv[++i];
-            } else if ((!strcmp(key, "colo") || !strcmp(key, "v4-colo") || !strcmp(key, "v6-colo") ||
-                        !strcmp(key, "exclude-colo") || !strcmp(key, "v4-exclude-colo") || !strcmp(key, "v6-exclude-colo") ||
-                        !strcmp(key, "ex-colo") || !strcmp(key, "v4-ex-colo") || !strcmp(key, "v6-ex-colo")) &&
-                       argv[i + 1][1] != '\0' && !strchr(argv[i + 1], '=')) {
-                /* 支持数据中心筛选反选传参，如 -colo -HKG */
-                val = argv[++i];
-            }
-        }
+        } else if (i + 1 < argc && argv[i + 1][0] != '-') val = argv[++i];
 
         /* 本地监听参数解析: 支持 -v4-listen, -v6-listen, -baidu-listen, -direct-listen */
         if (!strcmp(key, "v4-listen")) {
@@ -2105,37 +2024,6 @@ static inline int sockaddr_equal(const struct sockaddr_storage *a, const struct 
     return 0;
 }
 
-static void format_endpoint_str(const struct sockaddr_storage *ss, char *out, size_t outsz) {
-    if (!ss || !out || outsz == 0) return;
-    out[0] = '\0';
-    if (ss->ss_family == AF_INET) {
-        const struct sockaddr_in *sin = (const struct sockaddr_in *)ss;
-        char ipbuf[INET_ADDRSTRLEN] = {0};
-        inet_ntop(AF_INET, &sin->sin_addr, ipbuf, sizeof(ipbuf));
-        snprintf(out, outsz, "%s:%d", ipbuf, ntohs(sin->sin_port));
-    } else if (ss->ss_family == AF_INET6) {
-        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)ss;
-        char ipbuf[INET6_ADDRSTRLEN] = {0};
-        inet_ntop(AF_INET6, &sin6->sin6_addr, ipbuf, sizeof(ipbuf));
-        snprintf(out, outsz, "[%s]:%d", ipbuf, ntohs(sin6->sin6_port));
-    } else {
-        snprintf(out, outsz, "unknown");
-    }
-}
-
-static void format_bytes(uint64_t b, char *out, size_t outsz) {
-    if (!out || outsz == 0) return;
-    if (b < 1024) {
-        snprintf(out, outsz, "%llu B", (unsigned long long)b);
-    } else if (b < 1024ULL * 1024ULL) {
-        snprintf(out, outsz, "%.1f KB", (double)b / 1024.0);
-    } else if (b < 1024ULL * 1024ULL * 1024ULL) {
-        snprintf(out, outsz, "%.2f MB", (double)b / (1024.0 * 1024.0));
-    } else {
-        snprintf(out, outsz, "%.2f GB", (double)b / (1024.0 * 1024.0 * 1024.0));
-    }
-}
-
 /* RFC 9000 规范的 1200 字节 QUIC Version Negotiation 轻量探针
  * 利用保留版本号 0x5A5A5A5A 触发 Cloudflare 边缘节点立即回包 Version Negotiation
  * 零密钥协商，零 CPU 加密开销，单包 1200 字节符合防放大攻击标准，精准测出 UDP 443 真实延迟 */
@@ -2511,17 +2399,10 @@ static int recv_headers_ev(socket_t fd, char *buf, size_t bufsz, int timeout_ms,
         int left = (int)(deadline - now_ms());
         if (left <= 0) break;
         int n = evloop_wait(el, &ev, 1, left);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            break;
-        }
-        if (n == 0) break;
+        if (n <= 0) break;
         if (ev.fd != fd || !(ev.events & EV_READ)) continue;
         ssize_t nread = recv(fd, buf + used, bufsz - used - 1, 0);
-        if (nread <= 0) {
-            if (nread < 0 && errno == EINTR) continue;
-            break;
-        }
+        if (nread <= 0) break;
         used += (size_t)nread;
         buf[used] = 0;
         /* 只从 search_pos 开始搜索，避免 O(n²) */
@@ -2558,9 +2439,8 @@ static int extract_cfray(const char *headers, char *colo, size_t sz) {
     if (!p) return -1;
     const char *line_end = strstr(p, "\r\n");
     if (!line_end) line_end = p + strlen(p);
-    const char *val_start = p + 7; /* 跳过 "CF-RAY:" 前缀，杜绝匹配自身连字符的错误 */
     const char *dash = nullptr;
-    for (const char *q = val_start; q < line_end; q++) if (*q == '-') dash = q;
+    for (const char *q = p; q < line_end; q++) if (*q == '-') dash = q;
     if (!dash || dash + 1 >= line_end) return -1;
     const char *s = dash + 1;
     size_t n = (size_t)(line_end - s);
@@ -2629,8 +2509,8 @@ static void baidu_pool_free(BaiduProxyPool *pool) {
     pool->nodes = nullptr;
     pool->len = 0;
     pool->cap = 0;
-    atomic_store(&pool->cached_best_idx, -1);
-    atomic_store(&pool->cached_at_ms, 0);
+    pool->cached_best = nullptr;
+    pool->cached_at_ms = 0;
 }
 
 static long proxy_node_score(const BaiduProxyNode *node) {
@@ -2640,31 +2520,29 @@ static long proxy_node_score(const BaiduProxyNode *node) {
     return ewma + (long)active * 50L + (long)failures * 300L;
 }
 
-/* P0-CACHE: 代理节点选择，带 5 秒缓存，原子并发安全 */
+/* P0-CACHE: 代理节点选择，带 5 秒缓存 */
 static BaiduProxyNode *baidu_pool_pick(BaiduProxyPool *pool) {
     if (!pool || pool->len == 0) return nullptr;
 
-    long now = now_ms();
-    long cat = atomic_load_explicit(&pool->cached_at_ms, memory_order_relaxed);
-    int cidx = atomic_load_explicit(&pool->cached_best_idx, memory_order_relaxed);
-    if (cidx >= 0 && (size_t)cidx < pool->len && (now - cat) < 5000) {
-        return &pool->nodes[cidx];
+    /* 缓存有效期内直接返回缓存结果 */
+    if (pool->cached_best && (now_ms() - pool->cached_at_ms) < 5000) {
+        return pool->cached_best;
     }
 
-    size_t best_idx = 0;
-    long best_score = proxy_node_score(&pool->nodes[0]);
+    BaiduProxyNode *best = &pool->nodes[0];
+    long best_score = proxy_node_score(best);
     for (size_t i = 1; i < pool->len; i++) {
         long score = proxy_node_score(&pool->nodes[i]);
         if (score < best_score) {
-            best_idx = i;
+            best = &pool->nodes[i];
             best_score = score;
         }
     }
 
-    /* 原子更新缓存 */
-    atomic_store_explicit(&pool->cached_best_idx, (int)best_idx, memory_order_relaxed);
-    atomic_store_explicit(&pool->cached_at_ms, now, memory_order_relaxed);
-    return &pool->nodes[best_idx];
+    /* 更新缓存 */
+    pool->cached_best = best;
+    pool->cached_at_ms = now_ms();
+    return best;
 }
 
 static socket_t tcp_connect_via_baidu(const char *node_addr, const char *target_addr, int timeout_ms, int *latency_ms) {
@@ -2682,16 +2560,9 @@ static socket_t tcp_connect_via_baidu(const char *node_addr, const char *target_
             "User-Agent: okhttp/3.11.0 Dalvik/2.1.0 (Linux; Build/RKQ1.200826.002) baiduboxapp/11.0.5.12 (Baidu; P1 11)\r\n"
             "Proxy-Connection: keep-alive\r\n"
             "Connection: keep-alive\r\n\r\n", target_addr);
-    size_t req_len = strlen(req);
-    size_t sent = 0;
-    while (sent < req_len) {
-        ssize_t s = send(fd, req + sent, req_len - sent, 0);
-        if (s <= 0) {
-            if (s < 0 && errno == EINTR) continue;
-            close(fd);
-            return INVALID_SOCKET;
-        }
-        sent += (size_t)s;
+    if (send(fd, req, strlen(req), 0) < 0) {
+        close(fd);
+        return INVALID_SOCKET;
     }
     char hdr[4096];
     int n = recv_headers(fd, hdr, sizeof(hdr), timeout_ms);
@@ -2700,14 +2571,13 @@ static socket_t tcp_connect_via_baidu(const char *node_addr, const char *target_
         close(fd);
         return INVALID_SOCKET;
     }
-    int status_code = extract_http_status_code(hdr);
-    if (status_code != 200) {
+    if (strstr(hdr, " 200 ") == nullptr) {
         char status[128];
         size_t status_len = strcspn(hdr, "\r\n");
         if (status_len >= sizeof(status)) status_len = sizeof(status) - 1;
         memcpy(status, hdr, status_len);
         status[status_len] = '\0';
-        debug_msg("百度 CONNECT 失败: 节点 %s 目标 %s 返回 %s (状态码 %d)", node_addr, target_addr, status, status_code);
+        debug_msg("百度 CONNECT 失败: 节点 %s 目标 %s 返回 %s", node_addr, target_addr, status);
         close(fd);
         return INVALID_SOCKET;
     }
@@ -2948,26 +2818,29 @@ static int parse_custom_doh_resolver(const char *spec, DohResolver *out, char *l
     const char *slash = strchr(rest, '/');
     if (!slash) return -1;
     size_t ip_len = (size_t)(slash - rest);
-    if (ip_len == 0 || ip_len >= sizeof(out->storage_ip)) return -1;
-    memcpy(out->storage_ip, rest, ip_len);
-    out->storage_ip[ip_len] = '\0';
+    if (ip_len == 0 || ip_len >= MAX_RESOLVER_LEN) return -1;
+    static char ipbuf[MAX_RESOLVER_LEN];
+    static char hostbuf[MAX_DOMAIN_LEN];
+    static char pathbuf[MAX_RESOLVER_SPEC_LEN];
+    memcpy(ipbuf, rest, ip_len);
+    ipbuf[ip_len] = '\0';
     const char *query = strchr(slash, '?');
     if (query) {
         size_t base_len = (size_t)(query - slash);
         char filtered[MAX_RESOLVER_SPEC_LEN] = {0};
-        if (extract_query_param_value(query + 1, "host", out->storage_host, sizeof(out->storage_host)) != 0) return -1;
+        if (extract_query_param_value(query + 1, "host", hostbuf, sizeof(hostbuf)) != 0) return -1;
         if (strip_query_param(query + 1, "host", filtered, sizeof(filtered)) != 0) return -1;
-        if (filtered[0]) snprintf(out->storage_path, sizeof(out->storage_path), "%.*s?%s", (int)base_len, slash, filtered);
-        else snprintf(out->storage_path, sizeof(out->storage_path), "%.*s", (int)base_len, slash);
+        if (filtered[0]) snprintf(pathbuf, sizeof(pathbuf), "%.*s?%s", (int)base_len, slash, filtered);
+        else snprintf(pathbuf, sizeof(pathbuf), "%.*s", (int)base_len, slash);
     } else {
         return -1;
     }
-    if (!out->storage_ip[0] || !out->storage_host[0] || !out->storage_path[0]) return -1;
+    if (!ipbuf[0] || !hostbuf[0] || !pathbuf[0]) return -1;
     out->label = label ? label : "custom DoH";
-    out->host = out->storage_host;
-    out->ip = out->storage_ip;
-    out->path = out->storage_path;
-    if (label && labelsz > 0) snprintf(label, labelsz, "DoH(%.50s)", out->storage_host);
+    out->host = hostbuf;
+    out->ip = ipbuf;
+    out->path = pathbuf;
+    if (label && labelsz > 0) snprintf(label, labelsz, "DoH(%.50s)", hostbuf);
     return 0;
 }
 
@@ -3498,6 +3371,15 @@ static void *scan_worker(void *arg) {
 
         int avg_latency = success_count > 0 ? (total_latency / success_count) : 0;
 
+        if (ctx->cfg->code <= 0 && success_count <= 0 && header_once && cfray_missing_once && !ctx->cfg->colo[0] && (!ctx->proxy_pool || ctx->proxy_pool->len == 0)) {
+            success_count = 1;
+            if (best_latency == 0) best_latency = ctx->cfg->delay_ms > 0 ? ctx->cfg->delay_ms : 1;
+            if (avg_latency <= 0) avg_latency = best_latency;
+            if (ewma_latency <= 0) ewma_latency = best_latency;
+            snprintf(best_colo, sizeof(best_colo), "%s", "UNK");
+            debug_msg("%s HTTP 响应缺少 CF-RAY，作为 UNK 候选交给健康检查确认", ip);
+        }
+
         uint64_t done = atomic_fetch_add(&ctx->completed, 1) + 1;
         uint64_t step = ctx->total / 100;
         if (step < 5) step = 5;
@@ -3700,8 +3582,7 @@ static void save_candidate_cache(const char *path, const Result *items, size_t l
     /* P0-EWMA: 缓存格式升级为 v2，增加 ewma_latency, jitter_ms, consecutive_fail */
     fprintf(fp, "# cfnat-cache-v2 %ld\n", (long)time(nullptr));
     size_t limit = len;
-    size_t max_save = (g_cfg.ipnum > 0) ? (size_t)g_cfg.ipnum * 2 : 40;
-    if (limit > max_save) limit = max_save;
+    if (g_cfg.ipnum > 0 && limit > (size_t)g_cfg.ipnum) limit = (size_t)g_cfg.ipnum;
     for (size_t i = 0; i < limit; i++) {
         const Result *r = &items[i];
         fprintf(fp, "%s|%s|%s|%s|%d|%d|%d|%d|%d|%d|%d\n",
@@ -3741,7 +3622,7 @@ static ResultList load_candidate_cache_for_profile(const char *path, const Profi
 
     int delay_limit = (prof && prof->delay_ms > 0) ? prof->delay_ms : (g_cfg.delay_ms > 0 ? g_cfg.delay_ms : 300);
     int num_probes = (prof && prof->num > 0) ? prof->num : (g_cfg.num > 0 ? g_cfg.num : 5);
-    int max_ips = (prof && prof->ipnum > 0) ? prof->ipnum * 2 : (g_cfg.ipnum > 0 ? g_cfg.ipnum * 2 : 40);
+    int max_ips = (prof && prof->ipnum > 0) ? prof->ipnum : (g_cfg.ipnum > 0 ? g_cfg.ipnum : 20);
     const char *colo_rule = (prof && prof->colo[0]) ? prof->colo : g_cfg.colo;
 
     while (fgets(line, sizeof(line), fp)) {
@@ -3822,50 +3703,77 @@ static int try_use_candidate_cache(BaiduProxyPool *proxy_pool, ResultList *out) 
     return 0;
 }
 
-/* P0-H3: 基于 RFC 9000 规范从同网段衍生兄弟 IP (IPv4 /24 或 IPv6 /64) */
-static int sample_sibling_ip_from_subnet(const char *seed_ip, char *out_ip, size_t outsz) {
-    if (!seed_ip || !*seed_ip || !out_ip || outsz == 0) return 0;
-    if (strchr(seed_ip, ':')) {
-        unsigned char bytes[16];
-        if (inet_pton(AF_INET6, seed_ip, bytes) != 1) return 0;
-        uint16_t w[4];
-        for (int i = 0; i < 4; i++) {
-            w[i] = (uint16_t)(((uint16_t)bytes[i * 2] << 8) | (uint16_t)bytes[i * 2 + 1]);
-        }
-        uint64_t r = rand_u64();
-        uint16_t seg4 = (uint16_t)(r & 0xffff);
-        uint16_t seg5 = (uint16_t)((r >> 16) & 0xffff);
-        uint16_t seg6 = (uint16_t)((r >> 32) & 0xffff);
-        uint16_t seg7 = (uint16_t)((r >> 48) & 0xffff);
-        if (seg4 == 0 && seg5 == 0 && seg6 == 0 && seg7 == 0) seg7 = 1;
-        snprintf(out_ip, outsz, "%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
-                 w[0], w[1], w[2], w[3], seg4, seg5, seg6, seg7);
-        return 1;
-    } else {
-        int a, b, c, d;
-        if (sscanf(seed_ip, "%d.%d.%d.%d", &a, &b, &c, &d) != 4) return 0;
-        int host = (int)(rand_u64() % 253) + 1; // 1..253
-        if (host >= d) host++;                  // 保证避开种子 IP 本身 (1..254 != d)
-        if (host < 1) host = 1;
-        if (host > 254) host = 254;
-        snprintf(out_ip, outsz, "%d.%d.%d.%d", a, b, c, host);
-        return 1;
+/* P0-H3: 高性能全异步并发 QUIC 探针，单/双栈套接字复用并发齐射，毫秒级快速完成 H3 精筛 */
+static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Result *tcp_results, size_t count, size_t target_ipnum) {
+    ResultList udp_res = {0};
+    pthread_mutex_init(&udp_res.mu, nullptr);
+    if (!tcp_results || count == 0 || target_ipnum == 0) return udp_res;
+
+    size_t sample_count = count < target_ipnum * 2 ? count : target_ipnum * 2;
+    if (sample_count > 64) sample_count = 64;
+
+    int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
+    if (target_port <= 0) target_port = 443;
+    int timeout_ms = (rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms;
+    if (timeout_ms < 600) timeout_ms = 600;
+    if (timeout_ms > 2000) timeout_ms = 2000;
+
+    log_msg("%s 正在并发验证前 %zu 个优质候选 IP 的 UDP/QUIC 响应...",
+            carrier_display_name(rt->spec.mode), sample_count);
+
+    int has_v4 = 0, has_v6 = 0;
+    for (size_t i = 0; i < sample_count; i++) {
+        if (strchr(tcp_results[i].ip, ':')) has_v6 = 1;
+        else has_v4 = 1;
     }
-}
 
-typedef struct {
-    Result res;
-    struct sockaddr_storage addr;
-    socklen_t addr_len;
-    long send_time;
-    int latency_ms;
-    int responded;
-} QuicProbeItem;
+    socket_t fd4 = INVALID_SOCKET;
+    socket_t fd6 = INVALID_SOCKET;
 
-/* 全异步非阻塞并发 QUIC 探针齐射批次执行函数 */
-static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, int target_port,
-                               int timeout_ms, QuicProbeItem *items, size_t count, size_t needed_responses) {
-    if (!items || count == 0) return 0;
+    if (has_v4) {
+        fd4 = socket(AF_INET, SOCK_DGRAM, 0);
+        if (cfnat_socket_valid(fd4)) {
+#ifdef _WIN32
+            BOOL bNewBehavior = FALSE;
+            DWORD dwBytesReturned = 0;
+            WSAIoctl(fd4, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), nullptr, 0, &dwBytesReturned, nullptr, nullptr);
+#endif
+            bind_socket_to_interface(fd4, AF_INET);
+            set_nonblock(fd4, 1);
+        }
+    }
+
+    if (has_v6) {
+        fd6 = socket(AF_INET6, SOCK_DGRAM, 0);
+        if (cfnat_socket_valid(fd6)) {
+#ifdef _WIN32
+            BOOL bNewBehavior = FALSE;
+            DWORD dwBytesReturned = 0;
+            WSAIoctl(fd6, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), nullptr, 0, &dwBytesReturned, nullptr, nullptr);
+#endif
+            bind_socket_to_interface(fd6, AF_INET6);
+            set_nonblock(fd6, 1);
+        }
+    }
+
+    if (cfnat_socket_invalid(fd4) && cfnat_socket_invalid(fd6)) {
+        warn_msg("%s 创建 UDP 探针套接字失败，降级使用 TCP 候选", carrier_display_name(rt->spec.mode));
+        size_t fb_count = count < target_ipnum ? count : target_ipnum;
+        for (size_t i = 0; i < fb_count; i++) resultlist_add(&udp_res, &tcp_results[i]);
+        return udp_res;
+    }
+
+    typedef struct {
+        const Result *src;
+        struct sockaddr_storage addr;
+        socklen_t addr_len;
+        long send_time;
+        int latency_ms;
+        int responded;
+    } QuicProbeItem;
+
+    QuicProbeItem items[64];
+    memset(items, 0, sizeof(items));
 
     uint8_t pkt[1200];
     memset(pkt, 0, sizeof(pkt));
@@ -3879,40 +3787,39 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
 
     long start_time = now_ms();
 
-    for (size_t i = 0; i < count; i++) {
-        items[i].responded = 0;
-        items[i].latency_ms = 0;
-        int is_v6 = (strchr(items[i].res.ip, ':') != nullptr);
+    // 并发齐射所有 UDP/QUIC 探针
+    for (size_t i = 0; i < sample_count; i++) {
+        items[i].src = &tcp_results[i];
+        int is_v6 = (strchr(tcp_results[i].ip, ':') != nullptr);
         socket_t sfd = is_v6 ? fd6 : fd4;
         if (cfnat_socket_invalid(sfd)) continue;
 
         if (is_v6) {
             struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&items[i].addr;
-            memset(sa6, 0, sizeof(*sa6));
             sa6->sin6_family = AF_INET6;
             sa6->sin6_port = htons((uint16_t)target_port);
-            inet_pton(AF_INET6, items[i].res.ip, &sa6->sin6_addr);
+            inet_pton(AF_INET6, tcp_results[i].ip, &sa6->sin6_addr);
             items[i].addr_len = sizeof(struct sockaddr_in6);
         } else {
             struct sockaddr_in *sa4 = (struct sockaddr_in *)&items[i].addr;
-            memset(sa4, 0, sizeof(*sa4));
             sa4->sin_family = AF_INET;
             sa4->sin_port = htons((uint16_t)target_port);
-            inet_pton(AF_INET, items[i].res.ip, &sa4->sin_addr);
+            inet_pton(AF_INET, tcp_results[i].ip, &sa4->sin_addr);
             items[i].addr_len = sizeof(struct sockaddr_in);
         }
 
-        uint32_t scid = seed ^ (uint32_t)(i + 1);
+        uint32_t scid = seed ^ (uint32_t)i;
         memcpy(pkt + 15, &scid, 4);
 
         items[i].send_time = now_ms();
         sendto(sfd, (const char *)pkt, sizeof(pkt), 0, (struct sockaddr *)&items[i].addr, items[i].addr_len);
     }
 
+    // 轮询等待收集响应
     size_t responded_count = 0;
     long deadline = start_time + timeout_ms;
 
-    while (responded_count < count && now_ms() < deadline) {
+    while (responded_count < sample_count && now_ms() < deadline) {
         int left = (int)(deadline - now_ms());
         if (left <= 0) break;
 
@@ -3961,7 +3868,7 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
                 if (n <= 0) break;
 
                 long r_now = now_ms();
-                for (size_t i = 0; i < count; i++) {
+                for (size_t i = 0; i < sample_count; i++) {
                     if (items[i].responded) continue;
                     if (sockaddr_ip_equal(&from, &items[i].addr)) {
                         items[i].responded = 1;
@@ -3970,187 +3877,48 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
                         items[i].latency_ms = lat;
                         responded_count++;
                         debug_msg("%s QUIC 探针响应成功: %s 延迟 %d ms",
-                                  carrier_display_name(rt ? rt->spec.mode : nullptr), items[i].res.ip, lat);
+                                  carrier_display_name(rt->spec.mode), items[i].src->ip, lat);
                         break;
                     }
                 }
             }
         }
 
-        if (responded_count >= needed_responses && (now_ms() - start_time) >= 250) {
+        // 若已达到预期候选数量且经过充分 RTT 收集窗口（>= 250ms），可提前退出
+        if (responded_count >= target_ipnum && (now_ms() - start_time) >= 250) {
             break;
         }
-    }
-
-    return responded_count;
-}
-
-/* P0-H3: 高性能多轮滑动 + 网段裂变衍生 QUIC 探针引擎 (真实验证，绝不降级假节点) */
-static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Result *tcp_results, size_t count, size_t target_ipnum) {
-    ResultList udp_res = {0};
-    pthread_mutex_init(&udp_res.mu, nullptr);
-    if (!tcp_results || count == 0 || target_ipnum == 0) return udp_res;
-
-    size_t desired_count = target_ipnum * 2;
-    if (desired_count > 64) desired_count = 64;
-    if (desired_count < 2) desired_count = 2;
-
-    int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
-    if (target_port <= 0) target_port = 443;
-    int timeout_ms = (rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms;
-    if (timeout_ms < 600) timeout_ms = 600;
-    if (timeout_ms > 2000) timeout_ms = 2000;
-
-    socket_t fd4 = socket(AF_INET, SOCK_DGRAM, 0);
-    if (cfnat_socket_valid(fd4)) {
-#ifdef _WIN32
-        BOOL bNewBehavior = FALSE;
-        DWORD dwBytesReturned = 0;
-        WSAIoctl(fd4, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), nullptr, 0, &dwBytesReturned, nullptr, nullptr);
-#endif
-        bind_socket_to_interface(fd4, AF_INET);
-        set_nonblock(fd4, 1);
-    }
-
-    socket_t fd6 = socket(AF_INET6, SOCK_DGRAM, 0);
-    if (cfnat_socket_valid(fd6)) {
-#ifdef _WIN32
-        BOOL bNewBehavior = FALSE;
-        DWORD dwBytesReturned = 0;
-        WSAIoctl(fd6, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), nullptr, 0, &dwBytesReturned, nullptr, nullptr);
-#endif
-        bind_socket_to_interface(fd6, AF_INET6);
-        set_nonblock(fd6, 1);
-    }
-
-    if (cfnat_socket_invalid(fd4) && cfnat_socket_invalid(fd6)) {
-        warn_msg("%s 创建 UDP 探针套接字失败", carrier_display_name(rt->spec.mode));
-        return udp_res; // 严禁降级假节点
-    }
-
-    long total_start = now_ms();
-    size_t batch_size = desired_count > 32 ? 32 : desired_count;
-    if (batch_size < 16 && count >= 16) batch_size = 16;
-
-    size_t offset = 0;
-    int round_idx = 1;
-
-    Result seeds[64];
-    size_t seed_count = 0;
-
-    QuicProbeItem probe_items[64];
-
-    // 阶段一：滑动批次检验 TCP 候选池
-    while (offset < count && udp_res.len < desired_count) {
-        size_t cur_len = count - offset;
-        if (cur_len > batch_size) cur_len = batch_size;
-
-        log_msg("%s [H3筛选/第%d轮] 正在并发检验第 %zu~%zu 个 TCP 候选 IP 的 UDP/QUIC 响应...",
-                carrier_display_name(rt->spec.mode), round_idx, offset + 1, offset + cur_len);
-
-        memset(probe_items, 0, sizeof(probe_items));
-        for (size_t i = 0; i < cur_len; i++) {
-            probe_items[i].res = tcp_results[offset + i];
-        }
-
-        size_t needed = desired_count - udp_res.len;
-        size_t responded = quic_batch_probe(rt, fd4, fd6, target_port, timeout_ms, probe_items, cur_len, needed);
-
-        if (responded > 0) {
-            for (size_t i = 0; i < cur_len; i++) {
-                if (probe_items[i].responded) {
-                    Result r = probe_items[i].res;
-                    r.latency_ms = probe_items[i].latency_ms;
-                    r.ewma_latency = probe_items[i].latency_ms;
-                    r.loss_rate = 0;
-                    r.success_count = 1;
-                    r.probe_count = 1;
-                    resultlist_add(&udp_res, &r);
-
-                    if (seed_count < 64) {
-                        seeds[seed_count++] = r;
-                    }
-                }
-            }
-
-            // 阶段二：网段裂变衍生 (Subnet Expansion)
-            if (seed_count > 0 && udp_res.len < desired_count) {
-                size_t deficit = desired_count - udp_res.len;
-                if (deficit > 32) deficit = 32;
-
-                QuicProbeItem derived_items[32];
-                memset(derived_items, 0, sizeof(derived_items));
-                size_t derived_count = 0;
-
-                for (size_t d = 0; d < deficit; d++) {
-                    const Result *base_seed = &seeds[d % seed_count];
-                    char sibling_ip[MAX_IP_LEN] = {0};
-
-                    for (int tries = 0; tries < 5; tries++) {
-                        if (!sample_sibling_ip_from_subnet(base_seed->ip, sibling_ip, sizeof(sibling_ip))) break;
-                        int dup = 0;
-                        for (size_t u = 0; u < udp_res.len; u++) {
-                            if (strcmp(udp_res.items[u].ip, sibling_ip) == 0) { dup = 1; break; }
-                        }
-                        if (!dup) {
-                            for (size_t u = 0; u < derived_count; u++) {
-                                if (strcmp(derived_items[u].res.ip, sibling_ip) == 0) { dup = 1; break; }
-                            }
-                        }
-                        if (!dup) break;
-                    }
-
-                    if (sibling_ip[0]) {
-                        derived_items[derived_count].res = *base_seed;
-                        snprintf(derived_items[derived_count].res.ip, sizeof(derived_items[derived_count].res.ip), "%s", sibling_ip);
-                        derived_count++;
-                    }
-                }
-
-                if (derived_count > 0) {
-                    log_msg("%s [H3网段衍生] 基于已捕获的 %zu 个优质种子网段，裂变衍生 %zu 个同网段 IP 启动快速并发检验...",
-                            carrier_display_name(rt->spec.mode), seed_count, derived_count);
-                    quic_batch_probe(rt, fd4, fd6, target_port, timeout_ms, derived_items, derived_count, desired_count - udp_res.len);
-
-                    for (size_t d = 0; d < derived_count; d++) {
-                        if (derived_items[d].responded) {
-                            Result r = derived_items[d].res;
-                            r.latency_ms = derived_items[d].latency_ms;
-                            r.ewma_latency = derived_items[d].latency_ms;
-                            r.loss_rate = 0;
-                            r.success_count = 1;
-                            r.probe_count = 1;
-                            resultlist_add(&udp_res, &r);
-                        }
-                    }
-                }
-            }
-
-            if (udp_res.len >= desired_count) {
-                break;
-            }
-        } else {
-            debug_msg("%s 第 %zu~%zu 个 TCP 候选 IP 全无 UDP 回包（可能被丢包/阻断），向后滑动选取下一批...",
-                      carrier_display_name(rt->spec.mode), offset + 1, offset + cur_len);
-        }
-
-        offset += cur_len;
-        round_idx++;
     }
 
     if (cfnat_socket_valid(fd4)) close(fd4);
     if (cfnat_socket_valid(fd6)) close(fd6);
 
+    for (size_t i = 0; i < sample_count; i++) {
+        if (items[i].responded) {
+            Result r = *items[i].src;
+            r.latency_ms = items[i].latency_ms;
+            r.ewma_latency = items[i].latency_ms;
+            r.loss_rate = 0;
+            r.success_count = 1;
+            r.probe_count = 1;
+            resultlist_add(&udp_res, &r);
+        } else {
+            debug_msg("%s QUIC 探针超时/不可达: %s", carrier_display_name(rt->spec.mode), items[i].src->ip);
+        }
+    }
+
     if (udp_res.len > 0) {
         qsort(udp_res.items, udp_res.len, sizeof(Result), cmp_result);
-        if (udp_res.len > desired_count) udp_res.len = desired_count;
-        log_msg("%s UDP/QUIC 精筛完成: 捕获 %zu 个真实有效 H3 候选 (目标: %zu)，最优延迟: %d ms (%s)，总耗时: %ld ms",
-                carrier_display_name(rt->spec.mode), udp_res.len, desired_count,
+        if (udp_res.len > target_ipnum) udp_res.len = target_ipnum;
+        log_msg("%s UDP/QUIC 并发精筛完成: 获得 %zu 个有效 H3 候选，最优延迟: %d ms (%s)，耗时: %ld ms",
+                carrier_display_name(rt->spec.mode), udp_res.len,
                 udp_res.items[0].latency_ms, udp_res.items[0].ip,
-                now_ms() - total_start);
+                now_ms() - start_time);
     } else {
-        warn_msg("%s 遍历全部 %zu 个 TCP 候选 IP 均无 UDP/QUIC 回包（当前运营商可能阻断境外 UDP 443），绝不使用假节点降级，保持真实 UDP 状态等待自愈重扫",
-                 carrier_display_name(rt->spec.mode), count);
+        warn_msg("%s 前 %zu 个优质 IP 均无 UDP/QUIC 回包（当地可能阻断境外 UDP 443），降级使用 TCP 最优 IP",
+                 carrier_display_name(rt->spec.mode), sample_count);
+        size_t fb_count = count < target_ipnum ? count : target_ipnum;
+        for (size_t i = 0; i < fb_count; i++) resultlist_add(&udp_res, &tcp_results[i]);
     }
 
     return udp_res;
@@ -4232,17 +4000,17 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
         }
     }
 
-    log_msg("[%s] 命中双轨候选缓存快速启动: [TCP/H2] 最优: %s (%d ms), [UDP/H3] 最优: %s (%d ms)",
+    log_msg("%s 命中候选缓存，快速启动: TCP 最优 IP: %s (%d ms), UDP 最优 IP: %s (%d ms)",
             carrier_display_name(rt->spec.mode),
             rt->candidates.current_ip,
             rt->candidates.items ? rt->candidates.items[0].latency_ms : 0,
             rt->udp_candidates.current_ip[0] ? rt->udp_candidates.current_ip : rt->candidates.current_ip,
             rt->udp_candidates.items ? rt->udp_candidates.items[0].latency_ms : 0);
     if (g_cfg.log_level >= LOG_DEBUG) {
-        debug_msg("[TCP/H2] [%s] 已载入缓存的候选 IP 列表 (共 %zu 个):", carrier_display_name(rt->spec.mode), rt->candidates.len);
+        log_msg("%s [DEBUG] 已载入缓存的 TCP 候选 IP 列表 (共 %zu 个):", carrier_display_name(rt->spec.mode), rt->candidates.len);
         print_results_table(rt->candidates.items, rt->candidates.len, 0);
         if (rt->udp_candidates.len > 0) {
-            debug_msg("[UDP/H3] [%s] 已载入缓存的候选 IP 列表 (共 %zu 个):", carrier_display_name(rt->spec.mode), rt->udp_candidates.len);
+            log_msg("%s [DEBUG] 已载入缓存的 UDP/H3 候选 IP 列表 (共 %zu 个):", carrier_display_name(rt->spec.mode), rt->udp_candidates.len);
             print_results_table(rt->udp_candidates.items, rt->udp_candidates.len, 0);
         }
     }
@@ -4374,8 +4142,8 @@ CFNAT_NODISCARD static int health_check_ip(const char *ip, BaiduProxyPool *proxy
 
 
 static void close_pair(socket_t a, socket_t b) {
-    if (cfnat_socket_valid(a)) shutdown(a, SHUT_RDWR);
-    if (cfnat_socket_valid(b)) shutdown(b, SHUT_RDWR);
+    shutdown(a, SHUT_RDWR);
+    shutdown(b, SHUT_RDWR);
 }
 
 /* P1-2: 带超时的 recv（支持 flags，如 MSG_PEEK），突破 FD_SETSIZE 限制 */
@@ -4400,27 +4168,17 @@ static void *pipe_worker_fallback(PipeCtx *pc) {
     char buf[COPY_BUF_SIZE];
     while (1) {
         ssize_t n = recv_timeout(pc->from, buf, sizeof(buf), 300000);
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
-            break;
-        }
+        if (n <= 0) break;
         char *p = buf;
         ssize_t left = n;
         while (left > 0) {
             ssize_t w = send(pc->to, p, (size_t)left, 0);
-            if (w <= 0) {
-                if (w < 0 && errno == EINTR) continue;
-                goto err;
-            }
+            if (w <= 0) goto done;
             p += w;
             left -= w;
         }
     }
-    /* 正常 EOF: 半关闭对端写方向，允许反向继续完整传输响应 */
-    shutdown(pc->to, SHUT_WR);
-    return nullptr;
-err:
-    close_pair(pc->from, pc->to);
+    done : close_pair(pc->from, pc->to);
     return nullptr;
 }
 
@@ -4431,30 +4189,15 @@ static void *pipe_worker(void *arg) {
         return pipe_worker_fallback(pc);
     }
     while (1) {
-        /* 去除 SPLICE_F_MORE，彻底杜绝尾包延迟引入的 40~200ms 卡顿 */
-        ssize_t n = splice(pc->from, nullptr, pipefd[1], nullptr, 65536, SPLICE_F_MOVE);
-        if (n < 0) {
-            if (errno == EINTR) continue;
-            goto err;
-        }
-        if (n == 0) break; /* 读到 EOF */
+        ssize_t n = splice(pc->from, nullptr, pipefd[1], nullptr, 65536, SPLICE_F_MOVE | SPLICE_F_MORE);
+        if (n <= 0) break;
         while (n > 0) {
-            ssize_t w = splice(pipefd[0], nullptr, pc->to, nullptr, (size_t)n, SPLICE_F_MOVE);
-            if (w < 0) {
-                if (errno == EINTR) continue;
-                goto err;
-            }
-            if (w == 0) goto err;
+            ssize_t w = splice(pipefd[0], nullptr, pc->to, nullptr, (size_t)n, SPLICE_F_MOVE | SPLICE_F_MORE);
+            if (w <= 0) goto done;
             n -= w;
         }
     }
-    close(pipefd[0]);
-    close(pipefd[1]);
-    /* 读到 EOF 正常半关闭：通知下游无更多数据，保留逆向接收通道 */
-    shutdown(pc->to, SHUT_WR);
-    return nullptr;
-
-err:
+    done :
     close(pipefd[0]);
     close(pipefd[1]);
     close_pair(pc->from, pc->to);
@@ -4468,43 +4211,31 @@ static void *pipe_worker(void *arg) {
     while (1) {
         /* P1-2: recv 带 300 秒超时，防止空闲连接永久阻塞 */
         ssize_t n = recv_timeout(pc->from, buf, sizeof(buf), 300000);
-        if (n <= 0) {
-            if (n < 0 && errno == EINTR) continue;
-            break;
-        }
+        if (n <= 0) break;
         char *p = buf;
         ssize_t left = n;
         while (left > 0) {
             ssize_t w = send(pc->to, p, (size_t)left, 0);
-            if (w <= 0) {
-                if (w < 0 && errno == EINTR) continue;
-                goto err;
-            }
+            if (w <= 0) goto done;
             p += w;
             left -= w;
         }
     }
-    /* 正常半关闭 */
-    shutdown(pc->to, SHUT_WR);
-    return nullptr;
-err:
-    close_pair(pc->from, pc->to);
+    done : close_pair(pc->from, pc->to);
     return nullptr;
 }
 #endif
 
 static int create_small_thread(pthread_t *tid, void *(*fn)(void *), void *arg) {
-    if (tid) *tid = 0;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
     pthread_attr_setstacksize(&attr, 64 * 1024);
     int rc = pthread_create(tid, &attr, fn, arg);
     pthread_attr_destroy(&attr);
-    if (rc != 0 && tid) {
-        *tid = 0;
-    }
     return rc;
 }
+
+
 
 static void set_socket_timeouts_and_keepalive(socket_t s, int timeout_sec) {
     if (cfnat_socket_invalid(s)) return;
@@ -4529,19 +4260,10 @@ static int relay_bidirectional(socket_t c, socket_t u) {
     /* 为双向套接字设置 300 秒空闲超时及 KeepAlive，防止 Linux splice 及非阻塞管道永久卡死 */
     set_socket_timeouts_and_keepalive(c, 300);
     set_socket_timeouts_and_keepalive(u, 300);
-    pthread_t t1 = 0, t2 = 0;
+    pthread_t t1, t2;
     PipeCtx a = { c, u }, b = { u, c };
-    int rc1 = create_small_thread(&t1, pipe_worker, &a);
-    if (rc1 != 0) {
-        close_pair(c, u);
-        return -1;
-    }
-    int rc2 = create_small_thread(&t2, pipe_worker, &b);
-    if (rc2 != 0) {
-        close_pair(c, u);
-        pthread_join(t1, nullptr);
-        return -1;
-    }
+    create_small_thread(&t1, pipe_worker, &a);
+    create_small_thread(&t2, pipe_worker, &b);
     pthread_join(t1, nullptr);
     pthread_join(t2, nullptr);
     return 0;
@@ -4566,10 +4288,9 @@ static void *connection_thread(void *arg) {
         client_hello_len = read_tls_client_hello(client, first, client_hello, sizeof(client_hello), cc->delay_ms);
         parse_tls_sni(client_hello, client_hello_len, sni_host, sizeof(sni_host));
     }
-    const char *carrier_name = cc->runtime ? carrier_display_name(cc->runtime->spec.mode) : "-";
-    conn_msg("[TCP/H2] #%llu [%s] 识别客户端协议: %s，转发到 IP: %s 端口: %d%s%s",
-             cc->conn_id, carrier_name,
-             is_tls ? "TLS" : "非TLS", cc->ip, target_port,
+    conn_msg("#%llu %s 识别客户端协议: %s，转发到 IP: %s 端口: %d%s%s",
+             cc->conn_id, cc->client_addr[0] ? cc->client_addr : "unknown",
+             is_tls ? "TLS" : "非 TLS", cc->ip, target_port,
              sni_host[0] ? "，SNI: " : "", sni_host[0] ? sni_host : "");
     int best = 0;
 
@@ -4581,7 +4302,7 @@ static void *connection_thread(void *arg) {
             if (cfnat_socket_valid(fd)) {
                 upstream = fd;
                 best = lat;
-                conn_msg("[TCP/H2] #%llu [%s] 选择连接: %s:%d (延迟 %d ms, 直连)", cc->conn_id, carrier_name, cc->ip, target_port, best);
+                conn_msg("#%llu 选择连接: 地址: %s:%d 延迟: %d ms (直连)", cc->conn_id, cc->ip, target_port, best);
                 break;
             }
         }
@@ -4592,7 +4313,7 @@ static void *connection_thread(void *arg) {
                 if (cfnat_socket_valid(fd)) {
                     upstream = fd;
                     best = lat;
-                    conn_msg("[TCP/H2] #%llu [%s] 选择连接: %s:%d (延迟 %d ms, 百度前置)", cc->conn_id, carrier_name, cc->ip, target_port, best);
+                    conn_msg("#%llu 选择连接: 地址: %s:%d 延迟: %d ms (百度前置)", cc->conn_id, cc->ip, target_port, best);
                     break;
                 }
             }
@@ -4605,7 +4326,7 @@ static void *connection_thread(void *arg) {
             if (cfnat_socket_valid(fd)) {
                 upstream = fd;
                 best = lat;
-                conn_msg("[TCP/H2] #%llu [%s] 选择连接: %s:%d (延迟 %d ms)", cc->conn_id, carrier_name, cc->ip, target_port, best);
+                conn_msg("#%llu 选择连接: 地址: %s:%d 延迟: %d ms", cc->conn_id, cc->ip, target_port, best);
                 break;
             }
         }
@@ -4617,39 +4338,35 @@ static void *connection_thread(void *arg) {
             char sni_ip[MAX_IP_LEN];
             if (carrier_choose_ip_for_sni(cc->runtime, sni_host, sni_ip, sizeof(sni_ip))) {
                 snprintf(cc->ip, sizeof(cc->ip), "%s", sni_ip);
-                conn_msg("[TCP/H2] #%llu [%s] SNI 故障转移: 为 %s 切换到备用 IP %s", cc->conn_id, carrier_name, sni_host, sni_ip);
+                conn_msg("#%llu SNI 故障转移：为 %s 切换到备用 IP %s", cc->conn_id, sni_host, sni_ip);
                 // 使用新 IP 重试一次
                 int lat = 0;
                 socket_t fd = dial_target_with_proxy(cc->ip, target_port, cc->delay_ms, cc->proxy_pool, &lat);
                 if (cfnat_socket_valid(fd)) {
                     upstream = fd;
                     best = lat;
-                    conn_msg("[TCP/H2] #%llu [%s] SNI 故障转移成功: %s:%d (延迟 %d ms)", cc->conn_id, carrier_name, cc->ip, target_port, best);
+                    conn_msg("#%llu SNI 故障转移成功: 地址: %s:%d 延迟: %d ms", cc->conn_id, cc->ip, target_port, best);
                 }
             }
         }
         if (cfnat_socket_invalid(upstream)) {
-            debug_msg("[TCP/H2] #%llu [%s] 未找到符合延迟要求的连接，关闭客户端连接", cc->conn_id, carrier_name);
+            debug_msg("#%llu 未找到符合延迟要求的连接，关闭客户端连接", cc->conn_id);
             goto out;
         }
     }
     if (is_tls && client_hello_len > 0) {
         if (!send_all_timeout(upstream, client_hello, client_hello_len, cc->delay_ms > 0 ? cc->delay_ms : 1000)) {
-            debug_msg("[TCP/H2] #%llu [%s] 转发客户端 ClientHello 失败，关闭连接", cc->conn_id, carrier_name);
+            debug_msg("#%llu 转发客户端 ClientHello 失败，关闭连接", cc->conn_id);
             goto out;
         }
     }
     relay_bidirectional(client, upstream);
-out:
+    out :
     if (cfnat_socket_valid(upstream)) close(upstream);
-    if (cfnat_socket_valid(client)) close(client);
-    if (atomic_load(&g_running) && cc->runtime) {
-        carrier_note_connection_result(cc->runtime, cc->ip, now_ms() - conn_start_ms);
-    }
-    int active = atomic_fetch_sub(&g_active_tcp_conns, 1) - 1;
-    long lifetime_s = (now_ms() - conn_start_ms) / 1000;
-    conn_msg("[TCP/H2] #%llu [%s] 客户端连接关闭 (存活 %lds, 当前活跃: %d)",
-             cc->conn_id, carrier_name, lifetime_s > 0 ? lifetime_s : 0, active);
+    close(client);
+    carrier_note_connection_result(cc->runtime, cc->ip, now_ms() - conn_start_ms);
+    int active = atomic_fetch_sub(&g_active_connections, 1) - 1;
+    conn_msg("#%llu 客户端连接关闭，当前活跃连接数: %d", cc->conn_id, active);
     free(cc);
     return nullptr;
 }
@@ -4676,8 +4393,8 @@ static int carrier_probe_and_check(CarrierRuntime *rt, socket_t fd, int timeout_
     return ok;
 }
 
-/* P1-HC: 增强 carrier 健康检查，支持级别参数，无锁采集延迟 */
-CFNAT_NODISCARD static int carrier_health_check_ip_level(CarrierRuntime *rt, const char *ip, HealthCheckLevel level, int *out_lat) {
+/* P1-HC: 增强 carrier 健康检查，支持级别参数 */
+CFNAT_NODISCARD static int carrier_health_check_ip_level(CarrierRuntime *rt, const char *ip, HealthCheckLevel level) {
     if (!rt || !ip || !*ip) return 0;
     int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
     int timeout_ms = (rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms;
@@ -4688,11 +4405,11 @@ CFNAT_NODISCARD static int carrier_health_check_ip_level(CarrierRuntime *rt, con
         if (cfnat_socket_valid(fd)) {
             if (level == HC_LIGHT) {
                 close(fd);
-                if (out_lat) *out_lat = latency;
+                debug_msg("%s 健康检查(轻量/直连)成功: IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
                 return 1;
             }
             if (carrier_probe_and_check(rt, fd, timeout_ms)) {
-                if (out_lat) *out_lat = latency;
+                debug_msg("%s 健康检查成功(直连): IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
                 return 1;
             }
         }
@@ -4701,32 +4418,35 @@ CFNAT_NODISCARD static int carrier_health_check_ip_level(CarrierRuntime *rt, con
             if (cfnat_socket_valid(fd)) {
                 if (level == HC_LIGHT) {
                     close(fd);
-                    if (out_lat) *out_lat = latency;
+                    debug_msg("%s 健康检查(轻量/百度)成功: IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
                     return 1;
                 }
                 if (carrier_probe_and_check(rt, fd, timeout_ms)) {
-                    if (out_lat) *out_lat = latency;
+                    debug_msg("%s 健康检查成功(百度前置): IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
                     return 1;
                 }
             }
         }
+        debug_msg("%s 健康检查失败: IP %s 暂不可用", carrier_display_name(rt->spec.mode), ip);
         return 0;
     }
     // 普通模式
     int latency = 0;
     socket_t fd = dial_target_with_proxy(ip, target_port, timeout_ms, rt->proxy_pool, &latency);
     if (cfnat_socket_invalid(fd)) {
+        debug_msg("%s 健康检查失败: IP %s 暂不可用", carrier_display_name(rt->spec.mode), ip);
         return 0;
     }
     if (level == HC_LIGHT) {
         close(fd);
-        if (out_lat) *out_lat = latency;
+        debug_msg("%s 健康检查(轻量)成功: IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
         return 1;
     }
     if (carrier_probe_and_check(rt, fd, timeout_ms)) {
-        if (out_lat) *out_lat = latency;
+        debug_msg("%s 健康检查成功: IP %s 延迟 %d ms", carrier_display_name(rt->spec.mode), ip, latency);
         return 1;
     }
+    debug_msg("%s 健康检查失败: IP %s TCP 可达但 HTTP 无响应", carrier_display_name(rt->spec.mode), ip);
     return 0;
 }
 
@@ -4884,8 +4604,7 @@ static int carrier_select_valid_ip(CarrierRuntime *rt) {
         if (carrier_health_check_ip(rt, check_ips[i])) {
             carrier_set_current_candidate(rt, check_indices[i]);
             atomic_store(&rt->candidates.cache_valid, 1);  /* P0-1: 选中有效 IP */
-            int port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
-            log_msg("[TCP/H2] [%s] 可用 IP: %s (端口: %d)", carrier_display_name(rt->spec.mode), check_ips[i], port);
+            log_msg("%s 可用 IP: %s (健康检查端口:%d)", carrier_display_name(rt->spec.mode), check_ips[i], g_cfg.port);
             return 1;
         }
     }
@@ -4922,7 +4641,7 @@ static int carrier_switch_next_ip(CarrierRuntime *rt) {
         if (carrier_health_check_ip(rt, check_ips[i])) {
             carrier_set_current_candidate(rt, check_indices[i]);
             atomic_store(&rt->candidates.cache_valid, 1);  /* P0-1: 新 IP 有效 */
-            log_msg("[TCP/H2] [%s] 顺位切换到下一个最优 IP: %s (候选索引: %zu/%zu)",
+            log_msg("%s 顺位切换到下一个最优 TCP IP: %s (候选索引: %zu/%zu)",
                     carrier_display_name(rt->spec.mode), check_ips[i], check_indices[i], total_len);
             return 1;
         }
@@ -4978,7 +4697,7 @@ CFNAT_UNUSED static int carrier_select_valid_udp_ip(CarrierRuntime *rt) {
         if (quic_probe_ip(check_ips[i], target_port, delay_ms, &lat)) {
             carrier_set_current_udp_candidate(rt, check_indices[i]);
             atomic_store(&rt->udp_candidates.cache_valid, 1);
-            log_msg("[UDP/H3] [%s] 可用 IP: %s (QUIC 延迟: %d ms)",
+            log_msg("%s 可用 UDP/H3 IP: %s (QUIC 延迟: %d ms)",
                     carrier_display_name(rt->spec.mode), check_ips[i], lat);
             return 1;
         }
@@ -5022,7 +4741,7 @@ CFNAT_NODISCARD static int carrier_switch_next_udp_ip(CarrierRuntime *rt) {
         if (quic_probe_ip(check_ips[i], target_port, delay_ms, &lat)) {
             carrier_set_current_udp_candidate(rt, check_indices[i]);
             atomic_store(&rt->udp_candidates.cache_valid, 1);
-            log_msg("[UDP/H3] [%s] 顺位切换到下一个最优 IP: %s (候选索引: %zu/%zu, 延迟 %d ms)",
+            log_msg("%s UDP 顺位切换到下一个最优 IP: %s (候选索引: %zu/%zu, 延迟 %d ms)",
                     carrier_display_name(rt->spec.mode), check_ips[i], check_indices[i], total_len, lat);
             return 1;
         }
@@ -5031,13 +4750,9 @@ CFNAT_NODISCARD static int carrier_switch_next_udp_ip(CarrierRuntime *rt) {
 }
 
 static void carrier_note_connection_result(CarrierRuntime *rt, const char *ip, long lifetime_ms) {
-    if (!atomic_load(&g_running) || !rt || !ip || !*ip) return;
+    if (!rt || !ip || !*ip) return;
     int should_switch = 0;
     pthread_mutex_lock(&rt->candidates.mu);
-    if (!atomic_load(&g_running)) {
-        pthread_mutex_unlock(&rt->candidates.mu);
-        return;
-    }
     if (strcmp(rt->candidates.current_ip, ip) == 0) {
         if (lifetime_ms > 0 && lifetime_ms < 3000) {
             rt->candidates.fast_fail_count++;
@@ -5051,10 +4766,10 @@ static void carrier_note_connection_result(CarrierRuntime *rt, const char *ip, l
         }
     }
     pthread_mutex_unlock(&rt->candidates.mu);
-    if (should_switch && atomic_load(&g_running)) {
-        log_msg("[TCP/H2] [%s] 当前 IP %s 连续快速断开，标记为不可用并顺位切换", carrier_display_name(rt->spec.mode), ip);
+    if (should_switch) {
+        log_msg("%s 当前 TCP IP %s 连续快速断开，标记为不可用并切换", carrier_display_name(rt->spec.mode), ip);
         if (!carrier_switch_next_ip(rt)) {
-            log_msg("[TCP/H2] [%s] 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护双轨候选池", carrier_display_name(rt->spec.mode));
+            log_msg("%s 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护双轨候选池", carrier_display_name(rt->spec.mode));
             carrier_rescan_dual_pools(rt);
         }
     }
@@ -5179,18 +4894,16 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
     pthread_mutex_init(&all_candidates.mu, nullptr);
 
     /* 2. 判定原地测活存活数量:
-       若存活数量达到门槛 (>= 25% target_ipnum)，直接原地重排自愈，无需全局扫描！ */
-    size_t heal_threshold = (target_ipnum * 25 + 99) / 100;
-    if (heal_threshold < 1) heal_threshold = 1;
-    if (survivors.len >= heal_threshold) {
-        log_msg("[%s] 双轨候选池原地测活完成: 存活 %zu 个 (>= 25%%门槛 %zu 个)，成功原地自愈，重排装填",
-                carrier_display_name(rt->spec.mode), survivors.len, heal_threshold);
+       若存活数量达到双轨满编门槛 (>= target_ipnum * 2)，直接原地重排自愈，无需全局扫描！ */
+    if (survivors.len >= target_ipnum * 2) {
+        log_msg("%s 双轨候选池原地测活完成: 存活 %zu 个 (>= 双轨满编 %zu)，成功自愈，开始双轨装填",
+                carrier_display_name(rt->spec.mode), survivors.len, target_ipnum * 2);
         for (size_t j = 0; j < survivors.len; j++) {
             resultlist_add(&all_candidates, &survivors.items[j]);
         }
         free(survivors.items);
     } else {
-        /* 存活数量不足 25% 门槛，执行带电增量补充扫描 */
+        /* 存活数量不足双轨满编 (< target_ipnum * 2)，执行带电增量补充扫描 */
         if (survivors.len > 0) {
             pthread_mutex_lock(&rt->candidates.mu);
             snprintf(rt->candidates.current_ip, sizeof(rt->candidates.current_ip), "%s", survivors.items[0].ip);
@@ -5198,10 +4911,10 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
             pthread_mutex_unlock(&rt->candidates.mu);
             atomic_store(&rt->candidates.cache_valid, 1);
 
-            log_msg("[%s] 存活候选 %zu 个 (< 25%%门槛 %zu 个)，维持最优存活 IP %s 正常转发，后台启动补充扫描...",
-                    carrier_display_name(rt->spec.mode), survivors.len, heal_threshold, survivors.items[0].ip);
+            log_msg("%s 存活候选 %zu 个 (< 双轨满编 %zu)，维持最优存活 IP %s 正常转发，后台启动补充扫描...",
+                    carrier_display_name(rt->spec.mode), survivors.len, target_ipnum * 2, survivors.items[0].ip);
         } else {
-            warn_msg("[%s] 候选池已全部失效，启动扫描寻找可用候选 IP", carrier_display_name(rt->spec.mode));
+            warn_msg("%s 候选池已全部失效，启动扫描寻找可用候选 IP", carrier_display_name(rt->spec.mode));
             atomic_store(&rt->candidates.cache_valid, 0);
         }
 
@@ -5263,9 +4976,8 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
     pthread_mutex_destroy(&all_candidates.mu);
     qsort(all_candidates.items, all_candidates.len, sizeof(Result), cmp_result);
 
-    /* 3. 分发给 TCP 候选池 (取前 target_ipnum * 2 个扩容池) */
-    size_t tcp_target = target_ipnum * 2;
-    size_t tcp_count = all_candidates.len > tcp_target ? tcp_target : all_candidates.len;
+    /* 3. 分发给 TCP 候选池 (取前 target_ipnum 个) */
+    size_t tcp_count = all_candidates.len > target_ipnum ? target_ipnum : all_candidates.len;
     Result *new_tcp_items = calloc(tcp_count, sizeof(Result));
     if (new_tcp_items) {
         memcpy(new_tcp_items, all_candidates.items, tcp_count * sizeof(Result));
@@ -5281,7 +4993,7 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
         save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), new_tcp_items, tcp_count);
     }
 
-    /* 4. 分发给 UDP 候选池 (多轮滑动检验 + 网段裂变衍生) */
+    /* 4. 分发给 UDP 候选池 (对前 min(all_candidates.len, target_ipnum * 2) 个做轻量 QUIC 验证并精筛) */
     ResultList udp_res = filter_udp_candidates_from_tcp(rt, all_candidates.items, all_candidates.len, target_ipnum);
     if (udp_res.len > 0) {
         pthread_mutex_lock(&rt->udp_candidates.mu);
@@ -5298,7 +5010,7 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
 
     free(all_candidates.items);
 
-    log_msg("[%s] 双轨补充自愈完成: [TCP/H2] 最优: %s (%d ms), [UDP/H3] 最优: %s (%d ms)",
+    log_msg("%s 双轨补充自愈完成: TCP 最优: %s (%d ms), UDP/H3 最优: %s (%d ms)",
             carrier_display_name(rt->spec.mode),
             rt->candidates.current_ip, rt->candidates.items ? rt->candidates.items[0].latency_ms : 0,
             rt->udp_candidates.current_ip, rt->udp_candidates.items ? rt->udp_candidates.items[0].latency_ms : 0);
@@ -5327,28 +5039,25 @@ static void *carrier_health_thread(void *arg) {
             level = HC_LIGHT;
         }
 
-        int latency = 0;
-        if (!ip[0] || !carrier_health_check_ip_level(rt, ip, level, &latency)) {
+        if (!ip[0] || !carrier_health_check_ip_level(rt, ip, level)) {
             fail++;
             consecutive_success = 0;
             atomic_store(&rt->candidates.cache_valid, 0);
-            warn_msg("[TCP/H2] [%s] 状态检查失败 (%d/2): 当前 IP %s 握手无响应",
-                     carrier_display_name(rt->spec.mode), fail, ip[0] ? ip : "为空");
+            log_msg("%s TCP 状态检查失败 (%d/2): 当前 IP %s 暂不可用", carrier_display_name(rt->spec.mode), fail, ip[0] ? ip : "为空");
         } else {
             fail = 0;
             consecutive_success++;
             atomic_store(&rt->candidates.cache_valid, 1);
             long n = now_ms();
             if (g_cfg.log_level >= LOG_DEBUG && g_cfg.health_log > 0 && n - last >= g_cfg.health_log * 1000L) {
-                debug_msg("[TCP/H2] [%s] 状态检查正常: 当前 IP %s 可用 (延迟 %d ms)",
-                          carrier_display_name(rt->spec.mode), ip, latency);
+                debug_msg("%s TCP 状态检查成功: 当前 IP %s 可用", carrier_display_name(rt->spec.mode), ip);
                 last = n;
             }
         }
         if (fail >= 2) {
-            log_msg("[TCP/H2] [%s] 连续两次状态检查失败，顺位切换下一个候选 IP", carrier_display_name(rt->spec.mode));
+            log_msg("%s 连续两次 TCP 状态检查失败，切换到下一个 IP", carrier_display_name(rt->spec.mode));
             if (!carrier_switch_next_ip(rt)) {
-                log_msg("[TCP/H2] [%s] 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护双轨候选池", carrier_display_name(rt->spec.mode));
+                log_msg("%s TCP 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护双轨候选池", carrier_display_name(rt->spec.mode));
                 if (!carrier_rescan_dual_pools(rt)) {
                     atomic_store(&g_running, 0);
                     return nullptr;
@@ -5380,24 +5089,24 @@ static void *carrier_udp_health_thread(void *arg) {
         if (!ok) {
             fail++;
             atomic_store(&rt->udp_candidates.cache_valid, 0);
-            warn_msg("[UDP/H3] [%s] 状态检查失败 (%d/2): 当前 IP %s QUIC 无响应",
-                     carrier_display_name(rt->spec.mode), fail, ip);
+            log_msg("%s UDP/H3 状态检查失败 (%d/2): 当前 IP %s QUIC 无响应",
+                    carrier_display_name(rt->spec.mode), fail, ip);
         } else {
             fail = 0;
             atomic_store(&rt->udp_candidates.cache_valid, 1);
             long n = now_ms();
             if (g_cfg.log_level >= LOG_DEBUG && g_cfg.health_log > 0 && n - last_log >= g_cfg.health_log * 1000L) {
-                debug_msg("[UDP/H3] [%s] 状态检查正常: 当前 IP %s 可用 (延迟 %d ms)",
+                debug_msg("%s UDP/H3 状态检查成功: 当前 IP %s 可用 (延迟 %d ms)",
                           carrier_display_name(rt->spec.mode), ip, latency);
                 last_log = n;
             }
         }
 
         if (fail >= 2) {
-            log_msg("[UDP/H3] [%s] 连续两次状态检查失败，顺位切换下一个候选 IP",
+            log_msg("%s 连续两次 UDP 状态检查失败，切换到下一个 UDP 候选 IP",
                     carrier_display_name(rt->spec.mode));
             if (!carrier_switch_next_udp_ip(rt)) {
-                log_msg("[UDP/H3] [%s] 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护双轨候选池",
+                log_msg("%s UDP 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护双轨候选池",
                         carrier_display_name(rt->spec.mode));
                 carrier_rescan_dual_pools(rt);
             }
@@ -5435,13 +5144,13 @@ static void *carrier_accept_thread(void *arg) {
             close(cfd);
             continue;
         }
-        int active = atomic_fetch_add(&g_active_tcp_conns, 1) + 1;
-        unsigned long long conn_id = atomic_fetch_add(&g_tcp_conn_seq, 1) + 1;
-        conn_msg("[TCP/H2] #%llu [%s] 客户端连接建立 (当前活跃: %d)", conn_id, carrier_display_name(rt->spec.mode), active);
+        int active = atomic_fetch_add(&g_active_connections, 1) + 1;
+        unsigned long long conn_id = atomic_fetch_add(&g_conn_seq, 1) + 1;
+        conn_msg("#%llu %s 客户端连接建立，当前活跃连接数: %d", conn_id, carrier_display_name(rt->spec.mode), active);
         ConnCtx *cc = calloc(1, sizeof(ConnCtx));
         if (!cc) {
             close(cfd);
-            atomic_fetch_sub(&g_active_tcp_conns, 1);
+            atomic_fetch_sub(&g_active_connections, 1);
             continue;
         }
         cc->client_fd = cfd;
@@ -5454,16 +5163,20 @@ static void *carrier_accept_thread(void *arg) {
         cc->runtime = rt;
         cc->use_mixed = (rt->spec.use_baidu_proxy == 2) ? 1 : 0;
         cc->conn_id = conn_id;
-        format_endpoint_str((const struct sockaddr_storage *)&ss, cc->client_addr, sizeof(cc->client_addr));
-        pthread_t tid = 0;
-        set_tcp_nodelay(cfd);
-        if (create_small_thread(&tid, connection_thread, cc) != 0) {
-            warn_msg("[TCP/H2] #%llu [%s] 创建连接处理线程失败", conn_id, carrier_display_name(rt->spec.mode));
-            close(cfd);
-            free(cc);
-            atomic_fetch_sub(&g_active_tcp_conns, 1);
-            continue;
+        if (ss.ss_family == AF_INET) {
+            struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
+            char ipbuf[INET_ADDRSTRLEN] = {0};
+            inet_ntop(AF_INET, &sin->sin_addr, ipbuf, sizeof(ipbuf));
+            snprintf(cc->client_addr, sizeof(cc->client_addr), "%s:%d", ipbuf, ntohs(sin->sin_port));
+        } else if (ss.ss_family == AF_INET6) {
+            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
+            char ipbuf[INET6_ADDRSTRLEN] = {0};
+            inet_ntop(AF_INET6, &sin6->sin6_addr, ipbuf, sizeof(ipbuf));
+            snprintf(cc->client_addr, sizeof(cc->client_addr), "[%s]:%d", ipbuf, ntohs(sin6->sin6_port));
         }
+        pthread_t tid;
+        set_tcp_nodelay(cfd);
+        create_small_thread(&tid, connection_thread, cc);
         pthread_detach(tid);
     }
     return nullptr;
@@ -5570,15 +5283,10 @@ static socket_t listen_tcp(const char *addr) {
 struct UdpSession {
     struct sockaddr_storage client_addr;
     socklen_t client_addr_len;
-    char client_addr_str[64];
     socket_t upstream_fd;
     char target_ip[MAX_IP_LEN];
     int target_port;
-    unsigned long long sess_id;
-    long created_ms;
     long last_active_ms;
-    uint64_t bytes_up;
-    uint64_t bytes_down;
     struct UdpSession *next;
 };
 
@@ -5697,7 +5405,7 @@ static socket_t udp_connect_upstream(const char *ip, int port) {
     return fd;
 }
 
-static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct sockaddr_storage *client_addr, socklen_t client_len, const char *target_ip, int target_port, uint8_t first_byte) {
+static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct sockaddr_storage *client_addr, socklen_t client_len, const char *target_ip, int target_port) {
     if (!rt || !client_addr || !target_ip || !*target_ip) return nullptr;
 
     UdpSession *s = rt->udp_sessions;
@@ -5738,13 +5446,6 @@ static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct s
             if (prev_oldest) prev_oldest->next = oldest->next;
             else rt->udp_sessions = oldest->next;
             if (cfnat_socket_valid(oldest->upstream_fd)) close(oldest->upstream_fd);
-            int active = atomic_fetch_sub(&g_active_udp_sessions, 1) - 1;
-            long lifetime_s = (now_ms() - oldest->created_ms) / 1000;
-            char up_s[32] = {0}, down_s[32] = {0};
-            format_bytes(oldest->bytes_up, up_s, sizeof(up_s));
-            format_bytes(oldest->bytes_down, down_s, sizeof(down_s));
-            conn_msg("[UDP/H3] #%llu [%s] 客户端会话关闭 (LRU淘汰, 存活 %lds, 上行 %s, 下行 %s, 当前活跃: %d)",
-                     oldest->sess_id, carrier_display_name(rt->spec.mode), lifetime_s > 0 ? lifetime_s : 0, up_s, down_s, active);
             free(oldest);
         }
     }
@@ -5754,7 +5455,6 @@ static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct s
     if (!new_sess) return nullptr;
     memcpy(&new_sess->client_addr, client_addr, client_len);
     new_sess->client_addr_len = client_len;
-    format_endpoint_str(client_addr, new_sess->client_addr_str, sizeof(new_sess->client_addr_str));
     new_sess->upstream_fd = udp_connect_upstream(target_ip, target_port);
     if (cfnat_socket_invalid(new_sess->upstream_fd)) {
         free(new_sess);
@@ -5762,25 +5462,16 @@ static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct s
     }
     snprintf(new_sess->target_ip, sizeof(new_sess->target_ip), "%s", target_ip);
     new_sess->target_port = target_port;
-    new_sess->created_ms = now_ms();
-    new_sess->last_active_ms = new_sess->created_ms;
-    new_sess->sess_id = atomic_fetch_add(&g_udp_sess_seq, 1) + 1;
-    int active = atomic_fetch_add(&g_active_udp_sessions, 1) + 1;
+    new_sess->last_active_ms = now_ms();
     new_sess->next = rt->udp_sessions;
     rt->udp_sessions = new_sess;
 
-    int is_quic = ((first_byte & 0x80) != 0 && (first_byte & 0x40) != 0);
-    conn_msg("[UDP/H3] #%llu [%s] 客户端连接建立 (当前活跃: %d)",
-             new_sess->sess_id, carrier_display_name(rt->spec.mode), active);
-    conn_msg("[UDP/H3] #%llu [%s] 识别客户端协议: %s，转发到 IP: %s 端口: %d",
-             new_sess->sess_id, carrier_display_name(rt->spec.mode),
-             is_quic ? "QUIC/H3" : "UDP", new_sess->target_ip, new_sess->target_port);
+    debug_msg("%s 建立新 UDP/H3 会话 -> %s:%d", carrier_display_name(rt->spec.mode), target_ip, target_port);
     return new_sess;
 }
 
 static void prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
     if (!rt) return;
-    int should_switch_udp = 0;
     pthread_mutex_lock(&rt->udp_mu);
     UdpSession *prev = nullptr;
     UdpSession *s = rt->udp_sessions;
@@ -5796,27 +5487,6 @@ static void prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
             if (cfnat_socket_valid(del->upstream_fd)) {
                 close(del->upstream_fd);
             }
-            int active = atomic_fetch_sub(&g_active_udp_sessions, 1) - 1;
-            long lifetime_s = (cur_ms - del->created_ms) / 1000;
-            char up_s[32] = {0}, down_s[32] = {0};
-            format_bytes(del->bytes_up, up_s, sizeof(up_s));
-            format_bytes(del->bytes_down, down_s, sizeof(down_s));
-            conn_msg("[UDP/H3] #%llu [%s] 客户端会话关闭 (空闲超时, 存活 %lds, 上行 %s, 下行 %s, 当前活跃: %d)",
-                     del->sess_id, carrier_display_name(rt->spec.mode), lifetime_s > 0 ? lifetime_s : 0, up_s, down_s, active);
-
-            /* 快速失效感知：若已发送报文但从未收到任何回包（可能遭遇运营商 UDP QoS 或阻断） */
-            if (del->bytes_up >= 1200 && del->bytes_down == 0) {
-                pthread_mutex_lock(&rt->udp_candidates.mu);
-                if (strcmp(rt->udp_candidates.current_ip, del->target_ip) == 0) {
-                    rt->udp_candidates.fast_fail_count++;
-                    if (rt->udp_candidates.fast_fail_count >= 2) {
-                        rt->udp_candidates.fast_fail_count = 0;
-                        atomic_store(&rt->udp_candidates.cache_valid, 0);
-                        should_switch_udp = 1;
-                    }
-                }
-                pthread_mutex_unlock(&rt->udp_candidates.mu);
-            }
             free(del);
         } else {
             prev = s;
@@ -5824,14 +5494,6 @@ static void prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
         }
     }
     pthread_mutex_unlock(&rt->udp_mu);
-
-    if (should_switch_udp && atomic_load(&g_running)) {
-        log_msg("[UDP/H3] [%s] 检测到上游连续无回包响应 (可能受 UDP QoS 阻断)，触发顺位切换", carrier_display_name(rt->spec.mode));
-        if (!carrier_switch_next_udp_ip(rt)) {
-            log_msg("[UDP/H3] [%s] 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护双轨候选池", carrier_display_name(rt->spec.mode));
-            carrier_rescan_dual_pools(rt);
-        }
-    }
 }
 
 static void *carrier_udp_thread(void *arg) {
@@ -5905,19 +5567,17 @@ static void *carrier_udp_thread(void *arg) {
 
                 char cur_target_ip[MAX_IP_LEN] = {0};
                 carrier_get_current_udp_ip(rt, cur_target_ip, sizeof(cur_target_ip));
-                /* 严禁降级回退到未通过 QUIC 验证的 TCP IP，确保 UDP 通路纯净 */
                 if (!cur_target_ip[0]) {
-                    continue;
+                    carrier_get_current_ip(rt, cur_target_ip, sizeof(cur_target_ip));
                 }
                 int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
                 if (target_port <= 0) target_port = 443;
 
                 if (cur_target_ip[0]) {
                     pthread_mutex_lock(&rt->udp_mu);
-                    UdpSession *sess = find_or_create_udp_session(rt, &client_ss, (socklen_t)client_len, cur_target_ip, target_port, (uint8_t)buf[0]);
+                    UdpSession *sess = find_or_create_udp_session(rt, &client_ss, (socklen_t)client_len, cur_target_ip, target_port);
                     if (sess && cfnat_socket_valid(sess->upstream_fd)) {
                         sess->last_active_ms = cur_ms;
-                        sess->bytes_up += (uint64_t)n;
                         send(sess->upstream_fd, buf, (size_t)n, 0);
                     }
                     pthread_mutex_unlock(&rt->udp_mu);
@@ -5941,10 +5601,6 @@ static void *carrier_udp_thread(void *arg) {
                         ssize_t n = recv(sess->upstream_fd, buf, UDP_BUF_SIZE, 0);
                         if (n <= 0) break;
                         sess->last_active_ms = cur_ms;
-                        sess->bytes_down += (uint64_t)n;
-                        pthread_mutex_lock(&rt->udp_candidates.mu);
-                        rt->udp_candidates.fast_fail_count = 0;
-                        pthread_mutex_unlock(&rt->udp_candidates.mu);
                         sendto(rt->udp_listen_fd, buf, (size_t)n, 0, (struct sockaddr *)&sess->client_addr, sess->client_addr_len);
                     }
                 }
@@ -5998,6 +5654,20 @@ static socket_t accept_interruptible(socket_t listen_fd, struct sockaddr *addr,
 static void on_signal(int sig) {
     (void)sig;
     atomic_store(&g_running, 0);
+    if (cfnat_socket_valid(g_listen_fd)) {
+        close(g_listen_fd);
+        g_listen_fd = INVALID_SOCKET;
+    }
+    for (size_t i = 0; i < g_carrier_runtime_count; i++) {
+        if (cfnat_socket_valid(g_carrier_runtimes[i].listen_fd)) {
+            close(g_carrier_runtimes[i].listen_fd);
+            g_carrier_runtimes[i].listen_fd = INVALID_SOCKET;
+        }
+        if (cfnat_socket_valid(g_carrier_runtimes[i].udp_listen_fd)) {
+            close(g_carrier_runtimes[i].udp_listen_fd);
+            g_carrier_runtimes[i].udp_listen_fd = INVALID_SOCKET;
+        }
+    }
 }
 
 static void install_signals(void) {
@@ -6166,9 +5836,9 @@ int main(int argc, char **argv) {
                 log_msg("%s 正在监听 %s (双轨分流: TCP/H2 + UDP/H3)，TLS目标端口：%d，非TLS目标端口：%d",
                         carrier_display_name(rt->spec.mode), rt->spec.addr,
                         rt->spec.prof.port, rt->spec.prof.http_port);
-                log_msg("  ├─ [TCP/H2] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
+                log_msg("  ├─ TCP / H2 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
                         rt->candidates.current_ip, rt->candidates.items ? rt->candidates.items[0].latency_ms : 0, rt->candidates.len);
-                log_msg("  └─ [UDP/H3] 最优 IP: %s (QUIC 延迟 %d ms, 候选 %zu 个)",
+                log_msg("  └─ UDP / H3 最优 IP: %s (QUIC 延迟 %d ms, 候选 %zu 个)",
                         rt->udp_candidates.current_ip[0] ? rt->udp_candidates.current_ip : rt->candidates.current_ip,
                         rt->udp_candidates.items ? rt->udp_candidates.items[0].latency_ms : 0, rt->udp_candidates.len);
                 create_small_thread(&rt->health_tid, carrier_health_thread, rt);
@@ -6244,9 +5914,8 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            // 1. 设置 TCP 候选池 (取前 target_ipnum * 2 个扩容池)
-            size_t tcp_target = target_ipnum * 2;
-            size_t tcp_count = carrier_results.len > tcp_target ? tcp_target : carrier_results.len;
+            // 1. 设置 TCP 候选池 (取前 target_ipnum 个)
+            size_t tcp_count = carrier_results.len > target_ipnum ? target_ipnum : carrier_results.len;
             rt->candidates.items = calloc(tcp_count, sizeof(Result));
             if (rt->candidates.items) {
                 memcpy(rt->candidates.items, carrier_results.items, tcp_count * sizeof(Result));
@@ -6258,7 +5927,7 @@ int main(int argc, char **argv) {
                 save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), rt->candidates.items, rt->candidates.len);
             }
 
-            // 2. 设置 UDP 候选池 (多轮滑动检验 + 网段裂变衍生)
+            // 2. 设置 UDP 候选池 (从前 min(carrier_results.len, target_ipnum * 2) 中精筛出 target_ipnum 个)
             ResultList udp_res = filter_udp_candidates_from_tcp(rt, carrier_results.items, carrier_results.len, target_ipnum);
             if (udp_res.len > 0) {
                 rt->udp_candidates.items = udp_res.items;
@@ -6266,9 +5935,6 @@ int main(int argc, char **argv) {
                 carrier_set_current_udp_candidate(rt, 0);
                 atomic_store(&rt->udp_candidates.cache_valid, 1);
                 save_candidate_cache(candidate_cache_file_for_profile_udp(rt->spec.mode, rt->spec.prof.ips_type), udp_res.items, udp_res.len);
-            } else {
-                warn_msg("%s 经过多轮滑动检验，未捕获到有效 UDP/QUIC 节点（当地网络可能阻断境外 UDP 443），绝不使用假节点降级，等待自愈重扫",
-                         carrier_display_name(rt->spec.mode));
             }
 
             free(carrier_results.items);
@@ -6302,9 +5968,9 @@ int main(int argc, char **argv) {
             log_msg("%s 正在监听 %s (双轨分流: TCP/H2 + UDP/H3)，TLS目标端口：%d，非TLS目标端口：%d",
                     carrier_display_name(rt->spec.mode), rt->spec.addr,
                     rt->spec.prof.port, rt->spec.prof.http_port);
-            log_msg("  ├─ [TCP/H2] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
+            log_msg("  ├─ TCP / H2 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
                     rt->candidates.current_ip, rt->candidates.items ? rt->candidates.items[0].latency_ms : 0, rt->candidates.len);
-            log_msg("  └─ [UDP/H3] 最优 IP: %s (QUIC 延迟 %d ms, 候选 %zu 个)",
+            log_msg("  └─ UDP / H3 最优 IP: %s (QUIC 延迟 %d ms, 候选 %zu 个)",
                     rt->udp_candidates.current_ip[0] ? rt->udp_candidates.current_ip : rt->candidates.current_ip,
                     rt->udp_candidates.items ? rt->udp_candidates.items[0].latency_ms : 0, rt->udp_candidates.len);
 
@@ -6359,20 +6025,11 @@ int main(int argc, char **argv) {
             if (rt->udp_health_tid) pthread_join(rt->udp_health_tid, nullptr);
             if (rt->accept_tid) pthread_join(rt->accept_tid, nullptr);
             if (rt->udp_tid) pthread_join(rt->udp_tid, nullptr);
-        }
-        /* 等待所有正在收尾的 TCP 活跃连接线程安全退出，杜绝 UAF */
-        long drain_start = now_ms();
-        while (atomic_load(&g_active_tcp_conns) > 0 && (now_ms() - drain_start) < 2000) {
-            sleep_ms_raw(20);
-        }
-        for (size_t i = 0; i < g_carrier_runtime_count; i++) {
-            CarrierRuntime *rt = &g_carrier_runtimes[i];
             pthread_mutex_lock(&rt->udp_mu);
             UdpSession *s = rt->udp_sessions;
             while (s) {
                 UdpSession *next = s->next;
                 if (cfnat_socket_valid(s->upstream_fd)) close(s->upstream_fd);
-                atomic_fetch_sub(&g_active_udp_sessions, 1);
                 free(s);
                 s = next;
             }
