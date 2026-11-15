@@ -3415,8 +3415,8 @@ static void *scan_worker(void *arg) {
     ScanCtx *ctx = (ScanCtx *)arg;
     EventLoop el = evloop_create();
 
-    /* thread-local 结果积累 */
-#define LOCAL_MAX 256
+    /* thread-local 结果积累 (16 已经足够批量减少互斥锁竞争，同时避免线程栈过度消耗) */
+#define LOCAL_MAX 16
     Result local_results[LOCAL_MAX];
     int local_count = 0;
 
@@ -4330,17 +4330,26 @@ static ResultList scan_ips(StringList *ips, CidrList *cidrs, Config *cfg, BaiduP
             (unsigned long long)total_ips, threads, cfg->num > 0 ? cfg->num : 1, cfg->delay_ms);
     pthread_attr_t scan_attr;
     pthread_attr_init(&scan_attr);
-    pthread_attr_setstacksize(&scan_attr, 64 * 1024);
+    size_t scan_stack_sz = 512 * 1024;
+#if defined(PTHREAD_STACK_MIN)
+    if (scan_stack_sz < (size_t)PTHREAD_STACK_MIN) scan_stack_sz = (size_t)PTHREAD_STACK_MIN;
+#endif
+    pthread_attr_setstacksize(&scan_attr, scan_stack_sz);
     int created = 0;
     for (int i = 0; i < threads; i++) {
         if (pthread_create(&tids[i], &scan_attr, scan_worker, &ctx) != 0) break;
         created++;
     }
     pthread_attr_destroy(&scan_attr);
+    if (created < threads) {
+        debug_msg("系统线程限制或资源受限，实际启动 %d/%d 个并发扫描线程", created, threads);
+    }
     for (int i = 0; i < created; i++) pthread_join(tids[i], nullptr);
     free(tids);
     pthread_mutex_destroy(&rl.mu);
-    qsort(rl.items, rl.len, sizeof(Result), cmp_result);
+    if (rl.items && rl.len > 1) {
+        qsort(rl.items, rl.len, sizeof(Result), cmp_result);
+    }
     if (rl.len > (size_t)cfg->ipnum) rl.len = (size_t)cfg->ipnum;
     log_msg("扫描完成: 有效候选 %zu 个，耗时 %ld 秒", rl.len, (now_ms() - ctx.scan_start_ms) / 1000);
     if (cfg->log_level >= LOG_DEBUG) {
@@ -4531,7 +4540,11 @@ static int create_small_thread(pthread_t *tid, void *(*fn)(void *), void *arg) {
     if (tid) *tid = 0;
     pthread_attr_t attr;
     pthread_attr_init(&attr);
-    pthread_attr_setstacksize(&attr, 64 * 1024);
+    size_t stack_sz = 256 * 1024;
+#if defined(PTHREAD_STACK_MIN)
+    if (stack_sz < (size_t)PTHREAD_STACK_MIN) stack_sz = (size_t)PTHREAD_STACK_MIN;
+#endif
+    pthread_attr_setstacksize(&attr, stack_sz);
     int rc = pthread_create(tid, &attr, fn, arg);
     pthread_attr_destroy(&attr);
     if (rc != 0 && tid) {
