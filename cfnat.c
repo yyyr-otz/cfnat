@@ -680,8 +680,10 @@ static Config g_cfg;
 static Location *g_locations = nullptr;
 static size_t g_location_count = 0;
 static atomic_int g_running = 1;
-static atomic_int g_active_connections = 0;
-static atomic_ullong g_conn_seq = 0;
+static atomic_int g_active_tcp_conns = 0;
+static atomic_ullong g_tcp_conn_seq = 0;
+static atomic_int g_active_udp_sessions = 0;
+static atomic_ullong g_udp_sess_seq = 0;
 static socket_t g_listen_fd = INVALID_SOCKET;
 
 static BaiduProxyPool g_default_proxy_pool = {0};
@@ -2022,6 +2024,37 @@ static inline int sockaddr_equal(const struct sockaddr_storage *a, const struct 
                 memcmp(&a6->sin6_addr, &b6->sin6_addr, sizeof(struct in6_addr)) == 0);
     }
     return 0;
+}
+
+static void format_endpoint_str(const struct sockaddr_storage *ss, char *out, size_t outsz) {
+    if (!ss || !out || outsz == 0) return;
+    out[0] = '\0';
+    if (ss->ss_family == AF_INET) {
+        const struct sockaddr_in *sin = (const struct sockaddr_in *)ss;
+        char ipbuf[INET_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET, &sin->sin_addr, ipbuf, sizeof(ipbuf));
+        snprintf(out, outsz, "%s:%d", ipbuf, ntohs(sin->sin_port));
+    } else if (ss->ss_family == AF_INET6) {
+        const struct sockaddr_in6 *sin6 = (const struct sockaddr_in6 *)ss;
+        char ipbuf[INET6_ADDRSTRLEN] = {0};
+        inet_ntop(AF_INET6, &sin6->sin6_addr, ipbuf, sizeof(ipbuf));
+        snprintf(out, outsz, "[%s]:%d", ipbuf, ntohs(sin6->sin6_port));
+    } else {
+        snprintf(out, outsz, "unknown");
+    }
+}
+
+static void format_bytes(uint64_t b, char *out, size_t outsz) {
+    if (!out || outsz == 0) return;
+    if (b < 1024) {
+        snprintf(out, outsz, "%llu B", (unsigned long long)b);
+    } else if (b < 1024ULL * 1024ULL) {
+        snprintf(out, outsz, "%.1f KB", (double)b / 1024.0);
+    } else if (b < 1024ULL * 1024ULL * 1024ULL) {
+        snprintf(out, outsz, "%.2f MB", (double)b / (1024.0 * 1024.0));
+    } else {
+        snprintf(out, outsz, "%.2f GB", (double)b / (1024.0 * 1024.0 * 1024.0));
+    }
 }
 
 /* RFC 9000 规范的 1200 字节 QUIC Version Negotiation 轻量探针
@@ -4114,17 +4147,17 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
         }
     }
 
-    log_msg("%s 命中候选缓存，快速启动: TCP 最优 IP: %s (%d ms), UDP 最优 IP: %s (%d ms)",
+    log_msg("%s 命中双轨候选缓存，快速启动: [TCP/H2] 最优: %s (%d ms), [UDP/H3] 最优: %s (%d ms)",
             carrier_display_name(rt->spec.mode),
             rt->candidates.current_ip,
             rt->candidates.items ? rt->candidates.items[0].latency_ms : 0,
             rt->udp_candidates.current_ip[0] ? rt->udp_candidates.current_ip : rt->candidates.current_ip,
             rt->udp_candidates.items ? rt->udp_candidates.items[0].latency_ms : 0);
     if (g_cfg.log_level >= LOG_DEBUG) {
-        log_msg("%s [DEBUG] 已载入缓存的 TCP 候选 IP 列表 (共 %zu 个):", carrier_display_name(rt->spec.mode), rt->candidates.len);
+        log_msg("%s [DEBUG] 已载入缓存的 [TCP/H2] 候选 IP 列表 (共 %zu 个):", carrier_display_name(rt->spec.mode), rt->candidates.len);
         print_results_table(rt->candidates.items, rt->candidates.len, 0);
         if (rt->udp_candidates.len > 0) {
-            log_msg("%s [DEBUG] 已载入缓存的 UDP/H3 候选 IP 列表 (共 %zu 个):", carrier_display_name(rt->spec.mode), rt->udp_candidates.len);
+            log_msg("%s [DEBUG] 已载入缓存的 [UDP/H3] 候选 IP 列表 (共 %zu 个):", carrier_display_name(rt->spec.mode), rt->udp_candidates.len);
             print_results_table(rt->udp_candidates.items, rt->udp_candidates.len, 0);
         }
     }
@@ -4402,7 +4435,7 @@ static void *connection_thread(void *arg) {
         client_hello_len = read_tls_client_hello(client, first, client_hello, sizeof(client_hello), cc->delay_ms);
         parse_tls_sni(client_hello, client_hello_len, sni_host, sizeof(sni_host));
     }
-    conn_msg("#%llu %s 识别客户端协议: %s，转发到 IP: %s 端口: %d%s%s",
+    conn_msg("#%llu [TCP/H2] %s 识别客户端协议: %s，转发到 IP: %s 端口: %d%s%s",
              cc->conn_id, cc->client_addr[0] ? cc->client_addr : "unknown",
              is_tls ? "TLS" : "非 TLS", cc->ip, target_port,
              sni_host[0] ? "，SNI: " : "", sni_host[0] ? sni_host : "");
@@ -4416,7 +4449,7 @@ static void *connection_thread(void *arg) {
             if (cfnat_socket_valid(fd)) {
                 upstream = fd;
                 best = lat;
-                conn_msg("#%llu 选择连接: 地址: %s:%d 延迟: %d ms (直连)", cc->conn_id, cc->ip, target_port, best);
+                conn_msg("#%llu [TCP/H2] 选择连接: 地址: %s:%d 延迟: %d ms (直连)", cc->conn_id, cc->ip, target_port, best);
                 break;
             }
         }
@@ -4427,7 +4460,7 @@ static void *connection_thread(void *arg) {
                 if (cfnat_socket_valid(fd)) {
                     upstream = fd;
                     best = lat;
-                    conn_msg("#%llu 选择连接: 地址: %s:%d 延迟: %d ms (百度前置)", cc->conn_id, cc->ip, target_port, best);
+                    conn_msg("#%llu [TCP/H2] 选择连接: 地址: %s:%d 延迟: %d ms (百度前置)", cc->conn_id, cc->ip, target_port, best);
                     break;
                 }
             }
@@ -4440,7 +4473,7 @@ static void *connection_thread(void *arg) {
             if (cfnat_socket_valid(fd)) {
                 upstream = fd;
                 best = lat;
-                conn_msg("#%llu 选择连接: 地址: %s:%d 延迟: %d ms", cc->conn_id, cc->ip, target_port, best);
+                conn_msg("#%llu [TCP/H2] 选择连接: 地址: %s:%d 延迟: %d ms", cc->conn_id, cc->ip, target_port, best);
                 break;
             }
         }
@@ -4452,25 +4485,25 @@ static void *connection_thread(void *arg) {
             char sni_ip[MAX_IP_LEN];
             if (carrier_choose_ip_for_sni(cc->runtime, sni_host, sni_ip, sizeof(sni_ip))) {
                 snprintf(cc->ip, sizeof(cc->ip), "%s", sni_ip);
-                conn_msg("#%llu SNI 故障转移：为 %s 切换到备用 IP %s", cc->conn_id, sni_host, sni_ip);
+                conn_msg("#%llu [TCP/H2] SNI 故障转移：为 %s 切换到备用 IP %s", cc->conn_id, sni_host, sni_ip);
                 // 使用新 IP 重试一次
                 int lat = 0;
                 socket_t fd = dial_target_with_proxy(cc->ip, target_port, cc->delay_ms, cc->proxy_pool, &lat);
                 if (cfnat_socket_valid(fd)) {
                     upstream = fd;
                     best = lat;
-                    conn_msg("#%llu SNI 故障转移成功: 地址: %s:%d 延迟: %d ms", cc->conn_id, cc->ip, target_port, best);
+                    conn_msg("#%llu [TCP/H2] SNI 故障转移成功: 地址: %s:%d 延迟: %d ms", cc->conn_id, cc->ip, target_port, best);
                 }
             }
         }
         if (cfnat_socket_invalid(upstream)) {
-            debug_msg("#%llu 未找到符合延迟要求的连接，关闭客户端连接", cc->conn_id);
+            debug_msg("#%llu [TCP/H2] 未找到符合延迟要求的连接，关闭客户端连接", cc->conn_id);
             goto out;
         }
     }
     if (is_tls && client_hello_len > 0) {
         if (!send_all_timeout(upstream, client_hello, client_hello_len, cc->delay_ms > 0 ? cc->delay_ms : 1000)) {
-            debug_msg("#%llu 转发客户端 ClientHello 失败，关闭连接", cc->conn_id);
+            debug_msg("#%llu [TCP/H2] 转发客户端 ClientHello 失败，关闭连接", cc->conn_id);
             goto out;
         }
     }
@@ -4479,8 +4512,8 @@ static void *connection_thread(void *arg) {
     if (cfnat_socket_valid(upstream)) close(upstream);
     close(client);
     carrier_note_connection_result(cc->runtime, cc->ip, now_ms() - conn_start_ms);
-    int active = atomic_fetch_sub(&g_active_connections, 1) - 1;
-    conn_msg("#%llu 客户端连接关闭，当前活跃连接数: %d", cc->conn_id, active);
+    int active = atomic_fetch_sub(&g_active_tcp_conns, 1) - 1;
+    conn_msg("#%llu [TCP/H2] 客户端连接关闭，当前活跃连接数: %d", cc->conn_id, active);
     free(cc);
     return nullptr;
 }
@@ -4718,7 +4751,7 @@ static int carrier_select_valid_ip(CarrierRuntime *rt) {
         if (carrier_health_check_ip(rt, check_ips[i])) {
             carrier_set_current_candidate(rt, check_indices[i]);
             atomic_store(&rt->candidates.cache_valid, 1);  /* P0-1: 选中有效 IP */
-            log_msg("%s 可用 IP: %s (健康检查端口:%d)", carrier_display_name(rt->spec.mode), check_ips[i], g_cfg.port);
+            log_msg("%s [TCP/H2] 可用 IP: %s (端口: %d)", carrier_display_name(rt->spec.mode), check_ips[i], g_cfg.port);
             return 1;
         }
     }
@@ -4755,7 +4788,7 @@ static int carrier_switch_next_ip(CarrierRuntime *rt) {
         if (carrier_health_check_ip(rt, check_ips[i])) {
             carrier_set_current_candidate(rt, check_indices[i]);
             atomic_store(&rt->candidates.cache_valid, 1);  /* P0-1: 新 IP 有效 */
-            log_msg("%s 顺位切换到下一个最优 TCP IP: %s (候选索引: %zu/%zu)",
+            log_msg("%s [TCP/H2] 顺位切换到下一个最优 IP: %s (候选索引: %zu/%zu)",
                     carrier_display_name(rt->spec.mode), check_ips[i], check_indices[i], total_len);
             return 1;
         }
@@ -4811,7 +4844,7 @@ CFNAT_UNUSED static int carrier_select_valid_udp_ip(CarrierRuntime *rt) {
         if (quic_probe_ip(check_ips[i], target_port, delay_ms, &lat)) {
             carrier_set_current_udp_candidate(rt, check_indices[i]);
             atomic_store(&rt->udp_candidates.cache_valid, 1);
-            log_msg("%s 可用 UDP/H3 IP: %s (QUIC 延迟: %d ms)",
+            log_msg("%s [UDP/H3] 可用 IP: %s (QUIC 延迟: %d ms)",
                     carrier_display_name(rt->spec.mode), check_ips[i], lat);
             return 1;
         }
@@ -4855,7 +4888,7 @@ CFNAT_NODISCARD static int carrier_switch_next_udp_ip(CarrierRuntime *rt) {
         if (quic_probe_ip(check_ips[i], target_port, delay_ms, &lat)) {
             carrier_set_current_udp_candidate(rt, check_indices[i]);
             atomic_store(&rt->udp_candidates.cache_valid, 1);
-            log_msg("%s UDP 顺位切换到下一个最优 IP: %s (候选索引: %zu/%zu, 延迟 %d ms)",
+            log_msg("%s [UDP/H3] 顺位切换到下一个最优 IP: %s (候选索引: %zu/%zu, 延迟 %d ms)",
                     carrier_display_name(rt->spec.mode), check_ips[i], check_indices[i], total_len, lat);
             return 1;
         }
@@ -4881,9 +4914,9 @@ static void carrier_note_connection_result(CarrierRuntime *rt, const char *ip, l
     }
     pthread_mutex_unlock(&rt->candidates.mu);
     if (should_switch) {
-        log_msg("%s 当前 TCP IP %s 连续快速断开，标记为不可用并切换", carrier_display_name(rt->spec.mode), ip);
+        log_msg("%s [TCP/H2] 当前 IP %s 连续快速断开，标记为不可用并顺位切换", carrier_display_name(rt->spec.mode), ip);
         if (!carrier_switch_next_ip(rt)) {
-            log_msg("%s 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护双轨候选池", carrier_display_name(rt->spec.mode));
+            log_msg("%s [TCP/H2] 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护双轨候选池", carrier_display_name(rt->spec.mode));
             carrier_rescan_dual_pools(rt);
         }
     }
@@ -5125,7 +5158,7 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
 
     free(all_candidates.items);
 
-    log_msg("%s 双轨补充自愈完成: TCP 最优: %s (%d ms), UDP/H3 最优: %s (%d ms)",
+    log_msg("%s 双轨补充自愈完成: [TCP/H2] 最优: %s (%d ms), [UDP/H3] 最优: %s (%d ms)",
             carrier_display_name(rt->spec.mode),
             rt->candidates.current_ip, rt->candidates.items ? rt->candidates.items[0].latency_ms : 0,
             rt->udp_candidates.current_ip, rt->udp_candidates.items ? rt->udp_candidates.items[0].latency_ms : 0);
@@ -5158,21 +5191,21 @@ static void *carrier_health_thread(void *arg) {
             fail++;
             consecutive_success = 0;
             atomic_store(&rt->candidates.cache_valid, 0);
-            log_msg("%s TCP 状态检查失败 (%d/2): 当前 IP %s 暂不可用", carrier_display_name(rt->spec.mode), fail, ip[0] ? ip : "为空");
+            log_msg("%s [TCP/H2] 状态检查失败 (%d/2): 当前 IP %s 握手无响应", carrier_display_name(rt->spec.mode), fail, ip[0] ? ip : "为空");
         } else {
             fail = 0;
             consecutive_success++;
             atomic_store(&rt->candidates.cache_valid, 1);
             long n = now_ms();
             if (g_cfg.log_level >= LOG_DEBUG && g_cfg.health_log > 0 && n - last >= g_cfg.health_log * 1000L) {
-                debug_msg("%s TCP 状态检查成功: 当前 IP %s 可用", carrier_display_name(rt->spec.mode), ip);
+                debug_msg("%s [TCP/H2] 状态检查成功: 当前 IP %s 可用", carrier_display_name(rt->spec.mode), ip);
                 last = n;
             }
         }
         if (fail >= 2) {
-            log_msg("%s 连续两次 TCP 状态检查失败，切换到下一个 IP", carrier_display_name(rt->spec.mode));
+            log_msg("%s [TCP/H2] 连续两次状态检查失败，顺位切换下一个候选 IP", carrier_display_name(rt->spec.mode));
             if (!carrier_switch_next_ip(rt)) {
-                log_msg("%s TCP 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护双轨候选池", carrier_display_name(rt->spec.mode));
+                log_msg("%s [TCP/H2] 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护双轨候选池", carrier_display_name(rt->spec.mode));
                 if (!carrier_rescan_dual_pools(rt)) {
                     atomic_store(&g_running, 0);
                     return nullptr;
@@ -5204,24 +5237,24 @@ static void *carrier_udp_health_thread(void *arg) {
         if (!ok) {
             fail++;
             atomic_store(&rt->udp_candidates.cache_valid, 0);
-            log_msg("%s UDP/H3 状态检查失败 (%d/2): 当前 IP %s QUIC 无响应",
+            log_msg("%s [UDP/H3] 状态检查失败 (%d/2): 当前 IP %s QUIC 无响应",
                     carrier_display_name(rt->spec.mode), fail, ip);
         } else {
             fail = 0;
             atomic_store(&rt->udp_candidates.cache_valid, 1);
             long n = now_ms();
             if (g_cfg.log_level >= LOG_DEBUG && g_cfg.health_log > 0 && n - last_log >= g_cfg.health_log * 1000L) {
-                debug_msg("%s UDP/H3 状态检查成功: 当前 IP %s 可用 (延迟 %d ms)",
+                debug_msg("%s [UDP/H3] 状态检查成功: 当前 IP %s 可用 (延迟 %d ms)",
                           carrier_display_name(rt->spec.mode), ip, latency);
                 last_log = n;
             }
         }
 
         if (fail >= 2) {
-            log_msg("%s 连续两次 UDP 状态检查失败，切换到下一个 UDP 候选 IP",
+            log_msg("%s [UDP/H3] 连续两次状态检查失败，顺位切换下一个候选 IP",
                     carrier_display_name(rt->spec.mode));
             if (!carrier_switch_next_udp_ip(rt)) {
-                log_msg("%s UDP 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护双轨候选池",
+                log_msg("%s [UDP/H3] 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护双轨候选池",
                         carrier_display_name(rt->spec.mode));
                 carrier_rescan_dual_pools(rt);
             }
@@ -5259,13 +5292,13 @@ static void *carrier_accept_thread(void *arg) {
             close(cfd);
             continue;
         }
-        int active = atomic_fetch_add(&g_active_connections, 1) + 1;
-        unsigned long long conn_id = atomic_fetch_add(&g_conn_seq, 1) + 1;
-        conn_msg("#%llu %s 客户端连接建立，当前活跃连接数: %d", conn_id, carrier_display_name(rt->spec.mode), active);
+        int active = atomic_fetch_add(&g_active_tcp_conns, 1) + 1;
+        unsigned long long conn_id = atomic_fetch_add(&g_tcp_conn_seq, 1) + 1;
+        conn_msg("#%llu [TCP/H2] %s 客户端连接建立，当前活跃连接数: %d", conn_id, carrier_display_name(rt->spec.mode), active);
         ConnCtx *cc = calloc(1, sizeof(ConnCtx));
         if (!cc) {
             close(cfd);
-            atomic_fetch_sub(&g_active_connections, 1);
+            atomic_fetch_sub(&g_active_tcp_conns, 1);
             continue;
         }
         cc->client_fd = cfd;
@@ -5278,17 +5311,7 @@ static void *carrier_accept_thread(void *arg) {
         cc->runtime = rt;
         cc->use_mixed = (rt->spec.use_baidu_proxy == 2) ? 1 : 0;
         cc->conn_id = conn_id;
-        if (ss.ss_family == AF_INET) {
-            struct sockaddr_in *sin = (struct sockaddr_in *)&ss;
-            char ipbuf[INET_ADDRSTRLEN] = {0};
-            inet_ntop(AF_INET, &sin->sin_addr, ipbuf, sizeof(ipbuf));
-            snprintf(cc->client_addr, sizeof(cc->client_addr), "%s:%d", ipbuf, ntohs(sin->sin_port));
-        } else if (ss.ss_family == AF_INET6) {
-            struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&ss;
-            char ipbuf[INET6_ADDRSTRLEN] = {0};
-            inet_ntop(AF_INET6, &sin6->sin6_addr, ipbuf, sizeof(ipbuf));
-            snprintf(cc->client_addr, sizeof(cc->client_addr), "[%s]:%d", ipbuf, ntohs(sin6->sin6_port));
-        }
+        format_endpoint_str((const struct sockaddr_storage *)&ss, cc->client_addr, sizeof(cc->client_addr));
         pthread_t tid;
         set_tcp_nodelay(cfd);
         create_small_thread(&tid, connection_thread, cc);
@@ -5398,10 +5421,15 @@ static socket_t listen_tcp(const char *addr) {
 struct UdpSession {
     struct sockaddr_storage client_addr;
     socklen_t client_addr_len;
+    char client_addr_str[64];
     socket_t upstream_fd;
     char target_ip[MAX_IP_LEN];
     int target_port;
+    unsigned long long sess_id;
+    long created_ms;
     long last_active_ms;
+    uint64_t bytes_up;
+    uint64_t bytes_down;
     struct UdpSession *next;
 };
 
@@ -5520,7 +5548,7 @@ static socket_t udp_connect_upstream(const char *ip, int port) {
     return fd;
 }
 
-static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct sockaddr_storage *client_addr, socklen_t client_len, const char *target_ip, int target_port) {
+static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct sockaddr_storage *client_addr, socklen_t client_len, const char *target_ip, int target_port, uint8_t first_byte) {
     if (!rt || !client_addr || !target_ip || !*target_ip) return nullptr;
 
     UdpSession *s = rt->udp_sessions;
@@ -5561,6 +5589,13 @@ static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct s
             if (prev_oldest) prev_oldest->next = oldest->next;
             else rt->udp_sessions = oldest->next;
             if (cfnat_socket_valid(oldest->upstream_fd)) close(oldest->upstream_fd);
+            int active = atomic_fetch_sub(&g_active_udp_sessions, 1) - 1;
+            long lifetime_s = (now_ms() - oldest->created_ms) / 1000;
+            char up_s[32] = {0}, down_s[32] = {0};
+            format_bytes(oldest->bytes_up, up_s, sizeof(up_s));
+            format_bytes(oldest->bytes_down, down_s, sizeof(down_s));
+            conn_msg("#%llu [UDP/H3] 客户端连接关闭 (LRU淘汰, 存活 %lds, 上行 %s, 下行 %s)，当前活跃连接数: %d",
+                     oldest->sess_id, lifetime_s > 0 ? lifetime_s : 0, up_s, down_s, active);
             free(oldest);
         }
     }
@@ -5570,6 +5605,7 @@ static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct s
     if (!new_sess) return nullptr;
     memcpy(&new_sess->client_addr, client_addr, client_len);
     new_sess->client_addr_len = client_len;
+    format_endpoint_str(client_addr, new_sess->client_addr_str, sizeof(new_sess->client_addr_str));
     new_sess->upstream_fd = udp_connect_upstream(target_ip, target_port);
     if (cfnat_socket_invalid(new_sess->upstream_fd)) {
         free(new_sess);
@@ -5577,11 +5613,19 @@ static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct s
     }
     snprintf(new_sess->target_ip, sizeof(new_sess->target_ip), "%s", target_ip);
     new_sess->target_port = target_port;
-    new_sess->last_active_ms = now_ms();
+    new_sess->created_ms = now_ms();
+    new_sess->last_active_ms = new_sess->created_ms;
+    new_sess->sess_id = atomic_fetch_add(&g_udp_sess_seq, 1) + 1;
+    int active = atomic_fetch_add(&g_active_udp_sessions, 1) + 1;
     new_sess->next = rt->udp_sessions;
     rt->udp_sessions = new_sess;
 
-    debug_msg("%s 建立新 UDP/H3 会话 -> %s:%d", carrier_display_name(rt->spec.mode), target_ip, target_port);
+    int is_quic = ((first_byte & 0x80) != 0 && (first_byte & 0x40) != 0);
+    conn_msg("#%llu [UDP/H3] %s 客户端连接建立，当前活跃连接数: %d",
+             new_sess->sess_id, carrier_display_name(rt->spec.mode), active);
+    conn_msg("#%llu [UDP/H3] %s 识别客户端协议: %s，转发到 IP: %s 端口: %d",
+             new_sess->sess_id, new_sess->client_addr_str,
+             is_quic ? "QUIC/H3" : "UDP", new_sess->target_ip, new_sess->target_port);
     return new_sess;
 }
 
@@ -5602,6 +5646,13 @@ static void prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
             if (cfnat_socket_valid(del->upstream_fd)) {
                 close(del->upstream_fd);
             }
+            int active = atomic_fetch_sub(&g_active_udp_sessions, 1) - 1;
+            long lifetime_s = (cur_ms - del->created_ms) / 1000;
+            char up_s[32] = {0}, down_s[32] = {0};
+            format_bytes(del->bytes_up, up_s, sizeof(up_s));
+            format_bytes(del->bytes_down, down_s, sizeof(down_s));
+            conn_msg("#%llu [UDP/H3] 客户端连接关闭 (空闲超时, 存活 %lds, 上行 %s, 下行 %s)，当前活跃连接数: %d",
+                     del->sess_id, lifetime_s > 0 ? lifetime_s : 0, up_s, down_s, active);
             free(del);
         } else {
             prev = s;
@@ -5690,9 +5741,10 @@ static void *carrier_udp_thread(void *arg) {
 
                 if (cur_target_ip[0]) {
                     pthread_mutex_lock(&rt->udp_mu);
-                    UdpSession *sess = find_or_create_udp_session(rt, &client_ss, (socklen_t)client_len, cur_target_ip, target_port);
+                    UdpSession *sess = find_or_create_udp_session(rt, &client_ss, (socklen_t)client_len, cur_target_ip, target_port, (uint8_t)buf[0]);
                     if (sess && cfnat_socket_valid(sess->upstream_fd)) {
                         sess->last_active_ms = cur_ms;
+                        sess->bytes_up += (uint64_t)n;
                         send(sess->upstream_fd, buf, (size_t)n, 0);
                     }
                     pthread_mutex_unlock(&rt->udp_mu);
@@ -5716,6 +5768,7 @@ static void *carrier_udp_thread(void *arg) {
                         ssize_t n = recv(sess->upstream_fd, buf, UDP_BUF_SIZE, 0);
                         if (n <= 0) break;
                         sess->last_active_ms = cur_ms;
+                        sess->bytes_down += (uint64_t)n;
                         sendto(rt->udp_listen_fd, buf, (size_t)n, 0, (struct sockaddr *)&sess->client_addr, sess->client_addr_len);
                     }
                 }
@@ -5951,9 +6004,9 @@ int main(int argc, char **argv) {
                 log_msg("%s 正在监听 %s (双轨分流: TCP/H2 + UDP/H3)，TLS目标端口：%d，非TLS目标端口：%d",
                         carrier_display_name(rt->spec.mode), rt->spec.addr,
                         rt->spec.prof.port, rt->spec.prof.http_port);
-                log_msg("  ├─ TCP / H2 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
+                log_msg("  ├─ [TCP/H2] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
                         rt->candidates.current_ip, rt->candidates.items ? rt->candidates.items[0].latency_ms : 0, rt->candidates.len);
-                log_msg("  └─ UDP / H3 最优 IP: %s (QUIC 延迟 %d ms, 候选 %zu 个)",
+                log_msg("  └─ [UDP/H3] 最优 IP: %s (QUIC 延迟 %d ms, 候选 %zu 个)",
                         rt->udp_candidates.current_ip[0] ? rt->udp_candidates.current_ip : rt->candidates.current_ip,
                         rt->udp_candidates.items ? rt->udp_candidates.items[0].latency_ms : 0, rt->udp_candidates.len);
                 create_small_thread(&rt->health_tid, carrier_health_thread, rt);
@@ -6087,9 +6140,9 @@ int main(int argc, char **argv) {
             log_msg("%s 正在监听 %s (双轨分流: TCP/H2 + UDP/H3)，TLS目标端口：%d，非TLS目标端口：%d",
                     carrier_display_name(rt->spec.mode), rt->spec.addr,
                     rt->spec.prof.port, rt->spec.prof.http_port);
-            log_msg("  ├─ TCP / H2 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
+            log_msg("  ├─ [TCP/H2] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
                     rt->candidates.current_ip, rt->candidates.items ? rt->candidates.items[0].latency_ms : 0, rt->candidates.len);
-            log_msg("  └─ UDP / H3 最优 IP: %s (QUIC 延迟 %d ms, 候选 %zu 个)",
+            log_msg("  └─ [UDP/H3] 最优 IP: %s (QUIC 延迟 %d ms, 候选 %zu 个)",
                     rt->udp_candidates.current_ip[0] ? rt->udp_candidates.current_ip : rt->candidates.current_ip,
                     rt->udp_candidates.items ? rt->udp_candidates.items[0].latency_ms : 0, rt->udp_candidates.len);
 
@@ -6149,6 +6202,7 @@ int main(int argc, char **argv) {
             while (s) {
                 UdpSession *next = s->next;
                 if (cfnat_socket_valid(s->upstream_fd)) close(s->upstream_fd);
+                atomic_fetch_sub(&g_active_udp_sessions, 1);
                 free(s);
                 s = next;
             }
