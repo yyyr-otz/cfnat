@@ -3184,6 +3184,39 @@ static void flush_local_results(ResultList *rl, Result *local, int *count) {
     *count = 0;
 }
 
+/* 解析配置中的域名与路径，严格符合 RFC 9112 Section 7.2 规范：Host 头部严禁包含路径 */
+static void parse_domain_and_path(const char *raw_domain, char *out_host, size_t hostsz, char *out_path, size_t pathsz) {
+    if (!out_host || hostsz == 0 || !out_path || pathsz == 0) return;
+    out_host[0] = '\0';
+    out_path[0] = '\0';
+
+    const char *p = raw_domain ? raw_domain : "";
+    while (*p == ' ' || *p == '\t' || *p == '\r' || *p == '\n') p++;
+
+    /* 跳过可能包含的 http:// 或 https:// scheme 前缀 */
+    if (strncasecmp(p, "http://", 7) == 0) {
+        p += 7;
+    } else if (strncasecmp(p, "https://", 8) == 0) {
+        p += 8;
+    }
+
+    const char *slash = strchr(p, '/');
+    if (slash) {
+        size_t hlen = (size_t)(slash - p);
+        if (hlen >= hostsz) hlen = hostsz - 1;
+        memcpy(out_host, p, hlen);
+        out_host[hlen] = '\0';
+        snprintf(out_path, pathsz, "%s", slash);
+    } else {
+        snprintf(out_host, hostsz, "%s", p);
+        snprintf(out_path, pathsz, "/");
+    }
+
+    /* 缺省兜底 */
+    if (!out_host[0]) snprintf(out_host, hostsz, "%s", "cloudflaremirrors.com");
+    if (!out_path[0]) snprintf(out_path, pathsz, "%s", "/");
+}
+
 /* 新 scan_worker：EventLoop + Keep-Alive + thread-local 结果 */
 static void *scan_worker(void *arg) {
     ScanCtx *ctx = (ScanCtx *)arg;
@@ -3193,6 +3226,11 @@ static void *scan_worker(void *arg) {
 #define LOCAL_MAX 256
     Result local_results[LOCAL_MAX];
     int local_count = 0;
+
+    char probe_host[MAX_DOMAIN_LEN];
+    char probe_path[MAX_PATH_LEN];
+    parse_domain_and_path(ctx->cfg->domain, probe_host, sizeof(probe_host), probe_path, sizeof(probe_path));
+    int probe_port = ctx->cfg->http_port > 0 ? ctx->cfg->http_port : 80;
 
     while (atomic_load(&g_running)) {
         size_t idx = atomic_fetch_add(&ctx->index, 1);
@@ -3217,6 +3255,7 @@ static void *scan_worker(void *arg) {
         char best_colo[MAX_COLO_LEN] = {0};
         int header_once = 0;
         int cfray_missing_once = 0;
+        int code_matched = 0;
 
         /* Keep-Alive 复用连接 */
         socket_t fd = INVALID_SOCKET;
@@ -3224,17 +3263,16 @@ static void *scan_worker(void *arg) {
         for (int attempt = 0; atomic_load(&g_running) && attempt < probes; attempt++) {
             if (cfnat_socket_invalid(fd)) {
                 conn_lat = 0;
-                fd = dial_target_with_proxy(ip, 80, ctx->cfg->delay_ms, ctx->proxy_pool, &conn_lat);
+                fd = dial_target_with_proxy(ip, probe_port, ctx->cfg->delay_ms, ctx->proxy_pool, &conn_lat);
                 if (cfnat_socket_invalid(fd)) {
                     atomic_fetch_add(&ctx->connect_fail, 1);
                     continue;
                 }
             }
-            const char *probe_domain = (ctx->cfg->domain[0]) ? ctx->cfg->domain : "cloudflaremirrors.com";
-            char req[512];
+            char req[1024];
             snprintf(req, sizeof(req),
-                     "HEAD / HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n",
-                     probe_domain);
+                     "HEAD %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n",
+                     probe_path, probe_host);
 
             long t_start = now_ms();
             send(fd, req, strlen(req), 0);
@@ -3254,6 +3292,17 @@ static void *scan_worker(void *arg) {
             if (cfnat_strcasestr(hdr, "Connection: close")) {
                 close(fd);
                 fd = INVALID_SOCKET;
+            }
+
+            int resp_code = extract_http_status_code(hdr);
+            if (ctx->cfg->code > 0) {
+                if (resp_code == ctx->cfg->code) {
+                    code_matched = 1;
+                } else if (resp_code != 405) {
+                    /* 非 405 的状态码不匹配（如 400、403、502）判定失败并跳过当前探测 */
+                    atomic_fetch_add(&ctx->http_code_mismatch, 1);
+                    continue;
+                }
             }
 
             char colo[MAX_COLO_LEN] = {0};
@@ -3296,7 +3345,7 @@ static void *scan_worker(void *arg) {
 
         int avg_latency = success_count > 0 ? (total_latency / success_count) : 0;
 
-        if (success_count <= 0 && header_once && cfray_missing_once && !ctx->cfg->colo[0] && (!ctx->proxy_pool || ctx->proxy_pool->len == 0)) {
+        if (ctx->cfg->code <= 0 && success_count <= 0 && header_once && cfray_missing_once && !ctx->cfg->colo[0] && (!ctx->proxy_pool || ctx->proxy_pool->len == 0)) {
             success_count = 1;
             if (best_latency == 0) best_latency = ctx->cfg->delay_ms > 0 ? ctx->cfg->delay_ms : 1;
             if (avg_latency <= 0) avg_latency = best_latency;
@@ -3329,38 +3378,19 @@ static void *scan_worker(void *arg) {
         }
         if (success_count <= 0 || !best_colo[0] || avg_latency <= 0 || (ctx->cfg->delay_ms > 0 && avg_latency > ctx->cfg->delay_ms)) continue;
 
-        /* 若显式指定了 code (code > 0)，在测试延迟获得可连通 IP 后，对候选 IP 测试目标 HTTP 状态码；缺省 code <= 0 时不测 */
-        if (ctx->cfg->code > 0) {
+        /* 若显式指定了 code (code > 0)，且初筛未完全确认（例如 HEAD 返回 405），使用 GET 做二次状态码校验 */
+        if (ctx->cfg->code > 0 && !code_matched) {
             int target_code = ctx->cfg->code;
-            int check_port = ctx->cfg->http_port > 0 ? ctx->cfg->http_port : 80;
-            char req_domain[MAX_DOMAIN_LEN];
-            char req_path[MAX_PATH_LEN];
-            req_domain[0] = '\0';
-            req_path[0] = '\0';
-            const char *dom_slash = strchr(ctx->cfg->domain, '/');
-            if (dom_slash) {
-                size_t dlen = (size_t)(dom_slash - ctx->cfg->domain);
-                if (dlen >= sizeof(req_domain)) dlen = sizeof(req_domain) - 1;
-                memcpy(req_domain, ctx->cfg->domain, dlen);
-                req_domain[dlen] = '\0';
-                snprintf(req_path, sizeof(req_path), "%s", dom_slash);
-            } else {
-                snprintf(req_domain, sizeof(req_domain), "%s", ctx->cfg->domain[0] ? ctx->cfg->domain : "cloudflaremirrors.com");
-                snprintf(req_path, sizeof(req_path), "/");
-            }
-            if (!req_domain[0]) snprintf(req_domain, sizeof(req_domain), "cloudflaremirrors.com");
-            if (!req_path[0]) snprintf(req_path, sizeof(req_path), "/");
-
-            socket_t check_fd = dial_target_with_proxy(ip, check_port, ctx->cfg->delay_ms, ctx->proxy_pool, nullptr);
+            socket_t check_fd = dial_target_with_proxy(ip, probe_port, ctx->cfg->delay_ms, ctx->proxy_pool, nullptr);
             if (cfnat_socket_invalid(check_fd)) {
-                debug_msg("IP %s 状态码二次校验失败: 无法连接端口 %d", ip, check_port);
+                debug_msg("IP %s 状态码二次校验失败: 无法连接端口 %d", ip, probe_port);
                 atomic_fetch_add(&ctx->http_code_mismatch, 1);
                 continue;
             }
             char check_req[1024];
             snprintf(check_req, sizeof(check_req),
                      "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n",
-                     req_path, req_domain);
+                     probe_path, probe_host);
             send(check_fd, check_req, strlen(check_req), 0);
             char check_hdr[4096];
             int chk_n = recv_headers_ev(check_fd, check_hdr, sizeof(check_hdr), ctx->cfg->delay_ms > 2000 ? ctx->cfg->delay_ms : 2000, &el);
@@ -3404,9 +3434,27 @@ static void *scan_worker(void *arg) {
             const char *c_loc = use_color ? ANSI_YELLOW : "";
             const char *c_ms = use_color ? ANSI_GREEN : "";
             const char *reset = use_color ? ANSI_RESET : "";
+            char loc_buf[128];
+            if (r.city[0] && strcmp(r.city, "Unknown") != 0) {
+                if (r.data_center[0] && strcmp(r.data_center, "UNK") != 0) {
+                    snprintf(loc_buf, sizeof(loc_buf), "%s (%s)", r.city, r.data_center);
+                } else {
+                    snprintf(loc_buf, sizeof(loc_buf), "%s", r.city);
+                }
+            } else if (r.region[0] && strcmp(r.region, "Unknown") != 0) {
+                if (r.data_center[0] && strcmp(r.data_center, "UNK") != 0) {
+                    snprintf(loc_buf, sizeof(loc_buf), "%s (%s)", r.region, r.data_center);
+                } else {
+                    snprintf(loc_buf, sizeof(loc_buf), "%s", r.region);
+                }
+            } else if (r.data_center[0] && strcmp(r.data_center, "UNK") != 0) {
+                snprintf(loc_buf, sizeof(loc_buf), "%s", r.data_center);
+            } else {
+                snprintf(loc_buf, sizeof(loc_buf), "Unknown");
+            }
             debug_msg("发现有效IP %s%s%s 位置信息 %s%s%s 延迟 %s%d%s 毫秒",
                       c_ip, r.ip, reset,
-                      c_loc, r.city[0] ? r.city : (r.region[0] ? r.region : "未知"), reset,
+                      c_loc, loc_buf, reset,
                       c_ms, r.latency_ms, reset);
         }
 
