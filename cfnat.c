@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.13"
+#define CFNAT_VERSION "0.0.14"
 
 /* =========================================================================
  * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
@@ -862,12 +862,13 @@ static void vlog_line(const char *tag, const char *fmt, va_list ap) {
         else tag_color = ANSI_CYAN;
     }
 
-    char raw_msg[4096];
+    /* 紧凑栈帧：常规日志行长 < 200 字节，1KB/2KB 缓冲比原 12KB 栈帧缩减 75% 消耗 */
+    char raw_msg[1024];
     int n = vsnprintf(raw_msg, sizeof(raw_msg), fmt, ap);
     if (n < 0) return;
 
     /* 单一完整行缓冲输出，彻底杜绝并发日志交错与字符截断 */
-    char line_buf[8192];
+    char line_buf[2048];
     size_t out_len = 0;
 
     int prefix_len = snprintf(line_buf, sizeof(line_buf), "%s%s%s [%s%s%s] ",
@@ -3774,12 +3775,11 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
                                int timeout_ms, QuicProbeItem *items, size_t count, size_t needed_responses) {
     if (!items || count == 0) return 0;
 
-    uint8_t pkt[1200];
-    memset(pkt, 0, sizeof(pkt));
-    pkt[0] = 0xC0;
-    pkt[1] = 0x5A; pkt[2] = 0x5A; pkt[3] = 0x5A; pkt[4] = 0x5A;
-    pkt[5] = 0x08; /* DCID Len */
-    pkt[14] = 0x08; /* SCID Len */
+    /* C23 thread_local 预格式化探针模板，零栈分配、零每轮 memset 清零开销 */
+    static thread_local uint8_t pkt[1200] = {
+        0xC0, 0x5A, 0x5A, 0x5A, 0x5A, 0x08,
+        [14] = 0x08
+    };
 
     uint32_t seed = (uint32_t)now_ms();
     memcpy(pkt + 6, &seed, 4);
@@ -5357,7 +5357,6 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
         pthread_mutex_unlock(&rt->candidates.mu);
         free(old_tcp_items);
         atomic_store(&rt->candidates.cache_valid, 1);
-        save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), new_tcp_items, tcp_count);
     }
 
     /* 4. 分发给 UDP 候选池 (多轮滑动检验 + 网段裂变衍生) */
@@ -5376,10 +5375,17 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
         pthread_mutex_unlock(&rt->udp_candidates.mu);
         free(old_udp_items);
         atomic_store(&rt->udp_candidates.cache_valid, 1);
-        save_candidate_cache(candidate_cache_file_for_profile_udp(rt->spec.mode, rt->spec.prof.ips_type), udp_res.items, udp_res.len);
     }
 
     free(all_candidates.items);
+
+    /* 内存结构与旧指针已纯粹就绪并安全释放，最后异步/脱锁落盘候选文件，杜绝磁盘 I/O 阻塞内存清理 */
+    if (new_tcp_items) {
+        save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), new_tcp_items, tcp_count);
+    }
+    if (udp_res.len > 0) {
+        save_candidate_cache(candidate_cache_file_for_profile_udp(rt->spec.mode, rt->spec.prof.ips_type), udp_res.items, udp_res.len);
+    }
 
     int tcp_lat = (rt->candidates.items && rt->candidates.current_index < rt->candidates.len) ?
                   rt->candidates.items[rt->candidates.current_index].latency_ms : 0;
