@@ -380,6 +380,12 @@ typedef struct {
     pthread_mutex_t results_mu;
     Config *cfg;
     BaiduProxyPool *proxy_pool;
+    char head_req[1024];
+    int head_req_len;
+    char get_req[1024];
+    int get_req_len;
+    int probe_port;
+    int hdr_timeout;
 } ScanCtx;
 
 
@@ -2188,6 +2194,9 @@ CFNAT_NODISCARD static int quic_probe_ip(const char *ip, int port, int timeout_m
     return 0;
 }
 
+/* 读取 HTTP 响应头部直到 \r\n\r\n。
+ * 返回值语义：成功时返回 HTTP 头部长度（偏移量 > 0），超时或未读到完整头部返回 -1。
+ * 注意：返回值仅代表头部结束位置，不用于统计实际套接字总接收字节数。 */
 static int recv_headers(socket_t fd, char *buf, size_t bufsz, int timeout_ms) {
     size_t used = 0;
     size_t search_pos = 0;
@@ -3258,24 +3267,13 @@ static void *scan_worker(void *arg) {
     Result local_results[LOCAL_MAX];
     int local_count = 0;
 
-    char probe_host[MAX_DOMAIN_LEN];
-    char probe_path[MAX_PATH_LEN];
-    parse_domain_and_path(ctx->cfg->domain, probe_host, sizeof(probe_host), probe_path, sizeof(probe_path));
-    int probe_port = ctx->cfg->http_port > 0 ? ctx->cfg->http_port : 80;
-
-    int hdr_timeout = ctx->cfg->delay_ms > 0 ? ctx->cfg->delay_ms * 2 : 1000;
-    if (hdr_timeout < 500) hdr_timeout = 500;
-    if (hdr_timeout > 1500) hdr_timeout = 1500;
-
-    /* 常量请求报文外提，杜绝内层循环数十万次重复 snprintf 与 strlen */
-    char head_req[1024];
-    int head_req_len = snprintf(head_req, sizeof(head_req),
-                                "HEAD %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n",
-                                probe_path, probe_host);
-    char get_req[1024];
-    int get_req_len = snprintf(get_req, sizeof(get_req),
-                               "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n",
-                               probe_path, probe_host);
+    /* 从 ScanCtx 直接获取预构建的请求模板与参数，彻底消灭每个工作线程重复的域名拆分与 snprintf 格式化 */
+    const char *head_req = ctx->head_req;
+    int head_req_len = ctx->head_req_len;
+    const char *get_req = ctx->get_req;
+    int get_req_len = ctx->get_req_len;
+    int probe_port = ctx->probe_port;
+    int hdr_timeout = ctx->hdr_timeout;
 
     while (atomic_load(&g_running)) {
         size_t idx = atomic_fetch_add(&ctx->index, 1);
@@ -3795,20 +3793,31 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
         socket_t sfd = is_v6 ? fd6 : fd4;
         if (cfnat_socket_invalid(sfd)) continue;
 
-        if (is_v6) {
-            struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&items[i].addr;
-            memset(sa6, 0, sizeof(*sa6));
-            sa6->sin6_family = AF_INET6;
-            sa6->sin6_port = htons((uint16_t)target_port);
-            inet_pton(AF_INET6, items[i].res.ip, &sa6->sin6_addr);
-            items[i].addr_len = sizeof(struct sockaddr_in6);
+        if (items[i].addr_len > 0) {
+            if (is_v6) ((struct sockaddr_in6 *)&items[i].addr)->sin6_port = htons((uint16_t)target_port);
+            else ((struct sockaddr_in *)&items[i].addr)->sin_port = htons((uint16_t)target_port);
+        } else if (items[i].res.addr_len > 0) {
+            items[i].addr = items[i].res.addr;
+            items[i].addr_len = items[i].res.addr_len;
+            if (is_v6) ((struct sockaddr_in6 *)&items[i].addr)->sin6_port = htons((uint16_t)target_port);
+            else ((struct sockaddr_in *)&items[i].addr)->sin_port = htons((uint16_t)target_port);
         } else {
-            struct sockaddr_in *sa4 = (struct sockaddr_in *)&items[i].addr;
-            memset(sa4, 0, sizeof(*sa4));
-            sa4->sin_family = AF_INET;
-            sa4->sin_port = htons((uint16_t)target_port);
-            inet_pton(AF_INET, items[i].res.ip, &sa4->sin_addr);
-            items[i].addr_len = sizeof(struct sockaddr_in);
+            /* 预解析缺失时的安全兜底 */
+            if (is_v6) {
+                struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&items[i].addr;
+                memset(sa6, 0, sizeof(*sa6));
+                sa6->sin6_family = AF_INET6;
+                sa6->sin6_port = htons((uint16_t)target_port);
+                inet_pton(AF_INET6, items[i].res.ip, &sa6->sin6_addr);
+                items[i].addr_len = sizeof(struct sockaddr_in6);
+            } else {
+                struct sockaddr_in *sa4 = (struct sockaddr_in *)&items[i].addr;
+                memset(sa4, 0, sizeof(*sa4));
+                sa4->sin_family = AF_INET;
+                sa4->sin_port = htons((uint16_t)target_port);
+                inet_pton(AF_INET, items[i].res.ip, &sa4->sin_addr);
+                items[i].addr_len = sizeof(struct sockaddr_in);
+            }
         }
 
         uint32_t scid = seed ^ (uint32_t)(i + 1);
@@ -3973,6 +3982,8 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
         memset(probe_items, 0, sizeof(probe_items));
         for (size_t i = 0; i < cur_len; i++) {
             probe_items[i].res = tcp_results[offset + i];
+            probe_items[i].addr = probe_items[i].res.addr;
+            probe_items[i].addr_len = probe_items[i].res.addr_len;
         }
 
         size_t needed = desired_count - udp_res.len;
@@ -4026,6 +4037,8 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
                         derived_items[derived_count].res = *base_seed;
                         snprintf(derived_items[derived_count].res.ip, sizeof(derived_items[derived_count].res.ip), "%s", sibling_ip);
                         result_init_addr(&derived_items[derived_count].res);
+                        derived_items[derived_count].addr = derived_items[derived_count].res.addr;
+                        derived_items[derived_count].addr_len = derived_items[derived_count].res.addr_len;
                         derived_count++;
                     }
                 }
@@ -4199,6 +4212,14 @@ static ResultList scan_ips(StringList *ips, CidrList *cidrs, Config *cfg, BaiduP
     if (!tids) {
         return rl;
     }
+    char probe_host[MAX_DOMAIN_LEN];
+    char probe_path[MAX_PATH_LEN];
+    parse_domain_and_path(cfg->domain, probe_host, sizeof(probe_host), probe_path, sizeof(probe_path));
+    int probe_port = cfg->http_port > 0 ? cfg->http_port : 80;
+    int hdr_timeout = cfg->delay_ms > 0 ? cfg->delay_ms * 2 : 1000;
+    if (hdr_timeout < 500) hdr_timeout = 500;
+    if (hdr_timeout > 1500) hdr_timeout = 1500;
+
     ScanCtx ctx = {
         .ips = ips ? ips->items : nullptr,
         .cidrs = cidrs,
@@ -4206,8 +4227,16 @@ static ResultList scan_ips(StringList *ips, CidrList *cidrs, Config *cfg, BaiduP
         .results = &rl,
         .cfg = cfg,
         .proxy_pool = proxy_pool,
-        .scan_start_ms = now_ms()
+        .scan_start_ms = now_ms(),
+        .probe_port = probe_port,
+        .hdr_timeout = hdr_timeout
     };
+    ctx.head_req_len = snprintf(ctx.head_req, sizeof(ctx.head_req),
+                                "HEAD %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: keep-alive\r\n\r\n",
+                                probe_path, probe_host);
+    ctx.get_req_len = snprintf(ctx.get_req, sizeof(ctx.get_req),
+                               "GET %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n",
+                               probe_path, probe_host);
     pthread_mutex_init(&ctx.results_mu, nullptr);
     atomic_init(&ctx.index, 0);
     atomic_init(&ctx.completed, 0);
@@ -5317,7 +5346,7 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
     if (new_tcp_items) {
         memcpy(new_tcp_items, all_candidates.items, tcp_count * sizeof(Result));
         pthread_mutex_lock(&rt->candidates.mu);
-        free(rt->candidates.items);
+        Result *old_tcp_items = rt->candidates.items;
         rt->candidates.items = new_tcp_items;
         rt->candidates.len = tcp_count;
         rt->candidates.current_index = 0;
@@ -5326,6 +5355,7 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
         rt->candidates.current_addr_len = new_tcp_items[0].addr_len;
         atomic_store_explicit(&rt->candidates.fast_fail_count, 0, memory_order_relaxed);
         pthread_mutex_unlock(&rt->candidates.mu);
+        free(old_tcp_items);
         atomic_store(&rt->candidates.cache_valid, 1);
         save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), new_tcp_items, tcp_count);
     }
@@ -5335,7 +5365,7 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
         filter_udp_candidates_from_tcp(rt, all_candidates.items, all_candidates.len, target_ipnum);
     if (udp_res.len > 0) {
         pthread_mutex_lock(&rt->udp_candidates.mu);
-        free(rt->udp_candidates.items);
+        Result *old_udp_items = rt->udp_candidates.items;
         rt->udp_candidates.items = udp_res.items;
         rt->udp_candidates.len = udp_res.len;
         rt->udp_candidates.current_index = 0;
@@ -5344,6 +5374,7 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
         rt->udp_candidates.current_addr_len = udp_res.items[0].addr_len;
         atomic_store_explicit(&rt->udp_candidates.fast_fail_count, 0, memory_order_relaxed);
         pthread_mutex_unlock(&rt->udp_candidates.mu);
+        free(old_udp_items);
         atomic_store(&rt->udp_candidates.cache_valid, 1);
         save_candidate_cache(candidate_cache_file_for_profile_udp(rt->spec.mode, rt->spec.prof.ips_type), udp_res.items, udp_res.len);
     }
@@ -5946,9 +5977,8 @@ static void *carrier_udp_thread(void *arg) {
     CarrierRuntime *rt = (CarrierRuntime *)arg;
     if (!rt || cfnat_socket_invalid(rt->udp_listen_fd)) return nullptr;
 
-    char *buf = (char *)malloc(UDP_BUF_SIZE);
-    if (!buf) return nullptr;
-
+    /* C23 thread_local 线程局部缓冲区，零堆分配、零内存碎片、无小线程栈溢出隐患 */
+    static thread_local char buf[UDP_BUF_SIZE];
     long last_prune_ms = now_ms();
 
     while (atomic_load(&g_running)) {
@@ -6086,7 +6116,6 @@ static void *carrier_udp_thread(void *arg) {
         }
     }
 
-    free(buf);
     return nullptr;
 }
 
