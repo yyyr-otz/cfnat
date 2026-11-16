@@ -109,6 +109,14 @@
 typedef SOCKET socket_t;
 CFNAT_NODISCARD static inline int cfnat_socket_valid(socket_t s) { return s != INVALID_SOCKET; }
 CFNAT_NODISCARD static inline int cfnat_socket_invalid(socket_t s) { return s == INVALID_SOCKET; }
+CFNAT_NODISCARD static inline bool cfnat_is_transient_error(int err) {
+    return (err == WSAECONNRESET || err == WSAENETRESET ||
+            err == WSAEHOSTUNREACH || err == WSAENETUNREACH ||
+            err == WSAECONNREFUSED || err == WSAEINTR);
+}
+CFNAT_NODISCARD static inline bool cfnat_last_socket_transient(void) {
+    return cfnat_is_transient_error(WSAGetLastError());
+}
 #else
 typedef int socket_t;
 #ifndef INVALID_SOCKET
@@ -119,6 +127,13 @@ typedef int socket_t;
 #endif
 CFNAT_NODISCARD static inline int cfnat_socket_valid(socket_t s) { return s >= 0; }
 CFNAT_NODISCARD static inline int cfnat_socket_invalid(socket_t s) { return s < 0; }
+CFNAT_NODISCARD static inline bool cfnat_is_transient_error(int err) {
+    return (err == ECONNREFUSED || err == EHOSTUNREACH ||
+            err == ENETUNREACH || err == ECONNRESET || err == EINTR);
+}
+CFNAT_NODISCARD static inline bool cfnat_last_socket_transient(void) {
+    return cfnat_is_transient_error(errno);
+}
 #endif
 
 /* 跨平台单套接字超时轮询（替代 select，突破 FD_SETSIZE 1024 限制）
@@ -3877,16 +3892,8 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
 #endif
                 ssize_t n = recvfrom(rfd, resp, sizeof(resp), 0, (struct sockaddr *)&from, &fromlen);
                 if (n < 0) {
-                    if (errno == EINTR) continue;
-#ifdef _WIN32
-                    int werr = WSAGetLastError();
-                    if (werr == WSAECONNRESET || werr == WSAENETRESET ||
-                        werr == WSAEHOSTUNREACH || werr == WSAENETUNREACH || werr == WSAECONNREFUSED) continue;
-#else
-                    /* 仅在网络瞬态错误时消费并继续读取队列后续报文，杜绝 EBADF/ENOTSOCK 等致命错误导致死循环 */
-                    if (errno == ECONNREFUSED || errno == EHOSTUNREACH ||
-                        errno == ENETUNREACH || errno == ECONNRESET) continue;
-#endif
+                    /* 仅在网络瞬态与中断错误时消费并继续读取队列后续报文，杜绝致命错误导致死循环 */
+                    if (cfnat_last_socket_transient()) continue;
                     break;
                 }
                 if (n <= 0) break;
