@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.12"
+#define CFNAT_VERSION "0.0.13"
 
 /* =========================================================================
  * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
