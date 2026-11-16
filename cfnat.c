@@ -374,170 +374,7 @@ typedef struct {
     BaiduProxyPool *proxy_pool;
 } ScanCtx;
 
-/* ── EventLoop 抽象层 ──────────────────────────────────────── */
-static void warn_msg(const char *fmt, ...);
-static void debug_msg(const char *fmt, ...);
-/* 事件驱动 I/O 抽象，Linux 用 epoll，macOS 用 kqueue，其他用 select() 回退 */
 
-#define EV_READ  1
-#define EV_WRITE 2
-
-struct evloop_event {
-    socket_t fd;
-    int events;   /* EV_READ | EV_WRITE */
-};
-
-typedef struct {
-    int epoll_fd;   /* Linux: epoll fd; macOS: kqueue fd; <0 = select fallback */
-    socket_t watched_fd;
-    int watched_events;
-} EventLoop;
-
-/* 创建事件循环实例 */
-static EventLoop evloop_create(void) {
-    EventLoop el;
-    el.epoll_fd = -1;
-    el.watched_fd = INVALID_SOCKET;
-    el.watched_events = 0;
-#if defined(__linux__)
-    el.epoll_fd = epoll_create1(0);
-    if (el.epoll_fd < 0) {
-        warn_msg("epoll_create1 失败 (%s)，回退到 select()", strerror(errno));
-    }
-#elif defined(__APPLE__)
-    el.epoll_fd = kqueue();
-    if (el.epoll_fd < 0) {
-        warn_msg("kqueue 失败 (%s)，回退到 select()", strerror(errno));
-    }
-#endif
-    return el;
-}
-
-/* 销毁事件循环 */
-static void evloop_destroy(EventLoop *el) {
-    if (!el) return;
-#if defined(__linux__) || defined(__APPLE__)
-    if (el->epoll_fd >= 0) {
-        close(el->epoll_fd);
-        el->epoll_fd = -1;
-    }
-#else
-    (void)el;
-#endif
-    el->watched_fd = INVALID_SOCKET;
-    el->watched_events = 0;
-}
-
-/* 注册 fd 的可读/可写事件 */
-static int evloop_add(EventLoop *el, socket_t fd, int events) {
-    if (!el) return -1;
-    el->watched_fd = fd;
-    el->watched_events = events;
-#if defined(__linux__)
-    if (el->epoll_fd >= 0) {
-        struct epoll_event ev;
-        memset(&ev, 0, sizeof(ev));
-        ev.data.fd = fd;
-        if (events & EV_READ)  ev.events |= EPOLLIN;
-        if (events & EV_WRITE) ev.events |= EPOLLOUT;
-        /* 水平触发：兼容阻塞与非阻塞模式，杜绝事件遗漏与挂起 */
-        return epoll_ctl(el->epoll_fd, EPOLL_CTL_ADD, fd, &ev);
-    }
-#elif defined(__APPLE__)
-    if (el->epoll_fd >= 0) {
-        struct kevent kev[2];
-        int n = 0;
-        if (events & EV_READ)
-            EV_SET(&kev[n++], fd, EVFILT_READ, EV_ADD | EV_ENABLE, 0, 0, nullptr);
-        if (events & EV_WRITE)
-            EV_SET(&kev[n++], fd, EVFILT_WRITE, EV_ADD | EV_ENABLE, 0, 0, nullptr);
-        return kevent(el->epoll_fd, kev, n, nullptr, 0, nullptr);
-    }
-#endif
-    /* select fallback: 无需注册，wait 时动态构造 fd_set */
-    (void)fd;
-    (void)events;
-    return 0;
-}
-
-/* 从事件循环中移除 fd */
-static int evloop_del(EventLoop *el, socket_t fd) {
-    if (!el) return -1;
-    if (el->watched_fd == fd) {
-        el->watched_fd = INVALID_SOCKET;
-        el->watched_events = 0;
-    }
-#if defined(__linux__)
-    if (el->epoll_fd >= 0) {
-        struct epoll_event ev;
-        memset(&ev, 0, sizeof(ev));
-        return epoll_ctl(el->epoll_fd, EPOLL_CTL_DEL, fd, &ev);
-    }
-#elif defined(__APPLE__)
-    if (el->epoll_fd >= 0) {
-        struct kevent kev[2];
-        int n = 0;
-        EV_SET(&kev[n++], fd, EVFILT_READ, EV_DELETE, 0, 0, nullptr);
-        EV_SET(&kev[n++], fd, EVFILT_WRITE, EV_DELETE, 0, 0, nullptr);
-        return kevent(el->epoll_fd, kev, n, nullptr, 0, nullptr);
-    }
-#endif
-    (void)fd;
-    return 0;
-}
-
-/* 跨平台事件轮询回退实现，支持 Windows/非 epoll 平台事件等待（突破 FD_SETSIZE 限制） */
-static int evloop_wait_select(EventLoop *el, struct evloop_event *evs, int maxevents, int timeout_ms) {
-    if (!el || !evs || maxevents <= 0 || cfnat_socket_invalid(el->watched_fd)) return -1;
-    int ptype = 0;
-    if (el->watched_events & EV_READ)  ptype |= 1;
-    if (el->watched_events & EV_WRITE) ptype |= 2;
-    int rc = cfnat_poll_single(el->watched_fd, ptype, timeout_ms);
-    if (rc <= 0) return rc;
-    evs[0].fd = el->watched_fd;
-    evs[0].events = el->watched_events;
-    return 1;
-}
-
-/* 等待事件，返回就绪 fd 数量和具体事件 */
-static int evloop_wait(EventLoop *el, struct evloop_event *evs, int maxevents, int timeout_ms) {
-    if (!el || !evs || maxevents <= 0) return -1;
-#if defined(__linux__)
-    if (el->epoll_fd >= 0) {
-        struct epoll_event epevs[64];
-        int n = epoll_wait(el->epoll_fd, epevs, maxevents > 64 ? 64 : maxevents, timeout_ms);
-        if (n < 0) return -1;
-        for (int i = 0; i < n && i < maxevents; i++) {
-            evs[i].fd = epevs[i].data.fd;
-            evs[i].events = 0;
-            if (epevs[i].events & (EPOLLIN | EPOLLHUP | EPOLLERR)) evs[i].events |= EV_READ;
-            if (epevs[i].events & EPOLLOUT) evs[i].events |= EV_WRITE;
-        }
-        return n;
-    }
-#elif defined(__APPLE__)
-    if (el->epoll_fd >= 0) {
-        struct kevent kevs[64];
-        struct timespec ts;
-        ts.tv_sec = timeout_ms / 1000;
-        ts.tv_nsec = (long)(timeout_ms % 1000) * 1000000L;
-        int n = kevent(el->epoll_fd, nullptr, 0, kevs, maxevents > 64 ? 64 : maxevents, &ts);
-        if (n < 0) return -1;
-        for (int i = 0; i < n && i < maxevents; i++) {
-            evs[i].fd = (socket_t)kevs[i].ident;
-            evs[i].events = 0;
-            if (kevs[i].filter == EVFILT_READ) evs[i].events |= EV_READ;
-            if (kevs[i].filter == EVFILT_WRITE) evs[i].events |= EV_WRITE;
-            if (kevs[i].flags & (EV_EOF | EV_ERROR)) evs[i].events |= EV_READ;
-        }
-        return n;
-    }
-#endif
-    /* select fallback */
-    return evloop_wait_select(el, evs, maxevents, timeout_ms);
-}
-
-/* ── EventLoop 抽象层结束 ──────────────────────────────────── */
 
 static long now_ms(void);
 static void log_msg(const char *fmt, ...);
@@ -2550,81 +2387,6 @@ static int parse_tls_sni(const unsigned char *buf, size_t len, char *out, size_t
     return 0;
 }
 
-/* ── EventLoop 版 I/O 函数 ─────────────────────────────────── */
-/* 基于 EventLoop 的 TCP 连接，替代 tcp_connect 中的 select() */
-static socket_t tcp_connect_ev(const char *ip, int port, int timeout_ms, int *latency_ms, EventLoop *el) __attribute__((unused));
-static socket_t tcp_connect_ev(const char *ip, int port, int timeout_ms, int *latency_ms, EventLoop *el) {
-    long start = now_ms();
-    int family = strchr(ip, ':') ? AF_INET6 : AF_INET;
-    socket_t fd = socket(family, SOCK_STREAM, 0);
-    if (cfnat_socket_invalid(fd)) return INVALID_SOCKET;
-    if (bind_socket_to_interface(fd, family) != 0) {
-        int err = errno;
-        close(fd);
-        errno = err;
-        return INVALID_SOCKET;
-    }
-    set_nonblock(fd, 1);
-    int rc;
-    if (family == AF_INET6) {
-        struct sockaddr_in6 sa6;
-        memset(&sa6, 0, sizeof(sa6));
-        sa6.sin6_family = AF_INET6;
-        sa6.sin6_port = htons((uint16_t)port);
-        if (inet_pton(AF_INET6, ip, &sa6.sin6_addr) != 1) { close(fd); return INVALID_SOCKET; }
-        rc = connect(fd, (struct sockaddr *)&sa6, sizeof(sa6));
-    } else {
-        struct sockaddr_in sa;
-        memset(&sa, 0, sizeof(sa));
-        sa.sin_family = AF_INET;
-        sa.sin_port = htons((uint16_t)port);
-        if (inet_pton(AF_INET, ip, &sa.sin_addr) != 1) { close(fd); return INVALID_SOCKET; }
-        rc = connect(fd, (struct sockaddr *)&sa, sizeof(sa));
-    }
-#ifdef _WIN32
-    if (rc == SOCKET_ERROR) {
-        int werr = WSAGetLastError();
-        if (werr != WSAEWOULDBLOCK && werr != WSAEINPROGRESS && werr != WSAEALREADY) { close(fd); return INVALID_SOCKET; }
-    }
-#else
-    if (rc < 0 && errno != EINPROGRESS) { close(fd); return INVALID_SOCKET; }
-#endif
-    if (rc != 0) {
-        /* 连接未立即完成，用 EventLoop 等待可写 */
-        evloop_add(el, fd, EV_WRITE);
-        struct evloop_event ev;
-        int n = evloop_wait(el, &ev, 1, timeout_ms);
-        evloop_del(el, fd);
-        if (n <= 0) { close(fd); return INVALID_SOCKET; }
-        /* 检查 SO_ERROR 确认连接成功 */
-        int err = 0;
-#ifdef _WIN32
-        int len = (int)sizeof(err);
-        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, (char *)&err, &len) < 0 || err != 0) {
-#else
-        socklen_t len = sizeof(err);
-        if (getsockopt(fd, SOL_SOCKET, SO_ERROR, &err, &len) < 0 || err != 0) {
-#endif
-            close(fd);
-            return INVALID_SOCKET;
-        }
-    }
-    set_nonblock(fd, 0);
-    set_tcp_nodelay(fd);
-    if (latency_ms) {
-        int elapsed = (int)(now_ms() - start);
-        *latency_ms = elapsed > 0 ? elapsed : 1;
-    }
-    return fd;
-}
-
-/* 单套接字 HTTP 响应头接收，单轮单 FD 直接使用 cfnat_poll_single 杜绝 epoll_ctl ADD/DEL 额外系统调用 */
-static inline int recv_headers_ev(socket_t fd, char *buf, size_t bufsz, int timeout_ms, EventLoop *el) {
-    (void)el;
-    return recv_headers(fd, buf, bufsz, timeout_ms);
-}
-
-/* ── EventLoop 版 I/O 函数结束 ─────────────────────────────── */
 
 static char *cfnat_strcasestr(const char *haystack, const char *needle) {
     if (!haystack || !needle) return nullptr;
@@ -6067,22 +5829,6 @@ static UdpSession *find_or_create_udp_session_sa(CarrierRuntime *rt, const struc
     new_sess->next = rt->udp_sessions;
     rt->udp_sessions = new_sess;
     rt->last_udp_sess = new_sess;
-    conn_msg("[UDP/H3] #%llu [%s] 客户端会话建立 (当前活跃: %d)",
-             new_sess->sess_id, carrier_display_name(rt->spec.mode), active);
-    return new_sess;
-}
-
-static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct sockaddr_storage *client_addr, socklen_t client_len, const char *target_ip, int target_port, uint8_t first_byte) {
-    return find_or_create_udp_session_sa(rt, client_addr, client_len, target_ip, nullptr, 0, target_port, first_byte);
-}
-    new_sess->target_port = target_port;
-    new_sess->created_ms = now_ms();
-    new_sess->last_active_ms = new_sess->created_ms;
-    new_sess->sess_id = atomic_fetch_add(&g_udp_sess_seq, 1) + 1;
-    int active = atomic_fetch_add(&g_active_udp_sessions, 1) + 1;
-    new_sess->next = rt->udp_sessions;
-    rt->udp_sessions = new_sess;
-    rt->last_udp_sess = new_sess;
 
     int is_quic = ((first_byte & 0x80) != 0 && (first_byte & 0x40) != 0);
     conn_msg("[UDP/H3] #%llu [%s] 客户端连接建立 (当前活跃: %d)",
@@ -6091,6 +5837,10 @@ static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct s
              new_sess->sess_id, carrier_display_name(rt->spec.mode),
              is_quic ? "QUIC/H3" : "UDP", new_sess->target_ip, new_sess->target_port);
     return new_sess;
+}
+
+static UdpSession *find_or_create_udp_session(CarrierRuntime *rt, const struct sockaddr_storage *client_addr, socklen_t client_len, const char *target_ip, int target_port, uint8_t first_byte) {
+    return find_or_create_udp_session_sa(rt, client_addr, client_len, target_ip, nullptr, 0, target_port, first_byte);
 }
 
 static void prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
