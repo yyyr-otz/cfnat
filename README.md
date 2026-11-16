@@ -29,6 +29,24 @@
 ## ⚡ 现代平台优化与支持说明
 
 ### 1. 核心性能与传输层优化
+- **双向转发线程合并减负（每连接线程数与虚拟内存立降 33%）**：
+  - `relay_bidirectional()` 彻底废除创建 2 个子转发线程的传统模式；当前连接处理线程 `connection_thread` 直接就地接管反向转发（`u -> c`），仅派生 1 个轻量子线程负责正向转发（`c -> u`）；
+  - 每条连接由 3 个线程压减至 2 个线程，降低 33% 的线程创建、销毁与上下文切换开销，并在等待对端终止时完全消除空闲等待线程的虚拟内存占用。
+- **预解析二进制地址缓存（`sockaddr_storage` 热路径零解析）**：
+  - 在 `Result`、`CandidatePool`、`ConnCtx` 及 `UdpSession` 中全量内置二进制网络地址 `struct sockaddr_storage addr` 与 `addr_len`；
+  - 候选 IP 初筛入池或切换时即刻完成 `inet_pton` 解析，后续高并发建立 TCP 连接与 UDP 会话时全面走 `tcp_connect_sa` 与 `udp_connect_upstream_sa`，彻底消除热路径上反复 `strchr` 探测与字符串 IP 重复转换的 CPU 开销。
+- **Linux 零拷贝栈保护（`pipe_worker_fallback` 强隔离 `noinline`）**：
+  - 将 Linux `splice` 失败时的用户态回退拷贝函数显式标记为 `noinline`（`__attribute__((noinline))` / `__declspec(noinline)`）；
+  - 彻底杜绝 GCC / Clang 自动将 16KB 回退缓冲区内联进主工作线程栈帧，保证走内核级零拷贝通道的线程栈干净轻巧，根除高并发小线程栈下的栈溢出风险。
+- **扫描架构轻量化（彻底释放 400 个内核描述符，静态失效单轮熔断）**：
+  - 废弃 `scan_worker` 中每线程创建独立 `EventLoop` 的开销，直接采用自适应超时 `recv_headers`，彻底消灭 400 个并发线程持有的 400 个内核 `epoll`/`kqueue` 句柄；
+  - 静态特征即刻熔断：当遇到机房不匹配（`colo_skip`）、Cloudflare 限制（`cfray_miss`）或状态码不符（`http_code_mismatch`）时，立即 `break` 终止后续轮次，杜绝高达 5 倍的无谓 HTTP 探测重试。
+- **QUIC 批量并发探测异常消费与特征校验**：
+  - 接入 `POLLERR` 并捕获消费 `recvfrom` 返回的 ICMP 异步错误及 Windows `WSAECONNRESET`，彻底修复探测套接字在非阻塞模式下遭遇不可达错误时 0ms 陷入 CPU 100% 死循环的隐患；
+  - 严格校验 QUIC 报文首字节长包头标志 `(resp[0] & 0x80) != 0`，有效过滤网络杂包与伪造报文。
+- **零堆分配 CIDR 惰性遍历与 IPv6 容量预分配**：
+  - 在 `-random=false` 顺序模式下全面启用 `CidrList` 二分定位前缀和流式生成 IP，消灭数百万个字符串堆内存分配（`malloc` / `realloc`），内存开销降低至 $O(1)$ 常数级；
+  - `load_ip_list` 载入 IPv6 时单次预分配 40960 项指针容量，避免上万行 IPv6 CIDR 衍生时的数十次数组搬迁。
 - **全链路禁用 Nagle 算法（`TCP_NODELAY`）**：在接入客户端连接以及拨号上游连接时全面注入，消除 40ms 交互粘滞延迟，显著提升 TLS 握手及多路复用首包响应速度。
 - **TCP Keep-Alive 微参数深度对齐（45s 保活，根除僵尸连接）**：
   - 针对 Xray / Chrome 等主流客户端 H2 空闲保活周期（45 秒），显式配置操作系统内核保活参数：`TCP_KEEPIDLE = 45s`、`TCP_KEEPINTVL = 10s`、`TCP_KEEPCNT = 3`（Windows 平台通过 `SIO_KEEPALIVE_VALS` 同步对齐）；
