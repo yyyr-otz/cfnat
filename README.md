@@ -81,6 +81,23 @@
 - **自适应内核页安全栈（支持 64KB Page ARM64 内核）**：
   - 扫描线程栈安全设定为 512 KB，转发/服务常驻线程设定为 256 KB，并全面动态对齐 `#if defined(PTHREAD_STACK_MIN)`；
   - 规避 Armbian / 树莓派 64KB 页面大小内核下的段错误（`status=11/SEGV`），在 64 位 Linux 需求分页（Demand Paging）机制下，每线程真实物理内存（RSS）仅占约 8~12 KB。
+- **主监听接入零阻塞（`carrier_accept_thread` 消除网络阻塞）**：
+  - 重构主接入循环的节点获取逻辑，废除在 `carrier_accept_thread` 中同步执行网络探测（`carrier_health_check_ip`）的做法，改用对候选池的 $O(1)$ 快速只读复制；
+  - 遇到节点需要切换或探测时，完全交由独立的 `connection_thread` 在后台按顺位轮换尝试，主监听循环保持**纯本地内存操作与零网络 I/O 阻塞**，从容应对每秒上千个 TCP 连接涌入。
+- **内核超时直通转发（单连接系统调用开销直接减半）**：
+  - 双向转发循环直接依托套接字已设置的内核级超时（`SO_RCVTIMEO` 300 秒），彻底废弃每轮 `recv` 前无谓的 `poll` / `WSAPoll` 预查询；
+  - 数据转发路径的系统调用次数立减 50%，显著压降 CPU 上下文切换消耗；同时在 Linux 零拷贝模式遭遇不支持的套接字类型（`EINVAL` / `ENOSYS`）时自动无缝降级至用户态缓冲拷贝。
+- **双向吞吐感知的节点淘汰（彻底杜绝 DoH / 短连接误判驱逐）**：
+  - 彻底摒弃以连接存活时间（$< 3000\text{ms}$）简单粗暴断定节点故障的缺陷逻辑，重构为基于数据流吞吐感知的 `carrier_note_connection_success` 与 `carrier_note_connection_failed` 状态机；
+  - 针对 DNS-over-HTTPS (DoH)、短 API 查询等在 100~500ms 内极速完成响应的合法短连接，只要检测到上游回包数据（`bytes > 0`）即判定为连接成功并重置失败计数，坚决捍卫延迟最低、响应最快的优质节点不被误杀。
+- **双轨预解析二进制地址全链路同步（彻底根除“脑裂” Bug）**：
+  - 针对 `tcp_connect_sa` 与 `udp_connect_upstream_sa` 直接使用二进制 `sockaddr_storage` 拨号的特性，在网段裂变衍生、原地测活自愈与全局自愈补充扫描等所有生成/重填路径中，严格同步更新字符串 IP 与二进制地址（`current_addr` / `current_addr_len`）；
+  - 彻底根除因拷贝遗漏导致日志显示新衍生 IP 但底层仍向旧种子节点发包的“脑裂”故障。
+- **128 KB 块级内存池（StringList Arena Chunk Allocation）**：
+  - 候选 IP 列表解析全面改用分块连续内存分配，单次申请 128 KB 内存块存储字符串，将数万次高频小碎片的 `malloc`/`free` 压减为常数级块级管理，彻底消灭堆内存碎片并提升启动解析速度。
+- **UDP/H3 热路径流水线优化（优先回包转发与惰性地址获取）**：
+  - 在 `carrier_udp_thread` 中优先处理并派发来自 Cloudflare 上游的回程数据报，有效压缩 QUIC/H3 往返时延；
+  - 客户端发包处理引入惰性目标地址获取，配合 MRU 命中机制使连续数据报转发达到近乎零锁与零地址解析开销。
 - **跨平台轻量级非阻塞 I/O 轮询**：统一使用 `cfnat_poll_single`（跨平台基于 `poll` / Windows `WSAPoll`），彻底移除冗余的 `EventLoop` 堆分配及每个线程持有的额外内核描述符，支持 Linux、Windows 与 Android 下单套接字的高性能毫秒级事件等待，解决 HTTP 探测时的虚假超时与资源占用。
 - **Android Termux 沙箱审计兼容**：在 Android 平台下自动隔离 `splice` 系统调用，避免触发 Android `seccomp` 过滤机制报 `signal 31 (SIGSYS)` 错误，确保转发稳定。
 
