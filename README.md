@@ -81,7 +81,7 @@
 - **自适应内核页安全栈（支持 64KB Page ARM64 内核）**：
   - 扫描线程栈安全设定为 512 KB，转发/服务常驻线程设定为 256 KB，并全面动态对齐 `#if defined(PTHREAD_STACK_MIN)`；
   - 规避 Armbian / 树莓派 64KB 页面大小内核下的段错误（`status=11/SEGV`），在 64 位 Linux 需求分页（Demand Paging）机制下，每线程真实物理内存（RSS）仅占约 8~12 KB。
-- **Windows 11 EventLoop 事件驱动补齐**：完善非 epoll 平台下的 `evloop_wait_select` 回退实现，支持 Windows 下单套接字的非阻塞异步事件等待，解决 HTTP 探测时的虚假超时。
+- **跨平台轻量级非阻塞 I/O 轮询**：统一使用 `cfnat_poll_single`（跨平台基于 `poll` / Windows `WSAPoll`），彻底移除冗余的 `EventLoop` 堆分配及每个线程持有的额外内核描述符，支持 Linux、Windows 与 Android 下单套接字的高性能毫秒级事件等待，解决 HTTP 探测时的虚假超时与资源占用。
 - **Android Termux 沙箱审计兼容**：在 Android 平台下自动隔离 `splice` 系统调用，避免触发 Android `seccomp` 过滤机制报 `signal 31 (SIGSYS)` 错误，确保转发稳定。
 
 ### 2. 目标平台支持矩阵（纯静态架构）
@@ -368,7 +368,7 @@ C 版的核心价值是降低常驻资源占用。相较于 Go 版，C 版没有
 - UDP MRU 会话查找仅增加 8 字节指针开销，消除 $O(N)$ 循环遍历。
 - 候选结果只保留必要字段，CIDR 惰性展开，KB 级内存即可处理百万级 IP 段。
 - 连接级 IP 选择缓存（cache_valid）结合原子原语，避免连接建立时的高频加锁与健康检查。
-- EventLoop 使用原生 epoll，select 回退，兼顾极简与并发效率。
+- I/O 轮询基于轻量级 `cfnat_poll_single` 与批量 `poll` / `WSAPoll`，无多余事件循环对象分配与文件描述符占用，兼顾极简与并发效率。
 
 ---
 
