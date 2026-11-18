@@ -1327,10 +1327,10 @@ static void parse_args(Config *c, int argc, char **argv) {
     if (c->direct_listen[0]) {
         if (c->ips_type == 6) {
             has_v6_listen = 1;
-            format_listen_endpoint(c->direct_listen, 6443, v6_listen_val, sizeof(v6_listen_val));
+            format_listen_endpoint(c->direct_listen, 6443, "[::]", v6_listen_val, sizeof(v6_listen_val));
         } else {
             has_v4_listen = 1;
-            format_listen_endpoint(c->direct_listen, 4443, v4_listen_val, sizeof(v4_listen_val));
+            format_listen_endpoint(c->direct_listen, 4443, "0.0.0.0", v4_listen_val, sizeof(v4_listen_val));
         }
     }
 
