@@ -17,6 +17,7 @@
 | **用户态 TCP 转发缓冲 (`COPY_BUF_SIZE`)** | Windows / Android（及 Linux 回退） | `64 KB`（虚拟线程栈 `512 KB`） | 单次 `recv`/`send` 吞吐 4 个满载 16KB TLS 记录帧，完美命中 CPU 核心 L2 Cache，高并发下较 128KB 节省 50% 物理页占用 |
 | **Linux 零拷贝管道 (`F_SETPIPE_SZ` + `splice`)** | Linux (`amd64` / `arm64`) | `256 KB`（回退 `128 KB` / `64 KB`） | 单次 `splice` 零拷贝系统调用可转移 64 个内核页面引用，长流大吞吐系统调用开销降低 75% |
 | **UDP/H3 批量收发队列 (`UDP_BATCH_SZ` + `recvmmsg` / `sendmmsg`)** | 无 Root Android / Linux | 上下行双向 `32` 包（单包槽位 `4096 B`，队列 `128 KB`） | 上行与下行双向批量收发，4KB 槽位承载大包 QUIC 与 Jumbo Frame 杜绝 `MSG_TRUNC` 截断 |
+| **Windows UDP/H3 合并收发卸载（URO / USO）** | Windows 11 (`amd64` / `arm64`) | `WSARecvMsg` (`UDP_RECV_MAX_COALESCED_SIZE`) + `WSASendMsg` (`UDP_SEND_MSG_SIZE`)，不支持时自动回退 | 将同流连续 QUIC 数据报合并为单次系统调用，显著降低 Windows 下 H3 大吞吐的内核态切换开销 |
 
 ### 2. 核心性能与传输层优化
 
@@ -30,8 +31,9 @@
 - **UDP/H3 1024 会话分实例限额、8 位哈希分桶 + MRU + 原子 `epoch` 热迁移**：
   - 单实例会话上限达 `1024`（各实例独立计数互不挤压），结合 8 位哈希分桶（`udp_hash[256]`）与单级 MRU 缓存，单客户端突发与多客户端并发均保持 $O(1)$ 检索；
   - **无锁 `epoch` 驱动动态热迁移**：UDP 优选池切换时仅原子递增 `udp_candidates.epoch`，`carrier_udp_thread` 在本线程内无锁感知变更并平滑重绑新上游，零互斥锁争抢、零哈希表并发竞争。
-- **Linux 与无 Root Android 上下行双向 `recvmmsg` / `sendmmsg` 批量收发**：
-  - UDP 上行与下行双向启用 32 包 `recvmmsg()` + `sendmmsg()` 对称批处理（下行单会话突发下载系统调用 32→1）；严格过滤 `MSG_TRUNC` 截断残包，遭遇非阻塞部分发送（Partial Send）时精确回退逐包恢复。
+- **全平台 UDP/H3 批量与合并收发加速**：
+  - **Linux / 无 Root Android**：UDP 上行与下行双向启用 32 包 `recvmmsg()` + `sendmmsg()` 对称批处理（下行单会话突发下载系统调用 32→1）；严格过滤 `MSG_TRUNC` 截断残包，遭遇非阻塞部分发送（Partial Send）时精确回退逐包恢复；
+  - **Windows 11**：自动启用 Winsock **URO（接收合并）** 与 **USO（发送分段卸载）**（`WSARecvMsg` / `WSASendMsg`），遇到不支持的网卡或虚拟驱动时无缝回退标准 `recvfrom` / `sendto`。
 - **BBR 拥塞控制、`TCP_NOTSENT_LOWAT` 与 `TCP_USER_TIMEOUT` 三重加固**：
   - Linux/Android 上游拨号优先启用 **BBR**（内核不支持时自动回退），有效抵抗 0.5%~2% 跨境随机丢包；
   - 配合 `TCP_NOTSENT_LOWAT = 64 KB` 消除大下载流引发的 Bufferbloat 延迟膨胀；
@@ -42,8 +44,8 @@
 - **异步后台维护线程（`carrier_maintenance_thread`）与全环形 30 秒冷却回灌**：
   - 节点顺位切换与双轨自愈扫描全面解耦至独立后台维护线程，数据转发面零阻塞；
   - 废除 70% 池容量硬截断，采用按综合分升序 + 4 路并发探测搭配 30 秒失败冷却期与 `consecutive_fail` 指数惩罚（$50 \times 2^n$），短暂抖动的头部优质节点冷却后自动回灌复用。
-- **vDSO 单调时钟、秒级时间戳缓存与无锁关闭快路径**：
-  - Linux 与 Android 使用 `clock_gettime(CLOCK_MONOTONIC)` 替代 `gettimeofday()`；日志采用 C23 `thread_local` 秒级缓存时间戳；连接正常关闭时通过 `fast_fail_count` 与 `has_node_fail` 原子无锁短路返回，99.9% 场景零锁开销。
+- **高精度单调时钟、秒级时间戳缓存与无锁关闭快路径**：
+  - Linux 与 Android 使用 `clock_gettime(CLOCK_MONOTONIC)` 替代 `gettimeofday()`，Windows 使用 `QueryPerformanceCounter` 提供 1ms 级单调时钟（消除系统默认 15.6ms 计时粒度抖动）；日志采用 C23 `thread_local` 秒级缓存时间戳；连接正常关闭时通过 `fast_fail_count` 与 `has_node_fail` 原子无锁短路返回，99.9% 场景零锁开销。
 - **冷启动端口预绑定（Early Binding）与优雅退出**：
   - 扫描前提前绑定监听端口（TCP Backlog `4096`），客户端首包握手先入内核队列，消除冷启动初期的 TCP RST；
   - 扫描线程数依 CPU 核心自适应降载（`min(task, 64 × nproc)`），保护低配软路由避免过度上下文切换。
@@ -90,7 +92,7 @@ cfnat C 版做四件事：
 - **H2 (TCP) + H3 (QUIC/UDP) 双轨独立测优与三栈透明分流**：
   - 在 `-v4-listen`、`-v6-listen` 与 `-baidu-listen` 监听端口上，TCP 流量导向 TCP 优选池，UDP/QUIC 流量导向 UDP 优选池；Xray 在三栈端口间切换时无需修改 H2/H3（`alpn`）配置。
 - **RFC 9000 规范的 1200 字节轻量 QUIC 版本协商探针**：
-  - 批量精筛使用「每协议族一个共享非阻塞 UDP 套接字 + `sendto` 齐射 + `poll`/`recvfrom` 按来源地址配对」的形态（与 0.0.16 一致）。**不要改成 per-IP `connect()`**：连通性探针一旦被内核/防火墙记上 ICMP 错误，per-IP 套接字会整条失效，且 32~64 个 fd 在 Windows 上易触发瞬时耗尽；
+  - 批量精筛使用「每协议族一个共享非阻塞 UDP 套接字 + `sendto` 齐射 + `poll`/`recvfrom` 按来源地址配对」的形态。**不要改成 per-IP `connect()`**：连通性探针一旦被内核/防火墙记上 ICMP 错误，per-IP 套接字会整条失效，且 32~64 个 fd 在 Windows 上易触发瞬时耗尽；
   - 单点校验（缓存校验 / 周期健康检查）用独立套接字 `connect()` + `send` + `poll`，两者共用同一份探针字节布局，零加密库依赖精准测得 IPv4/IPv6 UDP 443 真实延迟；
   - **载荷必须保持全零**：头部（`0xC0` + 保留版本号 `0x5A5A5A5A` + 8 字节 DCID/SCID）之后的 1177 字节若填成随机数据，Cloudflare 会按 Initial 报文结构把随机字节解析为 `Token Length` / `Length` 变长整数，绝大多数包被判畸形直接丢弃（同一节点实测：全零载荷 `8/8` 有回包，随机载荷仅 `1~3/8`），表现为 v4/v6 的 H3 精筛恒为 0 个候选、健康检查持续「QUIC 无响应」。
 - **网段裂变衍生与双轨协同自愈**：
@@ -241,8 +243,9 @@ journalctl --output cat -f -u cfnat
 | `-v6-split` | IPv6 `/48` 子网切分前缀掩码（安全范围 `48` ~ `58`，单段最多抽样 1024 个防 OOM）。<br>**默认 `54`：每个 `/48` 切分为 64 个 `/54` 子网各抽样 1 个**；统一展开为 8 段无缩写形式。 | `54` |
 | `-baidu-resolver` | 针对 Fake-IP 的百度解析方式: `auto` / `udp://` / `doh://` | `auto` |
 | `-bind-if` | 绑定出站物理网卡 (如 `eth0`、`en0`) | 留空使用默认路由 |
-| `-health-log` | 定时输出健康检查日志的间隔秒数（仅在 `-log=debug` 时输出成功汇报，普通模式仅告警失败） | `60` |
-| `-log` / `-log-level` | 日志级别：`silent` / `error` / `warn` / `info` / `debug`。<br>**`info`（默认）**：日常转发静默，仅输出关键里程碑（启动/自愈树状日志、故障切换）；<br>**`debug`**：输出每个有效 IP、详细进度、连接日志与完整候选表格。 | `info` |
+| `-health-log` | **健康状态行（`-log=debug` 级别明细）输出间隔**秒数，`0` = 关闭。<br>只影响这类逐栈明细的打印频率，**不影响健康检查本身的节奏**——健康检查是自适应的：失败 `10s`、稳定 `30s`、连续成功 5 次后 `60s`。 | `60` |
+| `-log` / `-log-level` | 日志级别：`silent` / `error` / `warn` / `info` / `debug`。<br>**`info`（默认）**：日常转发静默，仅输出关键里程碑（启动/自愈树状日志、故障切换）与周期运行指标；<br>**`debug`**：输出每个有效 IP、逐条探测明细、连接日志与完整候选表格（自动隐藏扫描阶段的百分比滚动进度日志，避免穿插刷屏）。 | `info` |
+| `-stats-interval`<br>（别名 `-log-interval`） | **三栈双协议运行指标汇报间隔（秒）**，`0` = 关闭。<br>每到一个周期，用**一次原子写入**输出一个树状摘要块，汇总全局活跃 TCP 连接与 UDP 会话数，并覆盖 IPv4 / IPv6 / 百度前置 × TCP/H2、UDP/H3 的当前最优 IP、机房（colo）、延迟、候选池数、活跃 UDP 会话数、累计切换次数（含首包超时实时回退），以及本周期 UDP 上行/下行发送丢包计数（与 5 秒下行告警解耦、按周期原子取出清零）。<br>**与健康检查间隔相互独立**：指标只是观测，不改变探测节奏。默认 `300` 秒（5 分钟），既能看见状态又不会刷屏。 | `300` |
 
 ## 常用示例
 
