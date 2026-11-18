@@ -1,0 +1,198 @@
+name: Build cfnat C (Linux, Windows 11 & Android Termux)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release 标签版本（例如 v0.0.x，留空则自动从 cfnat.c 提取版本）'
+        required: false
+        default: ''
+      prerelease:
+        description: '是否标记为 Pre-release 预发布'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    name: Build all 6 targets & Release
+    runs-on: ubuntu-latest
+
+    env:
+      SOURCE_FILE: cfnat.c
+      ZIG_VERSION: 0.15.1
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ github.token }}
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: true
+
+      - name: Setup Zig
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          case "$(uname -m)" in
+            x86_64)
+              zig_arch="x86_64"
+              ;;
+            aarch64|arm64)
+              zig_arch="aarch64"
+              ;;
+            *)
+              echo "Unsupported runner arch: $(uname -m)" >&2
+              exit 1
+              ;;
+          esac
+
+          zig_dir="zig-${zig_arch}-linux-${ZIG_VERSION}"
+          zig_url="https://ziglang.org/download/${ZIG_VERSION}/${zig_dir}.tar.xz"
+
+          curl -fsSL "$zig_url" -o zig.tar.xz
+          tar -xf zig.tar.xz
+
+          echo "$PWD/$zig_dir" >> "$GITHUB_PATH"
+
+      - name: Build all 6 targets concurrently
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ ! -f "$SOURCE_FILE" ]; then
+            echo "SOURCE_FILE '$SOURCE_FILE' not found" >&2
+            exit 1
+          fi
+
+          zig version
+          mkdir -p release /tmp/build-logs /tmp/zig-cache
+
+          NDK_BIN="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          STRIP="${NDK_BIN}/llvm-strip"
+
+          names=()
+          pids=()
+
+          launch() {
+            local name="$1"
+            shift
+            names+=("$name")
+            (
+              set -euo pipefail
+              "$@"
+            ) >"/tmp/build-logs/${name}.log" 2>&1 &
+            pids+=("$!")
+          }
+
+          build_zig_linux() {
+            local name="$1" target="$2" out="$3"
+            ZIG_LOCAL_CACHE_DIR="/tmp/zig-cache/${name}/local" \
+            ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/${name}/global" \
+            zig cc -target "$target" -O2 -pipe -std=c23 \
+              -Wall -Wextra -Wno-unused-parameter \
+              "$SOURCE_FILE" -o "release/${out}" \
+              -pthread -static -s
+          }
+
+          build_zig_windows() {
+            local name="$1" target="$2" out="$3"
+            ZIG_LOCAL_CACHE_DIR="/tmp/zig-cache/${name}/local" \
+            ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/${name}/global" \
+            zig cc -target "$target" -O2 -pipe -std=c23 \
+              -finput-charset=UTF-8 -fexec-charset=UTF-8 \
+              -Wall -Wextra -Wno-unused-parameter \
+              "$SOURCE_FILE" -o "release/${out}" \
+              -lws2_32 -ldnsapi -lwininet -static -s
+          }
+
+          build_android() {
+            local target="$1" api="$2" out="$3"
+            "${NDK_BIN}/${target}${api}-clang" \
+              -O2 -pipe -std=c23 -Wall -Wextra -Wno-unused-parameter \
+              -D__ANDROID__ \
+              "$SOURCE_FILE" -o "release/${out}" \
+              -pthread
+            "$STRIP" "release/${out}"
+          }
+
+          launch linux-amd64   build_zig_linux   linux-amd64   x86_64-linux-musl   cfnat-linux-amd64
+          launch linux-arm64   build_zig_linux   linux-arm64   aarch64-linux-musl  cfnat-linux-arm64
+          launch windows-amd64 build_zig_windows windows-amd64 x86_64-windows-gnu  cfnat-windows-amd64.exe
+          launch windows-arm64 build_zig_windows windows-arm64 aarch64-windows-gnu cfnat-windows-arm64.exe
+          launch android-arm64 build_android     aarch64-linux-android 24          cfnat-android-arm64
+          launch android-amd64 build_android     x86_64-linux-android  24          cfnat-android-amd64
+
+          failed=0
+          for i in "${!pids[@]}"; do
+            name="${names[$i]}"
+            pid="${pids[$i]}"
+            if wait "$pid"; then
+              echo "✅ [${name}] build succeeded"
+              if [ -s "/tmp/build-logs/${name}.log" ]; then
+                cat "/tmp/build-logs/${name}.log"
+              fi
+            else
+              echo "❌ [${name}] build failed" >&2
+              cat "/tmp/build-logs/${name}.log" >&2
+              failed=1
+            fi
+          done
+
+          if [ "$failed" -ne 0 ]; then
+            exit 1
+          fi
+
+          echo "Release contents:"
+          file release/*
+          ls -lh release/
+
+      - name: Create checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum cfnat-* > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Determine tag name
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          elif [ -n "${{ inputs.tag_name }}" ]; then
+            tag="${{ inputs.tag_name }}"
+          else
+            ver=$(grep -E '^#define[[:space:]]+CFNAT_VERSION[[:space:]]+"' "$SOURCE_FILE" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+            if [ -n "$ver" ]; then
+              tag="v${ver}"
+            else
+              tag="continuous"
+            fi
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Using release tag: $tag"
+
+      - name: Upload GitHub Release
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: Release ${{ steps.vars.outputs.tag }}
+          prerelease: ${{ inputs.prerelease || false }}
+          make_latest: true
+          files: release/*
