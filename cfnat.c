@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.17"
+#define CFNAT_VERSION "0.0.21"
 
 /* =========================================================================
  * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
@@ -411,6 +411,7 @@ typedef struct {
     char probe_host[MAX_DOMAIN_LEN];
     char probe_path[MAX_PATH_LEN];
     int hdr_timeout;
+    atomic_size_t code_meta_skip;  /* -code 校验因 80 端口不可达而被跳过的次数（用于一次性提示） */
 } ScanCtx;
 
 static long now_ms(void);
@@ -3429,82 +3430,29 @@ static void *scan_worker(void *arg) {
         int code_matched = 0;
         int code_failed = 0;
 
-        /* 统一 80 端口 Keep-Alive HTTP HEAD 测 CF-RAY 机房与状态码 + 首轮 443 TLS 握手真实验证 */
-        socket_t fd = INVALID_SOCKET;
+        /* 判定链（TLS 目标端口时）：
+         *   1) 唯一存活/延迟门槛 = 目标端口(443) 的 TLS 握手 —— 与真实转发路径一致；
+         *   2) 80 端口仅在首轮做一次「尽力而为」的 CF-RAY / 状态码采集，不参与存活与延迟统计。
+         * 旧实现把 80 端口 HEAD 当成硬门槛（连不上 / 无 CF-RAY / 状态码不符即淘汰），
+         * 在 IPv6（国内多数线路 :80 被过滤）与百度前置（:80 经代理可达但直连不可达）场景下
+         * 会把整批健全节点误杀，表现为「v6 测不到、baidu 只有缓存」。 */
+        socket_t fd = INVALID_SOCKET;     /* 仅非 TLS 分支使用的 Keep-Alive 连接 */
         int conn_lat = 0;
-        int eff_probes = probes;
+        int eff_probes = is_tls ? (probes > 2 ? 2 : probes) : probes;
+        int code_meta_unavailable = 0;
         for (int attempt = 0; atomic_load(&g_running) && attempt < eff_probes; attempt++) {
             int cur_latency = 0;
             char cur_colo[MAX_COLO_LEN] = {0};
 
-            if (cfnat_socket_invalid(fd)) {
-                conn_lat = 0;
-                fd = dial_target_with_proxy_sa(ip, &probe_sa, probe_salen, probe_port, ctx->cfg->delay_ms, ctx->proxy_pool, &conn_lat);
-                if (cfnat_socket_invalid(fd)) {
-                    atomic_fetch_add(&ctx->connect_fail, 1);
-                    if (attempt == 0) break; /* 首轮 TCP 握手失败直接判定死节点 */
-                    continue;
-                }
-            }
-
-            long t_start = now_ms();
-            if (!send_all_timeout(fd, head_req, (size_t)head_req_len, hdr_timeout)) {
-                close(fd);
-                fd = INVALID_SOCKET;
-                atomic_fetch_add(&ctx->header_fail, 1);
-                if (attempt == 0) break;
-                continue;
-            }
-            char hdr[4096];
-            int n = recv_headers(fd, hdr, sizeof(hdr), hdr_timeout);
-            long t_end = now_ms();
-            if (n <= 0) {
-                close(fd);
-                fd = INVALID_SOCKET;
-                atomic_fetch_add(&ctx->header_fail, 1);
-                if (attempt == 0) break;
-                continue;
-            }
-
-            if (cfnat_strcasestr(hdr, "Connection: close")) {
-                close(fd);
-                fd = INVALID_SOCKET;
-            }
-
-            int resp_code = extract_http_status_code(hdr);
-            if (ctx->cfg->code > 0) {
-                if (resp_code == ctx->cfg->code) {
-                    code_matched = 1;
-                } else if (resp_code != 405) {
-                    /* 严格状态码校验：任意一轮返回非期望状态码（如 301/403/502/1034）立即淘汰该 IP */
-                    atomic_fetch_add(&ctx->http_code_mismatch, 1);
-                    code_failed = 1;
-                    break;
-                }
-            }
-
-            if (extract_cfray(hdr, cur_colo, sizeof(cur_colo)) != 0) {
-                atomic_fetch_add(&ctx->cfray_miss, 1);
-                code_failed = 1;
-                break; /* 缺少 CF-RAY 报头直接剪枝 */
-            }
-            if (!colo_rule_allowed(ctx->cfg->colo, cur_colo)) {
-                atomic_fetch_add(&ctx->colo_skip, 1);
-                code_failed = 1;
-                break; /* 数据中心不匹配直接剪枝 */
-            }
-
-            cur_latency = (int)(t_end - t_start);
-            if (cur_latency <= 0) cur_latency = conn_lat > 0 ? conn_lat : 1;
-
-            /* 目标端口为 TLS 时首轮验证 443 握手有效性并校准延迟，确保 TLS 转发真实可用 */
-            if (is_tls && attempt == 0) {
+            if (is_tls) {
+                /* ── 主路径：目标端口 TLS 握手，既是存活门槛也是延迟样本 ── */
                 int tls_conn_lat = 0;
-                socket_t tls_fd = dial_target_with_proxy_sa(ip, &target_sa, target_salen, target_port, ctx->cfg->delay_ms, ctx->proxy_pool, &tls_conn_lat);
+                socket_t tls_fd = dial_target_with_proxy_sa(ip, &target_sa, target_salen, target_port,
+                                                            ctx->cfg->delay_ms, ctx->proxy_pool, &tls_conn_lat);
                 if (cfnat_socket_invalid(tls_fd)) {
                     atomic_fetch_add(&ctx->connect_fail, 1);
-                    code_failed = 1;
-                    break;
+                    if (attempt == 0) break;
+                    continue;
                 }
                 long t_tls_start = now_ms();
                 int tls_ok = tls_probe_host(tls_fd, hdr_timeout, ctx->probe_host);
@@ -3512,11 +3460,114 @@ static void *scan_worker(void *arg) {
                 close(tls_fd);
                 if (!tls_ok) {
                     atomic_fetch_add(&ctx->header_fail, 1);
+                    if (attempt == 0) break;
+                    continue;
+                }
+                int tls_rtt = (int)(t_tls_end - t_tls_start);
+                cur_latency = tls_rtt > 0 ? tls_rtt : (tls_conn_lat > 0 ? tls_conn_lat : 1);
+
+                /* ── 首轮附带一次 :80 元数据采集（短超时，失败绝不淘汰该 IP）── */
+                if (attempt == 0) {
+                    int meta_to = hdr_timeout > 600 ? 600 : hdr_timeout;
+                    socket_t mfd = dial_target_with_proxy_sa(ip, &probe_sa, probe_salen, probe_port,
+                                                             meta_to, ctx->proxy_pool, nullptr);
+                    if (cfnat_socket_invalid(mfd)) {
+                        code_meta_unavailable = 1;
+                        if (ctx->cfg->code > 0) atomic_fetch_add(&ctx->code_meta_skip, 1);
+                    } else {
+                        char mhdr[4096];
+                        int mn = -1;
+                        if (send_all_timeout(mfd, head_req, (size_t)head_req_len, meta_to)) {
+                            mn = recv_headers(mfd, mhdr, sizeof(mhdr), meta_to);
+                        }
+                        close(mfd);
+                        if (mn > 0) {
+                            if (extract_cfray(mhdr, cur_colo, sizeof(cur_colo)) == 0) {
+                                /* 仅当用户显式指定 -colo 时，机房不匹配才淘汰 */
+                                if (ctx->cfg->colo[0] && !colo_rule_allowed(ctx->cfg->colo, cur_colo)) {
+                                    atomic_fetch_add(&ctx->colo_skip, 1);
+                                    code_failed = 1;
+                                    break;
+                                }
+                            } else {
+                                atomic_fetch_add(&ctx->cfray_miss, 1); /* 只统计，不再淘汰 */
+                            }
+                            if (ctx->cfg->code > 0) {
+                                int rc_meta = extract_http_status_code(mhdr);
+                                if (rc_meta == ctx->cfg->code) {
+                                    code_matched = 1;
+                                } else if (rc_meta != 405) {
+                                    atomic_fetch_add(&ctx->http_code_mismatch, 1);
+                                    code_failed = 1;
+                                    break;
+                                }
+                            }
+                        } else {
+                            code_meta_unavailable = 1;
+                            if (ctx->cfg->code > 0) atomic_fetch_add(&ctx->code_meta_skip, 1);
+                        }
+                    }
+                }
+            } else {
+                /* ── 明文目标端口：沿用 80/自定义端口的 HTTP HEAD 作为存活判定 ── */
+                if (cfnat_socket_invalid(fd)) {
+                    conn_lat = 0;
+                    fd = dial_target_with_proxy_sa(ip, &probe_sa, probe_salen, probe_port, ctx->cfg->delay_ms, ctx->proxy_pool, &conn_lat);
+                    if (cfnat_socket_invalid(fd)) {
+                        atomic_fetch_add(&ctx->connect_fail, 1);
+                        if (attempt == 0) break;
+                        continue;
+                    }
+                }
+
+                long t_start = now_ms();
+                if (!send_all_timeout(fd, head_req, (size_t)head_req_len, hdr_timeout)) {
+                    close(fd);
+                    fd = INVALID_SOCKET;
+                    atomic_fetch_add(&ctx->header_fail, 1);
+                    if (attempt == 0) break;
+                    continue;
+                }
+                char hdr[4096];
+                int n = recv_headers(fd, hdr, sizeof(hdr), hdr_timeout);
+                long t_end = now_ms();
+                if (n <= 0) {
+                    close(fd);
+                    fd = INVALID_SOCKET;
+                    atomic_fetch_add(&ctx->header_fail, 1);
+                    if (attempt == 0) break;
+                    continue;
+                }
+
+                if (cfnat_strcasestr(hdr, "Connection: close")) {
+                    close(fd);
+                    fd = INVALID_SOCKET;
+                }
+
+                int resp_code = extract_http_status_code(hdr);
+                if (ctx->cfg->code > 0) {
+                    if (resp_code == ctx->cfg->code) {
+                        code_matched = 1;
+                    } else if (resp_code != 405) {
+                        atomic_fetch_add(&ctx->http_code_mismatch, 1);
+                        code_failed = 1;
+                        break;
+                    }
+                }
+
+                if (extract_cfray(hdr, cur_colo, sizeof(cur_colo)) != 0) {
+                    atomic_fetch_add(&ctx->cfray_miss, 1);
+                    code_failed = 1;
+                    break; /* 明文端口本身依赖 CF-RAY 识别，缺失即淘汰 */
+                }
+                if (!colo_rule_allowed(ctx->cfg->colo, cur_colo)) {
+                    atomic_fetch_add(&ctx->colo_skip, 1);
                     code_failed = 1;
                     break;
                 }
-                int tls_lat = (int)(t_tls_end - t_tls_start);
-                cur_latency = tls_lat > 0 ? tls_lat : (tls_conn_lat > 0 ? tls_conn_lat : cur_latency);
+
+                cur_latency = (int)(t_end - t_start);
+                if (cur_latency <= 0) cur_latency = conn_lat > 0 ? conn_lat : 1;
             }
 
             /* 慢节点早剪枝：首轮握手+探测延迟已超标 (> delay_ms * 2 且 > 250ms)，直接放弃 */
@@ -3547,6 +3598,8 @@ static void *scan_worker(void *arg) {
             }
         }
         if (cfnat_socket_valid(fd)) close(fd);
+        /* 机房标签缺失时统一回落 UNK，保证展示/缓存/过滤三处语义一致 */
+        if (!best_colo[0]) snprintf(best_colo, sizeof(best_colo), "%s", "UNK");
 
         int avg_latency = success_count > 0 ? (total_latency / success_count) : 0;
 
@@ -3574,8 +3627,11 @@ static void *scan_worker(void *arg) {
         }
         if (code_failed || success_count <= 0 || avg_latency <= 0 || (ctx->cfg->delay_ms > 0 && avg_latency > ctx->cfg->delay_ms)) continue;
 
-        /* 若显式指定了 code (code > 0)，且初筛未完全确认（例如 HEAD 返回 405），使用 GET 在 80 端口做二次状态码校验 */
-        if (ctx->cfg->code > 0 && !code_matched) {
+        /* 若显式指定了 code (code > 0)，且初筛未完全确认（例如 HEAD 返回 405），使用 GET 在 80 端口做二次状态码校验。
+         * 但当 80 端口完全不可达（IPv6 常见 / ISP 过滤）时不再做「连不上就淘汰」的判定：
+         * -code 的语义是校验 HTTP 状态码，而不是要求 80 必须可达；否则会与 TLS 主路径互相打架，
+         * 造成「443 完全可用、却因 80 不通被整批淘汰」。此时仅计数并在扫描结束时提示一次。 */
+        if (ctx->cfg->code > 0 && !code_matched && !code_meta_unavailable) {
             int target_code = ctx->cfg->code;
             socket_t check_fd = dial_target_with_proxy_sa(ip, &probe_sa, probe_salen, probe_port, ctx->cfg->delay_ms, ctx->proxy_pool, nullptr);
             if (cfnat_socket_invalid(check_fd)) {
@@ -4019,7 +4075,13 @@ static size_t quic_batch_probe(CarrierRuntime *rt, int target_port,
         active_fds++;
     }
 
-    if (active_fds == 0) return 0;
+    if (active_fds == 0) {
+        /* 探针根本没发出去（fd 耗尽 / 无 IPv6 路由 / bind 失败），必须与「发出但无回包」区分开，
+         * 否则日志只会显示“全无 UDP 回包”，把本机问题误判成运营商阻断。 */
+        debug_msg("[%s] QUIC 批量探测: %zu 个候选全部无法创建/连接探针套接字（fd 耗尽或无对应协议栈路由），本轮未发出任何探针",
+                  carrier_display_name(rt ? rt->spec.mode : nullptr), count);
+        return 0;
+    }
 
     size_t responded_count = 0;
     long deadline = start_time + timeout_ms;
@@ -4102,6 +4164,8 @@ static size_t quic_batch_probe(CarrierRuntime *rt, int target_port,
     for (size_t i = 0; i < count; i++) {
         if (cfnat_socket_valid(fds[i])) close(fds[i]);
     }
+    debug_msg("[%s] QUIC 批量探测汇总: 候选 %zu，成功发出 %zu，收到回包 %zu，超时上限 %d ms",
+              carrier_display_name(rt ? rt->spec.mode : nullptr), count, active_fds, responded_count, timeout_ms);
     return responded_count;
 }
 
@@ -4449,6 +4513,7 @@ static ResultList scan_ips(StringList *ips, CidrList *cidrs, Config *cfg, BaiduP
     atomic_init(&ctx.cfray_miss, 0);
     atomic_init(&ctx.colo_skip, 0);
     atomic_init(&ctx.http_code_mismatch, 0);
+    atomic_init(&ctx.code_meta_skip, 0);
     log_msg("开始扫描候选 IP: %llu 个，线程: %d，单 IP 探测次数: %d，超时: %d ms",
             (unsigned long long)total_ips, threads, cfg->num > 0 ? cfg->num : 1, cfg->delay_ms);
     pthread_attr_t scan_attr;
@@ -4487,6 +4552,10 @@ static ResultList scan_ips(StringList *ips, CidrList *cidrs, Config *cfg, BaiduP
                 atomic_load(&ctx.http_code_mismatch));
         if (rl.len == 0 && atomic_load(&ctx.cfray_miss) > 0 && cfg->colo[0]) {
             warn_msg("已连接到部分 IP，但响应中没有 CF-RAY 或不匹配 -colo；可先去掉 -colo 验证网络链路");
+        }
+        if (atomic_load(&ctx.code_meta_skip) > 0) {
+            warn_msg("有 %zu 个候选因 %d 端口不可达而跳过 -code 状态码校验（其 443 TLS 与转发均正常）；如需强制校验请确保该端口可达",
+                     atomic_load(&ctx.code_meta_skip), probe_port);
         }
     }
     return rl;
@@ -4999,8 +5068,10 @@ CFNAT_NODISCARD static int carrier_health_check_ip_level(CarrierRuntime *rt, con
                 if (out_lat) *out_lat = latency;
                 return 1;
             }
+            long probe_t0 = now_ms();
             if (carrier_probe_and_check(rt, fd, probe_timeout)) {
-                if (out_lat) *out_lat = latency;
+                /* 与扫描口径一致：上报「建连 + TLS/首字节」的完整往返，而非仅 CONNECT 时间 */
+                if (out_lat) *out_lat = latency + (int)(now_ms() - probe_t0);
                 return 1;
             }
         }
@@ -5012,8 +5083,9 @@ CFNAT_NODISCARD static int carrier_health_check_ip_level(CarrierRuntime *rt, con
                     if (out_lat) *out_lat = latency;
                     return 1;
                 }
+                long probe_t1 = now_ms();
                 if (carrier_probe_and_check(rt, fd, probe_timeout)) {
-                    if (out_lat) *out_lat = latency;
+                    if (out_lat) *out_lat = latency + (int)(now_ms() - probe_t1);
                     return 1;
                 }
             }
@@ -5031,8 +5103,9 @@ CFNAT_NODISCARD static int carrier_health_check_ip_level(CarrierRuntime *rt, con
         if (out_lat) *out_lat = latency;
         return 1;
     }
+    long probe_t2 = now_ms();
     if (carrier_probe_and_check(rt, fd, probe_timeout)) {
-        if (out_lat) *out_lat = latency;
+        if (out_lat) *out_lat = latency + (int)(now_ms() - probe_t2);
         return 1;
     }
     return 0;
@@ -7124,6 +7197,26 @@ int main(int argc, char **argv) {
             } else {
                 warn_msg("[%s] 经过多轮滑动检验，未捕获到有效 UDP/QUIC 节点（当地网络可能阻断境外 UDP 443），绝不使用假节点降级，等待自愈重扫",
                          carrier_display_name(rt->spec.mode));
+                /* 百度前置的 UDP 通道始终是本机直连（HTTP CONNECT 无法承载 UDP），
+                 * 而它筛出来的 TCP 候选是按「代理出口可达性」选出的，本机直连 UDP 未必可达。
+                 * 因此这里复用已经过本机直连 UDP 验证的直连 H3 缓存，避免「百度前置 H3 永远无候选」。 */
+                if (rt->spec.use_baidu_proxy) {
+                    int uport = (rt->spec.prof.port > 0) ? rt->spec.prof.port : (g_cfg.port > 0 ? g_cfg.port : 443);
+                    int udelay = udp_probe_timeout_ms((rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms);
+                    ResultList fb = load_candidate_cache_for_profile(
+                        candidate_cache_file_for_profile_udp("direct", rt->spec.prof.ips_type), &rt->spec.prof);
+                    if (fb.len > 0 &&
+                        cache_quick_check_parallel(rt, fb.items, fb.len, 1, uport, udelay) != (size_t)-1) {
+                        rt->udp_candidates.items = fb.items;
+                        rt->udp_candidates.len = fb.len;
+                        carrier_set_current_udp_candidate(rt, 0);
+                        atomic_store(&rt->udp_candidates.cache_valid, 1);
+                        log_msg("[%s] 已复用直连 H3 候选缓存（本机直连 UDP 可达），共 %zu 个节点：百度前置仅代理 TCP，UDP 走直连",
+                                carrier_display_name(rt->spec.mode), fb.len);
+                    } else {
+                        free(fb.items);
+                    }
+                }
             }
 
             free(carrier_results.items);
