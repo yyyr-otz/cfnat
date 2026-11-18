@@ -4198,7 +4198,125 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
     return responded_count;
 }
 
-/* P0-H3: 高性能多轮滑动 + 网段裂变衍生 QUIC 探针引擎 (真实验证，绝不降级假节点) */
+static void quic_drain_socket(socket_t fd) {
+    if (cfnat_socket_invalid(fd)) return;
+    char dump[2048];
+    for (int i = 0; i < 64; i++) {
+        ssize_t n = recvfrom(fd, dump, sizeof(dump), 0, nullptr, nullptr);
+        if (n <= 0) break;
+    }
+}
+
+static int ip_in_list(char (*ips)[MAX_IP_LEN], size_t len, const char *ip) {
+    for (size_t i = 0; i < len; i++) {
+        if (strcmp(ips[i], ip) == 0) return 1;
+    }
+    return 0;
+}
+
+static int ip_in_resultlist(const ResultList *rl, const char *ip) {
+    for (size_t i = 0; i < rl->len; i++) {
+        if (strcmp(rl->items[i].ip, ip) == 0) return 1;
+    }
+    return 0;
+}
+
+/* 对单个批次执行 num 轮 QUIC 测速（首轮无回包即熔断，避免死节点耗尽超时预算），
+ * 将满足延迟阈值的合格节点合并进 udp_res，并通过 out_any_resp 返回本批次收到过回包的节点数。 */
+static size_t quic_probe_batch_multi_round(CarrierRuntime *rt, socket_t fd4, socket_t fd6,
+                                           int target_port, int timeout_ms, int max_delay, int probe_rounds,
+                                           const QuicProbeItem *batch, size_t cur_len,
+                                           ResultList *udp_res, size_t *out_any_resp) {
+    if (out_any_resp) *out_any_resp = 0;
+    if (!batch || cur_len == 0) return 0;
+
+    QuicProbeItem *round_items = calloc(cur_len, sizeof(QuicProbeItem));
+    size_t *idx_map = calloc(cur_len, sizeof(size_t));
+    int *ok_cnt = calloc(cur_len, sizeof(int));
+    int *total_lat = calloc(cur_len, sizeof(int));
+    int *min_lat = calloc(cur_len, sizeof(int));
+    int *max_lat = calloc(cur_len, sizeof(int));
+    uint8_t *active = calloc(cur_len, sizeof(uint8_t));
+    if (!round_items || !idx_map || !ok_cnt || !total_lat || !min_lat || !max_lat || !active) {
+        free(round_items);
+        free(idx_map);
+        free(ok_cnt);
+        free(total_lat);
+        free(min_lat);
+        free(max_lat);
+        free(active);
+        return 0;
+    }
+
+    for (size_t i = 0; i < cur_len; i++) {
+        active[i] = 1;
+        min_lat[i] = 1000000;
+    }
+
+    for (int r = 0; r < probe_rounds && atomic_load(&g_running); r++) {
+        size_t active_cnt = 0;
+        for (size_t i = 0; i < cur_len; i++) {
+            if (!active[i]) continue;
+            round_items[active_cnt] = batch[i];
+            round_items[active_cnt].responded = 0;
+            round_items[active_cnt].latency_ms = 0;
+            idx_map[active_cnt] = i;
+            active_cnt++;
+        }
+        if (active_cnt == 0) break;
+
+        quic_drain_socket(fd4);
+        quic_drain_socket(fd6);
+        quic_batch_probe(rt, fd4, fd6, target_port, timeout_ms, round_items, active_cnt, active_cnt);
+
+        for (size_t k = 0; k < active_cnt; k++) {
+            size_t orig = idx_map[k];
+            if (round_items[k].responded) {
+                int lat = round_items[k].latency_ms;
+                ok_cnt[orig]++;
+                total_lat[orig] += lat;
+                if (lat < min_lat[orig]) min_lat[orig] = lat;
+                if (lat > max_lat[orig]) max_lat[orig] = lat;
+            } else if (r == 0) {
+                /* 首轮无回包立即熔断，不再浪费后续 num-1 轮超时等待 */
+                active[orig] = 0;
+            }
+        }
+    }
+
+    size_t added = 0;
+    size_t any_resp = 0;
+    for (size_t i = 0; i < cur_len; i++) {
+        if (ok_cnt[i] <= 0) continue;
+        any_resp++;
+        int avg_lat = total_lat[i] / ok_cnt[i];
+        if (avg_lat <= 0 || (max_delay > 0 && avg_lat > max_delay)) continue;
+        if (ip_in_resultlist(udp_res, batch[i].res.ip)) continue;
+
+        Result res = batch[i].res;
+        res.latency_ms = avg_lat;
+        res.ewma_latency = avg_lat;
+        res.jitter_ms = (ok_cnt[i] > 1 && max_lat[i] >= min_lat[i]) ? (max_lat[i] - min_lat[i]) : 0;
+        res.probe_count = probe_rounds;
+        res.success_count = ok_cnt[i];
+        res.loss_rate = ((probe_rounds - ok_cnt[i]) * 100) / probe_rounds;
+        resultlist_add(udp_res, &res);
+        added++;
+    }
+
+    if (out_any_resp) *out_any_resp = any_resp;
+
+    free(round_items);
+    free(idx_map);
+    free(ok_cnt);
+    free(total_lat);
+    free(min_lat);
+    free(max_lat);
+    free(active);
+    return added;
+}
+
+/* P0-H3: 高性能多轮 QUIC 测速 + 原池子网裂变循环补齐引擎 (真实验证，绝不降级假节点) */
 static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Result *tcp_results, size_t count, size_t target_ipnum) {
     ResultList udp_res = {0};
     if (!tcp_results || count == 0 || target_ipnum == 0) return udp_res;
@@ -4207,9 +4325,14 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
     if (desired_count > 64) desired_count = 64;
     if (desired_count < 2) desired_count = 2;
 
+    int probe_rounds = (rt->spec.prof.num > 0) ? rt->spec.prof.num : g_cfg.num;
+    if (probe_rounds < 1) probe_rounds = 1;
+    if (probe_rounds > 50) probe_rounds = 50;
+
+    int max_delay = (rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms;
     int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
     if (target_port <= 0) target_port = 443;
-    int timeout_ms = udp_probe_timeout_ms((rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms);
+    int timeout_ms = udp_probe_timeout_ms(max_delay);
     if (timeout_ms < 1000) timeout_ms = 1000;
     if (timeout_ms > 2500) timeout_ms = 2500;
 
@@ -4241,83 +4364,88 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
         return udp_res; /* 严禁降级假节点 */
     }
 
-
-
     long total_start = now_ms();
-    size_t batch_size = desired_count > 32 ? 32 : desired_count;
-    if (batch_size < 16 && count >= 16) batch_size = 16;
+    /* H3 并发批次严格按 2 * num 执行（上下界保护 [2, 128]） */
+    size_t batch_size = (size_t)probe_rounds * 2;
+    if (batch_size < 2) batch_size = 2;
+    if (batch_size > 128) batch_size = 128;
 
+    QuicProbeItem *probe_items = calloc(batch_size, sizeof(QuicProbeItem));
+    size_t tried_cap = 1024;
+    size_t tried_len = 0;
+    char (*tried_ips)[MAX_IP_LEN] = calloc(tried_cap, sizeof(*tried_ips));
+    if (!probe_items || !tried_ips) {
+        free(probe_items);
+        free(tried_ips);
+        if (cfnat_socket_valid(fd4)) close(fd4);
+        if (cfnat_socket_valid(fd6)) close(fd6);
+        return udp_res;
+    }
+
+    for (size_t i = 0; i < count && tried_len < tried_cap; i++) {
+        snprintf(tried_ips[tried_len++], MAX_IP_LEN, "%s", tcp_results[i].ip);
+    }
+
+    size_t stage1_any_resp = 0;
     size_t offset = 0;
-    int round_idx = 1;
+    int batch_idx = 1;
 
-    Result seeds[64];
-    size_t seed_count = 0;
-
-    QuicProbeItem probe_items[64];
-
-    // 阶段一：滑动批次检验 TCP 候选池
-    while (offset < count && udp_res.len < desired_count) {
+    /* 阶段一：按 2*num 批次遍历原 TCP 候选池，每批进行 num 轮 QUIC 测速 */
+    while (offset < count && udp_res.len < desired_count && atomic_load(&g_running)) {
         size_t cur_len = count - offset;
         if (cur_len > batch_size) cur_len = batch_size;
 
-        log_msg("[%s] [H3筛选/第%d轮] 正在并发检验第 %zu~%zu 个 TCP 候选 IP 的 UDP/QUIC 响应...",
-                carrier_display_name(rt->spec.mode), round_idx, offset + 1, offset + cur_len);
+        log_msg("[%s] [H3筛选/第%d批] 并发检验第 %zu~%zu 个 TCP 候选 IP (批次 %zu, 测速 %d 轮)...",
+                carrier_display_name(rt->spec.mode), batch_idx, offset + 1, offset + cur_len, cur_len, probe_rounds);
 
-        memset(probe_items, 0, sizeof(probe_items));
+        memset(probe_items, 0, cur_len * sizeof(QuicProbeItem));
         for (size_t i = 0; i < cur_len; i++) {
             probe_items[i].res = tcp_results[offset + i];
             probe_items[i].addr = probe_items[i].res.addr;
             probe_items[i].addr_len = probe_items[i].res.addr_len;
         }
 
-        size_t needed = desired_count - udp_res.len;
-        size_t responded = quic_batch_probe(rt, fd4, fd6, target_port, timeout_ms, probe_items, cur_len, needed);
+        size_t batch_resp = 0;
+        size_t added = quic_probe_batch_multi_round(rt, fd4, fd6, target_port, timeout_ms, max_delay, probe_rounds,
+                                                    probe_items, cur_len, &udp_res, &batch_resp);
+        stage1_any_resp += batch_resp;
+        if (added == 0 && batch_resp == 0) {
+            debug_msg("[%s] 第 %zu~%zu 个 TCP 候选 IP 全无 UDP 回包，向后滑动选取下一批...",
+                      carrier_display_name(rt->spec.mode), offset + 1, offset + cur_len);
+        }
 
-        if (responded > 0) {
-            for (size_t i = 0; i < cur_len; i++) {
-                if (probe_items[i].responded) {
-                    Result r = probe_items[i].res;
-                    r.latency_ms = probe_items[i].latency_ms;
-                    r.ewma_latency = probe_items[i].latency_ms;
-                    r.loss_rate = 0;
-                    r.success_count = 1;
-                    r.probe_count = 1;
-                    resultlist_add(&udp_res, &r);
+        offset += cur_len;
+        batch_idx++;
+    }
 
-                    if (seed_count < 64) {
-                        seeds[seed_count++] = r;
-                    }
-                }
-            }
+    /* 阶段二：若合格 H3 节点不足 ipnum 个（且阶段一确认 UDP 443 可达），
+     * 从原 ipnum 个 IP 的 IPv6 /64 或 IPv4 /24 子网循环裂变（每 IP 裂变 2 个，按 2*num 批次测 num 轮）直至补足 */
+    if (stage1_any_resp > 0 && udp_res.len < desired_count && atomic_load(&g_running)) {
+        size_t base_count = (count < desired_count) ? count : desired_count;
+        size_t max_derived = base_count * 2;
+        QuicProbeItem *derived_items = calloc(max_derived, sizeof(QuicProbeItem));
 
-            // 阶段二：网段裂变衍生 (Subnet Expansion)
-            if (seed_count > 0 && udp_res.len < desired_count) {
-                size_t deficit = desired_count - udp_res.len;
-                if (deficit > 32) deficit = 32;
-
-                QuicProbeItem derived_items[32];
-                memset(derived_items, 0, sizeof(derived_items));
+        if (derived_items) {
+            const int max_fission_rounds = 6;
+            for (int f_round = 1; f_round <= max_fission_rounds && udp_res.len < desired_count && atomic_load(&g_running); f_round++) {
                 size_t derived_count = 0;
-
-                for (size_t d = 0; d < deficit; d++) {
-                    const Result *base_seed = &seeds[d % seed_count];
-                    char sibling_ip[MAX_IP_LEN] = {0};
-
-                    for (int tries = 0; tries < 5; tries++) {
-                        if (!sample_sibling_ip_from_subnet(base_seed->ip, sibling_ip, sizeof(sibling_ip))) break;
-                        int dup = 0;
-                        for (size_t u = 0; u < udp_res.len; u++) {
-                            if (strcmp(udp_res.items[u].ip, sibling_ip) == 0) { dup = 1; break; }
-                        }
-                        if (!dup) {
-                            for (size_t u = 0; u < derived_count; u++) {
-                                if (strcmp(derived_items[u].res.ip, sibling_ip) == 0) { dup = 1; break; }
+                for (size_t b = 0; b < base_count; b++) {
+                    const Result *base_seed = &tcp_results[b];
+                    for (int s = 0; s < 2; s++) {
+                        char sibling_ip[MAX_IP_LEN] = {0};
+                        int picked = 0;
+                        for (int tries = 0; tries < 8; tries++) {
+                            if (!sample_sibling_ip_from_subnet(base_seed->ip, sibling_ip, sizeof(sibling_ip))) break;
+                            if (!ip_in_list(tried_ips, tried_len, sibling_ip)) {
+                                picked = 1;
+                                break;
                             }
                         }
-                        if (!dup) break;
-                    }
-
-                    if (sibling_ip[0]) {
+                        if (!picked) continue;
+                        if (tried_len < tried_cap) {
+                            snprintf(tried_ips[tried_len++], MAX_IP_LEN, "%s", sibling_ip);
+                        }
+                        derived_items[derived_count] = (QuicProbeItem){0};
                         derived_items[derived_count].res = *base_seed;
                         snprintf(derived_items[derived_count].res.ip, sizeof(derived_items[derived_count].res.ip), "%s", sibling_ip);
                         result_init_addr(&derived_items[derived_count].res);
@@ -4327,49 +4455,45 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
                     }
                 }
 
-                if (derived_count > 0) {
-                    log_msg("[%s] [H3网段衍生] 基于已捕获的 %zu 个优质种子网段，裂变衍生 %zu 个同网段 IP 启动快速并发检验...",
-                            carrier_display_name(rt->spec.mode), seed_count, derived_count);
-                    quic_batch_probe(rt, fd4, fd6, target_port, timeout_ms, derived_items, derived_count, desired_count - udp_res.len);
+                if (derived_count == 0) break;
 
-                    for (size_t d = 0; d < derived_count; d++) {
-                        if (derived_items[d].responded) {
-                            Result r = derived_items[d].res;
-                            r.latency_ms = derived_items[d].latency_ms;
-                            r.ewma_latency = derived_items[d].latency_ms;
-                            r.loss_rate = 0;
-                            r.success_count = 1;
-                            r.probe_count = 1;
-                            resultlist_add(&udp_res, &r);
-                        }
-                    }
+                log_msg("[%s] [H3子网裂变/第%d轮] 当前合格 %zu/%zu，从原 %zu 个 IP 各裂变 2 个共 %zu 个同网段 IP (批次 %zu, 测速 %d 轮)...",
+                        carrier_display_name(rt->spec.mode), f_round, udp_res.len, desired_count,
+                        base_count, derived_count, batch_size, probe_rounds);
+
+                size_t round_added = 0;
+                size_t round_resp = 0;
+                for (size_t d_off = 0; d_off < derived_count && udp_res.len < desired_count && atomic_load(&g_running); d_off += batch_size) {
+                    size_t d_len = derived_count - d_off;
+                    if (d_len > batch_size) d_len = batch_size;
+                    size_t b_resp = 0;
+                    round_added += quic_probe_batch_multi_round(rt, fd4, fd6, target_port, timeout_ms, max_delay, probe_rounds,
+                                                                &derived_items[d_off], d_len, &udp_res, &b_resp);
+                    round_resp += b_resp;
+                }
+
+                if (round_added == 0 && round_resp == 0) {
+                    break;
                 }
             }
-
-            if (udp_res.len >= desired_count) {
-                break;
-            }
-        } else {
-            debug_msg("[%s] 第 %zu~%zu 个 TCP 候选 IP 全无 UDP 回包（可能被丢包/阻断），向后滑动选取下一批...",
-                      carrier_display_name(rt->spec.mode), offset + 1, offset + cur_len);
+            free(derived_items);
         }
-
-        offset += cur_len;
-        round_idx++;
     }
 
+    free(probe_items);
+    free(tried_ips);
     if (cfnat_socket_valid(fd4)) close(fd4);
     if (cfnat_socket_valid(fd6)) close(fd6);
 
     if (udp_res.len > 0) {
         qsort(udp_res.items, udp_res.len, sizeof(Result), cmp_result);
         if (udp_res.len > desired_count) udp_res.len = desired_count;
-        log_msg("[%s] UDP/QUIC 精筛完成: 捕获 %zu 个真实有效 H3 候选 (目标: %zu)，最优延迟: %d ms (%s)，总耗时: %ld ms",
-                carrier_display_name(rt->spec.mode), udp_res.len, desired_count,
+        log_msg("[%s] UDP/QUIC 多轮精筛完成: 捕获 %zu 个真实有效 H3 候选 (目标: %zu, 每IP %d 轮)，最优延迟: %d ms (%s)，总耗时: %ld ms",
+                carrier_display_name(rt->spec.mode), udp_res.len, desired_count, probe_rounds,
                 udp_res.items[0].latency_ms, udp_res.items[0].ip,
                 now_ms() - total_start);
     } else {
-        warn_msg("[%s] 遍历全部 %zu 个 TCP 候选 IP 均无 UDP/QUIC 回包（当前运营商可能阻断境外 UDP 443），绝不使用假节点降级，保持真实 UDP 状态等待自愈重扫",
+        warn_msg("[%s] 遍历全部 %zu 个 TCP 候选 IP 均无合格 UDP/QUIC 节点（当前运营商可能阻断境外 UDP 443 或超时），绝不使用假节点降级，保持真实 UDP 状态等待自愈重扫",
                  carrier_display_name(rt->spec.mode), count);
     }
 
