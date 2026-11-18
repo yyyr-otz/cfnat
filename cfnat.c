@@ -499,8 +499,8 @@ static CidrList load_cidr_list(const char *filename, int random_mode) {
         *slash = 0;
         int prefix = atoi(slash + 1);
         uint32_t base = ipv4_to_u32(line);
-        if (base == 0 || prefix < 0 || prefix > 32) continue;
-        uint32_t mask = prefix == 0 ? 0 : (0xffffffffu << (32 - prefix));
+        if (base == 0 || prefix < 8 || prefix > 32) continue;
+        uint32_t mask = (0xffffffffu << (32 - prefix));
         uint32_t start = base & mask;
         uint32_t count = prefix == 32 ? 1u : (1u << (32 - prefix));
         cidrlist_add(&cl, start, count, prefix);
@@ -1312,8 +1312,11 @@ static void parse_args(Config *c, int argc, char **argv) {
 
     if (c->delay_ms <= 0) c->delay_ms = 300;
     if (c->ipnum <= 0) c->ipnum = 20;
+    if (c->ipnum > 1000) c->ipnum = 1000;
     if (c->num <= 0) c->num = 1;
+    if (c->num > 50) c->num = 50;
     if (c->task <= 0) c->task = 1;
+    if (c->task > 2000) c->task = 2000;
     if (c->baidu_port <= 0) c->baidu_port = 443;
     if (c->baidu_ipnum <= 0) c->baidu_ipnum = 12;
 
@@ -1816,10 +1819,11 @@ static StringList load_ip_list(const char *filename, int random_mode, int v6_spl
             continue;
         }
         uint32_t base = ipv4_to_u32(line);
-        if (base == 0 || prefix < 0 || prefix > 32) continue;
-        uint32_t mask = prefix == 0 ? 0 : (0xffffffffu << (32 - prefix));
+        if (base == 0 || prefix < 8 || prefix > 32) continue;
+        uint32_t mask = (0xffffffffu << (32 - prefix));
         uint32_t start = base & mask;
         uint64_t count = prefix == 32 ? 1ULL : (1ULL << (32 - prefix));
+        if (!random_mode && count > 65536) count = 65536;
         if (random_mode) {
             uint32_t off = count > 1 ? (uint32_t)(rand_u64() % count) : 0;
             char ip[MAX_IP_LEN];
@@ -1982,15 +1986,19 @@ static void set_loopback_fast_path(socket_t s) {
 static inline void set_loopback_fast_path(socket_t s) { (void)s; }
 #endif
 
-/* 套接字缓冲区高 BDP 深度优化：UDP 优先 4MB (回退 2MB/1MB) 吸收 QUIC 突发，TCP 优先 2MB (回退 1MB/512KB) 跑满高延迟大带宽 */
-static void tune_socket_buffers(socket_t s, int is_udp) {
+/* 套接字缓冲区分级调优：
+ * mode 0: TCP 转发 (优先 2MB，回退 1MB/512KB)；
+ * mode 1: UDP 监听 (优先 4MB，回退 2MB/1MB) 吸收多路复用突发；
+ * mode 2: UDP 会话 (优先 1MB，回退 512KB/256KB) 避免 256+ 会话耗尽内核内存 */
+static void tune_socket_buffers(socket_t s, int mode) {
     if (cfnat_socket_invalid(s)) return;
-    const int tiers_udp[3] = { 4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024 };
     const int tiers_tcp[3] = { 2 * 1024 * 1024, 1024 * 1024, 512 * 1024 };
-    const int *tiers = is_udp ? tiers_udp : tiers_tcp;
+    const int tiers_udp_listen[3] = { 4 * 1024 * 1024, 2 * 1024 * 1024, 1024 * 1024 };
+    const int tiers_udp_session[3] = { 1024 * 1024, 512 * 1024, 256 * 1024 };
+    const int *tiers = (mode == 1) ? tiers_udp_listen : ((mode == 2) ? tiers_udp_session : tiers_tcp);
+    int is_udp = (mode == 1 || mode == 2);
 #if defined(__linux__)
-    /* P2-3: Linux 下显式对 TCP 套接字设置 SO_RCVBUF 会锁定窗口并破坏内核 tcp_moderate_rcvbuf 自动伸缩；
-     * 仅对 UDP 套接字显式调大 SO_RCVBUF 吸收 QUIC 突发，TCP 则完全交由 Linux 内核依据 BDP 动态调整。 */
+    /* Linux 下仅对 UDP 显式设 SO_RCVBUF，TCP 默认保留内核自动调优 tcp_moderate_rcvbuf */
     if (is_udp) {
         for (int i = 0; i < 3; i++) {
             int sz = tiers[i];
@@ -3349,11 +3357,14 @@ static void *scan_worker(void *arg) {
         char best_colo[MAX_COLO_LEN] = {0};
         int code_matched = 0;
 
-        /* Keep-Alive 复用连接 */
+        /* Keep-Alive 复用连接与自适应探测次数 (L3: TLS 纯测速适度轻量化为 2 次独立建连) */
         socket_t fd = INVALID_SOCKET;
         int conn_lat = 0;
-        for (int attempt = 0; atomic_load(&g_running) && attempt < probes; attempt++) {
+        int eff_probes = (is_tls && !need_http_info) ? (probes > 2 ? 2 : probes) : probes;
+        for (int attempt = 0; atomic_load(&g_running) && attempt < eff_probes; attempt++) {
             int cur_latency = 0;
+            char cur_colo[MAX_COLO_LEN] = {0}; /* E1 修复：在循环体首部声明，避免跨作用域未定义 */
+
             if (is_tls && !need_http_info) {
                 /* P0-1: TLS 纯测速链路——直接在目标转发端口 (443) 建立 TLS ClientHello 握手，测量真实端到端 RTT */
                 conn_lat = 0;
@@ -3372,9 +3383,10 @@ static void *scan_worker(void *arg) {
                     if (attempt == 0) break;
                     continue;
                 }
-                cur_latency = (int)(t_end - t_start) + (conn_lat > 0 ? conn_lat : 0);
-                if (cur_latency <= 0) cur_latency = 1;
-                if (!best_colo[0]) snprintf(best_colo, sizeof(best_colo), "TLS");
+                /* L2 修复：严格对齐 1x RTT 物理口径，杜绝叠加 TCP 握手导致延迟虚高翻倍 */
+                int tls_rtt = (int)(t_end - t_start);
+                cur_latency = tls_rtt > 0 ? tls_rtt : (conn_lat > 0 ? conn_lat : 1);
+                /* L1 修复：TLS 纯测速无 CF-RAY，保留 cur_colo 为空串，杜绝写入 "TLS" 脏哨兵值破坏缓存 */
             } else {
                 /* HTTP / 携带 -colo 或 -code 筛选链路：通过 HTTP HEAD 提取机房与状态码 */
                 if (cfnat_socket_invalid(fd)) {
@@ -3424,12 +3436,11 @@ static void *scan_worker(void *arg) {
                     }
                 }
 
-                char colo[MAX_COLO_LEN] = {0};
-                if (extract_cfray(hdr, colo, sizeof(colo)) != 0) {
+                if (extract_cfray(hdr, cur_colo, sizeof(cur_colo)) != 0) {
                     atomic_fetch_add(&ctx->cfray_miss, 1);
                     break; /* 缺少 CF-RAY 报头直接剪枝 */
                 }
-                if (!colo_rule_allowed(ctx->cfg->colo, colo)) {
+                if (!colo_rule_allowed(ctx->cfg->colo, cur_colo)) {
                     atomic_fetch_add(&ctx->colo_skip, 1);
                     break; /* 数据中心不匹配直接剪枝，避免对不合格机房浪费后续探测 */
                 }
@@ -3453,8 +3464,8 @@ static void *scan_worker(void *arg) {
                         atomic_fetch_add(&ctx->header_fail, 1);
                         break;
                     }
-                    int tls_lat = (int)(t_tls_end - t_tls_start) + (tls_conn_lat > 0 ? tls_conn_lat : 0);
-                    if (tls_lat > 0) cur_latency = tls_lat;
+                    int tls_lat = (int)(t_tls_end - t_tls_start);
+                    cur_latency = tls_lat > 0 ? tls_lat : (tls_conn_lat > 0 ? tls_conn_lat : cur_latency);
                 }
             }
 
@@ -3481,8 +3492,8 @@ static void *scan_worker(void *arg) {
                 prev_latency = cur_latency;
             }
 
-            if (!best_colo[0] || cur_latency <= best_latency) {
-                snprintf(best_colo, sizeof(best_colo), "%s", colo);
+            if (cur_colo[0] && (!best_colo[0] || cur_latency <= best_latency)) {
+                snprintf(best_colo, sizeof(best_colo), "%s", cur_colo);
             }
         }
         if (cfnat_socket_valid(fd)) close(fd);
@@ -3550,7 +3561,7 @@ static void *scan_worker(void *arg) {
         r.addr_len = target_salen;
         snprintf(r.data_center, sizeof(r.data_center), "%s", best_colo);
         r.latency_ms = avg_latency;
-        r.probe_count = probes;
+        r.probe_count = eff_probes;
         r.success_count = success_count;
         r.loss_rate = (probes - success_count) * 100 / probes;
         r.ewma_latency = ewma_latency > 0 ? ewma_latency : avg_latency;
@@ -3790,7 +3801,7 @@ static ResultList load_candidate_cache_for_profile(const char *path, const Profi
         if (r.success_count <= 0) r.success_count = 1;
         /* P0-EWMA: 如果 v1 格式没有 EWMA 字段，用原始延迟初始化 */
         if (r.ewma_latency <= 0) r.ewma_latency = r.latency_ms;
-        if (colo_rule[0] && strcmp(r.data_center, "UNK") != 0 && !colo_rule_allowed(colo_rule, r.data_center)) continue;
+        if (colo_rule[0] && strcmp(r.data_center, "UNK") != 0 && r.data_center[0] != '\0' && !colo_rule_allowed(colo_rule, r.data_center)) continue;
         resultlist_add(&rl, &r);
         if (max_ips > 0 && rl.len >= (size_t)max_ips) break;
     }
@@ -4696,7 +4707,7 @@ static void *connection_thread(void *arg) {
              cc->conn_id, carrier_name,
              is_tls ? "TLS" : "非TLS", cc->ip, target_port);
     int best = 0;
-    upstream_dialed = 1;
+    int upstream_failed = 0;
 
     if (cc->use_mixed) {
         for (int i = 0; i < cc->num; i++) {
@@ -4766,8 +4777,20 @@ static void *connection_thread(void *arg) {
         }
     }
 
+    /* 非 TLS 流量（如 VMess/VLESS 明文、SS）80 连接失败时自动回退 443 端口 */
+    if (cfnat_socket_invalid(upstream) && !is_tls && cc->tls_port > 0 && target_port != cc->tls_port) {
+        target_port = cc->tls_port;
+        int lat = 0;
+        upstream = dial_target_with_proxy_sa(cc->ip, &cc->ip_addr, cc->ip_addr_len, target_port, cc->delay_ms, cc->proxy_pool, &lat);
+        if (cfnat_socket_valid(upstream)) {
+            best = lat;
+            conn_msg("[TCP/H2] #%llu [%s] 非TLS 80失败回退443成功: %s:%d (延迟 %d ms)", cc->conn_id, carrier_name, cc->ip, target_port, best);
+        }
+    }
+
     if (cfnat_socket_invalid(upstream)) {
         debug_msg("[TCP/H2] #%llu [%s] 未找到符合延迟要求的连接，关闭客户端连接", cc->conn_id, carrier_name);
+        upstream_failed = 1; /* 拨号失败，确定为上游故障 */
         goto out;
     }
     /* client 已在 accept 阶段设置 TCP_NODELAY 与 256KB 缓冲，upstream 已在 connect 阶段设置 TCP_NODELAY，仅需补充 upstream 缓冲 */
@@ -4775,6 +4798,8 @@ static void *connection_thread(void *arg) {
     int had_data = relay_bidirectional(client, upstream);
     if (had_data > 0 || (now_ms() - conn_start_ms) >= 3000) {
         conn_ok = 1;
+    } else if (had_data < 0) {
+        upstream_failed = 1; /* 上游异常重置或读超时 */
     }
 out:
     if (cfnat_socket_valid(upstream)) close(upstream);
@@ -4782,8 +4807,8 @@ out:
     if (atomic_load(&g_running) && cc->runtime && cc->ip[0]) {
         if (conn_ok) {
             carrier_note_connection_success(cc->runtime, cc->ip);
-        } else if (upstream_dialed) {
-            /* 仅当已向上游发起连接且失败/异常中断时才惩罚节点，排除客户端首包前主动挂断或嗅探超时的误判 */
+        } else if (upstream_failed) {
+            /* 严格排除客户端首字节前挂断或取消预连接的误判，仅在上游拨号失败或上游异常中断时惩罚节点 */
             carrier_note_connection_failed(cc->runtime, cc->ip);
         }
     }
@@ -5683,14 +5708,14 @@ static int parse_addr(const char *addr, char *host, size_t hostsz, int *port) {
         memcpy(host, addr + 1, n);
         host[n] = 0;
         *port = atoi(end + 2);
-        return *port > 0 ? 0 : -1;
+        return (*port > 0 && *port <= 65535) ? 0 : -1;
     }
     const char *colon = strrchr(addr, ':');
     if (!colon) {
         // 只有端口号的情况，例如 "1234"
         snprintf(host, hostsz, "0.0.0.0");
         *port = atoi(addr);
-        return *port > 0 ? 0 : -1;
+        return (*port > 0 && *port <= 65535) ? 0 : -1;
     }
     size_t n = (size_t)(colon - addr);
     if (n >= hostsz) n = hostsz - 1;
@@ -5698,7 +5723,7 @@ static int parse_addr(const char *addr, char *host, size_t hostsz, int *port) {
     host[n] = 0;
     *port = atoi(colon + 1);
     if (!host[0]) snprintf(host, hostsz, "0.0.0.0");
-    return *port > 0 ? 0 : -1;
+    return (*port > 0 && *port <= 65535) ? 0 : -1;
 }
 
 static socket_t listen_tcp(const char *addr) {
@@ -5898,7 +5923,7 @@ static socket_t udp_connect_upstream_sa(const char *ip, const struct sockaddr_st
 #endif
 
     bind_socket_to_interface(fd, is_v6 ? AF_INET6 : AF_INET);
-    tune_socket_buffers(fd, 1);
+    tune_socket_buffers(fd, 2); /* 会话套接字使用 1MB/512KB 分级缓冲，防止内存暴涨 */
     set_nonblock(fd, 1);
 
     if (connect(fd, (struct sockaddr *)&ss, slen) != 0) {
@@ -6172,6 +6197,9 @@ static void *carrier_udp_thread(void *arg) {
                         }
                         sess->last_active_ms = cur_ms;
                         for (int m = 0; m < nmsg; m++) {
+#ifdef MSG_TRUNC
+                            if (msgs[m].msg_hdr.msg_flags & MSG_TRUNC) continue; /* L5: 丢弃内核截断残报文 */
+#endif
                             unsigned int blen = msgs[m].msg_len;
                             ssize_t sent = sendto(rt->udp_listen_fd, batch_bufs[m], blen, 0, (struct sockaddr *)&sess->client_addr, sess->client_addr_len);
                             if (sent > 0) sess->bytes_down += (uint64_t)sent;
@@ -6222,6 +6250,9 @@ static void *carrier_udp_thread(void *arg) {
                 }
                 if (nmsg <= 0) break;
                 for (int m = 0; m < nmsg; m++) {
+#ifdef MSG_TRUNC
+                    if (msgs[m].msg_hdr.msg_flags & MSG_TRUNC) continue; /* L5: 丢弃内核截断残报文 */
+#endif
                     unsigned int blen = msgs[m].msg_len;
                     if (blen == 0) continue;
                     struct sockaddr_storage *c_ss = &client_addrs[m];
@@ -6544,6 +6575,16 @@ int main(int argc, char **argv) {
                 }
             }
 
+            /* 冷启动预监听：在执行 20~30s IP 扫描前提前绑定端口，让客户端连接在内核队列排队，彻底杜绝 RST */
+            if (cfnat_socket_invalid(rt->listen_fd)) {
+                rt->listen_fd = listen_tcp(rt->spec.addr);
+                rt->udp_listen_fd = listen_udp(rt->spec.addr);
+                if (cfnat_socket_valid(rt->listen_fd)) {
+                    log_msg("[%s] 预绑定监听端口成功 %s (消除冷启动 RST，握手先入内核队列)",
+                            carrier_display_name(rt->spec.mode), rt->spec.addr);
+                }
+            }
+
             Config scan_cfg = g_cfg;
             scan_cfg.ips_type = rt->spec.prof.ips_type;
             scan_cfg.port = rt->spec.prof.port;
@@ -6636,8 +6677,10 @@ int main(int argc, char **argv) {
                 rt->udp_candidates.len = 0;
                 continue;
             }
-            rt->listen_fd = listen_tcp(rt->spec.addr);
-            rt->udp_listen_fd = listen_udp(rt->spec.addr);
+            if (cfnat_socket_invalid(rt->listen_fd)) {
+                rt->listen_fd = listen_tcp(rt->spec.addr);
+                rt->udp_listen_fd = listen_udp(rt->spec.addr);
+            }
             if (cfnat_socket_invalid(rt->listen_fd)) {
                 log_msg("[%s] 无法监听 %s: %s", carrier_display_name(rt->spec.mode), rt->spec.addr, strerror(errno));
                 if (cfnat_socket_valid(rt->udp_listen_fd)) {
