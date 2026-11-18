@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.17"
+#define CFNAT_VERSION "0.0.18"
 
 /* =========================================================================
  * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
@@ -2230,34 +2230,14 @@ static void format_bytes(uint64_t b, char *out, size_t outsz) {
     }
 }
 
-/* RFC 9000 规范的 1200 字节 QUIC Version Negotiation 轻量探针
+/* RFC 9000 规范的 1200 字节 QUIC Version Negotiation 单发探针（与 0.0.16 逐字一致）
  * 利用保留版本号 0x5A5A5A5A 触发 Cloudflare 边缘节点立即回包 Version Negotiation
  * 零密钥协商，零 CPU 加密开销，单包 1200 字节符合防放大攻击标准，精准测出 UDP 443 真实延迟
  *
- * 注意（实测回归点）：头部之后的载荷必须保持全零。
- * 曾把 23..1199 填成伪随机字节以「规避全零洪泛 DPI」，结果 Cloudflare 侧按 Initial 报文
- * 结构解析载荷，随机字节被当成 Token Length / Length 变长整数，绝大多数包被判为畸形包
- * 直接丢弃（实测同一节点：全零载荷 8/8 有 Version Negotiation 回包，随机载荷仅 1~3/8）。
- * 表现为 v4/v6 的 H3 精筛恒为 0 个候选、health check 一直「QUIC 无响应」。 */
-static void build_quic_vn_probe(uint8_t pkt[1200], uint32_t version, uint64_t seed) {
-    memset(pkt, 0, 1200);
-    pkt[0] = 0xC0;
-    pkt[1] = (uint8_t)((version >> 24) & 0xFF);
-    pkt[2] = (uint8_t)((version >> 16) & 0xFF);
-    pkt[3] = (uint8_t)((version >> 8) & 0xFF);
-    pkt[4] = (uint8_t)(version & 0xFF);
-    pkt[5] = 0x08; /* DCID Len */
-    uint64_t x = seed ? seed : 0x9E3779B97F4A7C15ULL;
-    x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
-    uint64_t dcid = x * 0x2545F4914F6CDD1DULL;
-    memcpy(pkt + 6, &dcid, 8);
-    pkt[14] = 0x08; /* SCID Len */
-    x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
-    uint64_t scid = x * 0x2545F4914F6CDD1DULL;
-    memcpy(pkt + 15, &scid, 8);
-    /* 23..1199 保持全零：既满足 1200B 最小包长，又让载荷按合法的空 Initial 语义被解析 */
-}
-
+ * 关键约束：头部（0..22）之后的 1177 字节必须保持**全零**。
+ * Cloudflare 会按 Initial 报文结构解析载荷，把随机字节当作 Token Length / Length 变长整数，
+ * 绝大多数包被判为畸形包直接丢弃（同一节点实测：全零载荷 8/8 有回包，随机载荷仅 1~3/8）。
+ * 一旦填充随机数据，表现为 v4/v6 的 H3 精筛恒为 0 个候选、健康检查一直「QUIC 无响应」。 */
 CFNAT_NODISCARD static int quic_probe_ip(const char *ip, int port, int timeout_ms, int *latency_ms) {
     if (!ip || !*ip || port <= 0) return 0;
     int is_v6 = (strchr(ip, ':') != nullptr);
@@ -2277,7 +2257,15 @@ CFNAT_NODISCARD static int quic_probe_ip(const char *ip, int port, int timeout_m
     set_nonblock(fd, 1);
 
     uint8_t pkt[1200];
-    build_quic_vn_probe(pkt, 0x5A5A5A5AU, rand_u64() ^ (uint64_t)now_ms());
+    memset(pkt, 0, sizeof(pkt));
+    pkt[0] = 0xC0;
+    pkt[1] = 0x5A; pkt[2] = 0x5A; pkt[3] = 0x5A; pkt[4] = 0x5A;
+    pkt[5] = 0x08; /* DCID Len */
+    uint32_t seed = (uint32_t)now_ms();
+    memcpy(pkt + 6, &seed, 4);
+    pkt[14] = 0x08; /* SCID Len */
+    uint32_t scid = ~seed;
+    memcpy(pkt + 15, &scid, 4);
 
     struct sockaddr_storage ss;
     socklen_t sslen = 0;
@@ -2319,7 +2307,7 @@ CFNAT_NODISCARD static int quic_probe_ip(const char *ip, int port, int timeout_m
     ssize_t n = recv(fd, resp, sizeof(resp), 0);
     close(fd);
 
-    /* 必须接收到合法的 QUIC 长包头 (Version Negotiation 或 Initial 回包: 头部 0x80 置位且长度 >= 7) */
+    /* 合法的 QUIC 长包头回包 (Version Negotiation / Initial)：首字节 0x80 置位且长度 >= 7 */
     if (n >= 7 && ((uint8_t)resp[0] & 0x80) != 0) {
         long elapsed = now_ms() - start;
         if (latency_ms) *latency_ms = elapsed > 0 ? (int)elapsed : 1;
@@ -3621,6 +3609,32 @@ static void *scan_worker(void *arg) {
                 snprintf(best_colo, sizeof(best_colo), "%s", cur_colo);
             }
         }
+
+        /* 百度前置兜底通道：隧道内 80 端口 HEAD 全部失败时，改用目标端口(443) TLS 再验一次。
+         * 隧道出口的 80/443 策略可能不同（0.0.16 只测 80，没有这条兜底），
+         * 若只剩 443 可用，没有它就会整栈 0 候选（表现为「百度前置完全不可用」）。
+         * 该兜底只在 80 完全无果时触发，健康节点不会付出额外开销。 */
+        if (success_count == 0 && ctx->proxy_pool && !is_tls && atomic_load(&g_running)) {
+            int tls_conn_lat = 0;
+            socket_t tfd = dial_target_with_proxy_sa(ip, &target_sa, target_salen, target_port,
+                                                     ctx->cfg->delay_ms, ctx->proxy_pool, &tls_conn_lat);
+            if (cfnat_socket_valid(tfd)) {
+                long t0 = now_ms();
+                int ok = tls_probe_host(tfd, hdr_timeout, ctx->probe_host);
+                long t1 = now_ms();
+                close(tfd);
+                if (ok) {
+                    int lat = (int)(t1 - t0);
+                    if (lat <= 0) lat = tls_conn_lat > 0 ? tls_conn_lat : 1;
+                    success_count = eff_probes; /* 兜底路径视为本轮全部存活，避免 loss_rate 误判重罚 */
+                    total_latency = lat * success_count;
+                    best_latency = lat;
+                    ewma_latency = lat;
+                    jitter_ms = 0;
+                    debug_msg("IP %s 的 80 端口 HEAD 无果，已由 443 TLS 兜底判定存活 (延迟 %d ms)", ip, lat);
+                }
+            }
+        }
         if (cfnat_socket_valid(fd)) close(fd);
         /* 机房标签缺失时统一回落 UNK，保证展示/缓存/过滤三处语义一致 */
         if (!best_colo[0]) snprintf(best_colo, sizeof(best_colo), "%s", "UNK");
@@ -4014,24 +4028,32 @@ typedef struct {
     int responded;
 } QuicProbeItem;
 
-/* 全异步非阻塞并发 QUIC 探针齐射批次执行函数（每 IP 独立 connect() 套接字，与真实 H3 转发路由完全一致） */
-static size_t quic_batch_probe(CarrierRuntime *rt, int target_port,
+/* 全异步非阻塞并发 QUIC 探针齐射批次执行函数（与 0.0.16 逐字一致）
+ * 使用「每协议族一个共享非阻塞 UDP 套接字 + sendto」齐射，再用 poll + recvfrom 按来源地址配对。
+ * 不使用 per-IP connect()：连通性探针一旦被内核/防火墙记上 ICMP 错误，per-IP 套接字会整条失效，
+ * 且 32~64 个 fd 在 Windows 上更容易触发瞬时耗尽；共享套接字是 0.0.16 实测三栈可用的唯一形态。 */
+static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, int target_port,
                                int timeout_ms, QuicProbeItem *items, size_t count, size_t needed_responses) {
     if (!items || count == 0) return 0;
-    if (count > 64) count = 64;
 
-    socket_t fds[64];
-    for (size_t i = 0; i < count; i++) fds[i] = INVALID_SOCKET;
+    /* C23 thread_local 预格式化探针模板：头部 0..22 固定，其余 1177 字节必须保持全零 */
+    static thread_local uint8_t pkt[1200] = {
+        0xC0, 0x5A, 0x5A, 0x5A, 0x5A, 0x08,
+        [14] = 0x08
+    };
 
-    static thread_local uint8_t pkt[1200];
-    uint64_t base_seed = rand_u64() ^ (uint64_t)now_ms();
+    uint32_t seed = (uint32_t)now_ms();
+    memcpy(pkt + 6, &seed, 4);
+
     long start_time = now_ms();
-    size_t active_fds = 0;
+    size_t sent_count = 0;
 
     for (size_t i = 0; i < count; i++) {
         items[i].responded = 0;
         items[i].latency_ms = 0;
         int is_v6 = (strchr(items[i].res.ip, ':') != nullptr);
+        socket_t sfd = is_v6 ? fd6 : fd4;
+        if (cfnat_socket_invalid(sfd)) continue;
 
         if (items[i].addr_len > 0) {
             if (is_v6) ((struct sockaddr_in6 *)&items[i].addr)->sin6_port = htons((uint16_t)target_port);
@@ -4042,107 +4064,58 @@ static size_t quic_batch_probe(CarrierRuntime *rt, int target_port,
             if (is_v6) ((struct sockaddr_in6 *)&items[i].addr)->sin6_port = htons((uint16_t)target_port);
             else ((struct sockaddr_in *)&items[i].addr)->sin_port = htons((uint16_t)target_port);
         } else {
+            /* 预解析缺失时的安全兜底 */
             if (is_v6) {
                 struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&items[i].addr;
                 memset(sa6, 0, sizeof(*sa6));
                 sa6->sin6_family = AF_INET6;
                 sa6->sin6_port = htons((uint16_t)target_port);
-                if (inet_pton(AF_INET6, items[i].res.ip, &sa6->sin6_addr) != 1) continue;
+                inet_pton(AF_INET6, items[i].res.ip, &sa6->sin6_addr);
                 items[i].addr_len = sizeof(struct sockaddr_in6);
             } else {
                 struct sockaddr_in *sa4 = (struct sockaddr_in *)&items[i].addr;
                 memset(sa4, 0, sizeof(*sa4));
                 sa4->sin_family = AF_INET;
                 sa4->sin_port = htons((uint16_t)target_port);
-                if (inet_pton(AF_INET, items[i].res.ip, &sa4->sin_addr) != 1) continue;
+                inet_pton(AF_INET, items[i].res.ip, &sa4->sin_addr);
                 items[i].addr_len = sizeof(struct sockaddr_in);
             }
         }
 
-        socket_t fd = socket(is_v6 ? AF_INET6 : AF_INET, SOCK_DGRAM, 0);
-        if (cfnat_socket_invalid(fd)) continue;
-#ifdef _WIN32
-        BOOL bNewBehavior = FALSE;
-        DWORD dwBytesReturned = 0;
-        WSAIoctl(fd, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), nullptr, 0, &dwBytesReturned, nullptr, nullptr);
-#endif
-        bind_socket_to_interface(fd, is_v6 ? AF_INET6 : AF_INET);
-        set_nonblock(fd, 1);
-        if (connect(fd, (struct sockaddr *)&items[i].addr, items[i].addr_len) != 0) {
-            debug_msg("%s QUIC 探针 connect 失败: %s (err=%d)",
-                      carrier_display_name(rt ? rt->spec.mode : nullptr), items[i].res.ip,
-#ifdef _WIN32
-                      WSAGetLastError()
-#else
-                      errno
-#endif
-            );
-            close(fd);
-            continue;
-        }
+        uint32_t scid = seed ^ (uint32_t)(i + 1);
+        memcpy(pkt + 15, &scid, 4);
 
-        build_quic_vn_probe(pkt, 0x5A5A5A5AU, base_seed ^ (uint64_t)(i + 1) * 0x9E3779B97F4A7C15ULL);
         items[i].send_time = now_ms();
-        if (send(fd, (const char *)pkt, sizeof(pkt), 0) <= 0) {
-            debug_msg("%s QUIC 探针发送失败: %s (err=%d)",
-                      carrier_display_name(rt ? rt->spec.mode : nullptr), items[i].res.ip,
-#ifdef _WIN32
-                      WSAGetLastError()
-#else
-                      errno
-#endif
-            );
-            close(fd);
-            continue;
+        if (sendto(sfd, (const char *)pkt, sizeof(pkt), 0,
+                   (struct sockaddr *)&items[i].addr, items[i].addr_len) > 0) {
+            sent_count++;
         }
-        fds[i] = fd;
-        active_fds++;
-    }
-
-    if (active_fds == 0) {
-        /* 探针根本没发出去（fd 耗尽 / 无 IPv6 路由 / bind 失败），必须与「发出但无回包」区分开，
-         * 否则日志只会显示“全无 UDP 回包”，把本机问题误判成运营商阻断。 */
-        debug_msg("[%s] QUIC 批量探测: %zu 个候选全部无法创建/连接探针套接字（fd 耗尽或无对应协议栈路由），本轮未发出任何探针",
-                  carrier_display_name(rt ? rt->spec.mode : nullptr), count);
-        return 0;
     }
 
     size_t responded_count = 0;
     long deadline = start_time + timeout_ms;
-    long retry_at = start_time + (timeout_ms / 2);
-    int retried = 0;
 
-    while (responded_count < active_fds && now_ms() < deadline) {
-        long cur_now = now_ms();
-        /* 过半未凑齐响应时改用备用 GREASE 版本 0x0A0A0A0A 补发一次，规避偶发丢包或单版本过滤 */
-        if (!retried && cur_now >= retry_at && responded_count < needed_responses) {
-            retried = 1;
-            for (size_t i = 0; i < count; i++) {
-                if (items[i].responded || cfnat_socket_invalid(fds[i])) continue;
-                build_quic_vn_probe(pkt, 0x0A0A0A0AU, base_seed ^ (uint64_t)(i + 101) * 0xBF58476D1CE4E5B9ULL);
-                items[i].send_time = cur_now;
-                send(fds[i], (const char *)pkt, sizeof(pkt), 0);
-            }
-        }
-
-        int left = (int)(deadline - cur_now);
+    while (responded_count < count && now_ms() < deadline) {
+        int left = (int)(deadline - now_ms());
         if (left <= 0) break;
 
 #ifdef _WIN32
-        WSAPOLLFD pfds[64];
+        WSAPOLLFD pfds[2];
 #else
-        struct pollfd pfds[64];
+        struct pollfd pfds[2];
 #endif
-        size_t pmap[64];
         int npfd = 0;
-        for (size_t i = 0; i < count; i++) {
-            if (!items[i].responded && cfnat_socket_valid(fds[i])) {
-                pfds[npfd].fd = fds[i];
-                pfds[npfd].events = POLLIN;
-                pfds[npfd].revents = 0;
-                pmap[npfd] = i;
-                npfd++;
-            }
+        if (cfnat_socket_valid(fd4)) {
+            pfds[npfd].fd = fd4;
+            pfds[npfd].events = POLLIN;
+            pfds[npfd].revents = 0;
+            npfd++;
+        }
+        if (cfnat_socket_valid(fd6)) {
+            pfds[npfd].fd = fd6;
+            pfds[npfd].events = POLLIN;
+            pfds[npfd].revents = 0;
+            npfd++;
         }
         if (npfd == 0) break;
 
@@ -4155,28 +4128,41 @@ static size_t quic_batch_probe(CarrierRuntime *rt, int target_port,
 #endif
         if (pr <= 0) continue;
 
-        long r_now = now_ms();
         for (int p = 0; p < npfd; p++) {
-            size_t idx = pmap[p];
-            if (pfds[p].revents & (POLLERR | POLLHUP | POLLNVAL)) {
-                close(fds[idx]);
-                fds[idx] = INVALID_SOCKET;
-                continue;
-            }
-            if (!(pfds[p].revents & POLLIN)) continue;
+            if (!(pfds[p].revents & (POLLIN | POLLERR))) continue;
+            socket_t rfd = pfds[p].fd;
 
-            char resp[2048];
-            ssize_t n = recv(fds[idx], resp, sizeof(resp), 0);
-            if (n >= 7 && ((uint8_t)resp[0] & 0x80) != 0) {
-                items[idx].responded = 1;
-                int lat = (int)(r_now - items[idx].send_time);
-                if (lat <= 0) lat = 1;
-                items[idx].latency_ms = lat;
-                responded_count++;
-                close(fds[idx]);
-                fds[idx] = INVALID_SOCKET;
-                debug_msg("%s QUIC 探针响应成功: %s 延迟 %d ms",
-                          carrier_display_name(rt ? rt->spec.mode : nullptr), items[idx].res.ip, lat);
+            while (1) {
+                char resp[512];
+                struct sockaddr_storage from;
+#ifdef _WIN32
+                int fromlen = (int)sizeof(from);
+#else
+                socklen_t fromlen = sizeof(from);
+#endif
+                ssize_t n = recvfrom(rfd, resp, sizeof(resp), 0, (struct sockaddr *)&from, &fromlen);
+                if (n < 0) {
+                    /* 仅在网络瞬态与中断错误时消费并继续读取队列后续报文，杜绝致命错误导致死循环 */
+                    if (cfnat_last_socket_transient()) continue;
+                    break;
+                }
+                if (n <= 0) break;
+                if (n < 7 || ((uint8_t)resp[0] & 0x80) == 0) continue; /* 过滤非 QUIC 长包头噪声 */
+
+                long r_now = now_ms();
+                for (size_t i = 0; i < count; i++) {
+                    if (items[i].responded) continue;
+                    if (sockaddr_ip_equal(&from, &items[i].addr)) {
+                        items[i].responded = 1;
+                        int lat = (int)(r_now - items[i].send_time);
+                        if (lat <= 0) lat = 1;
+                        items[i].latency_ms = lat;
+                        responded_count++;
+                        debug_msg("%s QUIC 探针响应成功: %s 延迟 %d ms",
+                                  carrier_display_name(rt ? rt->spec.mode : nullptr), items[i].res.ip, lat);
+                        break;
+                    }
+                }
             }
         }
 
@@ -4185,11 +4171,8 @@ static size_t quic_batch_probe(CarrierRuntime *rt, int target_port,
         }
     }
 
-    for (size_t i = 0; i < count; i++) {
-        if (cfnat_socket_valid(fds[i])) close(fds[i]);
-    }
     debug_msg("[%s] QUIC 批量探测汇总: 候选 %zu，成功发出 %zu，收到回包 %zu，超时上限 %d ms",
-              carrier_display_name(rt ? rt->spec.mode : nullptr), count, active_fds, responded_count, timeout_ms);
+              carrier_display_name(rt ? rt->spec.mode : nullptr), count, sent_count, responded_count, timeout_ms);
     return responded_count;
 }
 
@@ -4207,6 +4190,34 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
     int timeout_ms = udp_probe_timeout_ms((rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms);
     if (timeout_ms < 1000) timeout_ms = 1000;
     if (timeout_ms > 2500) timeout_ms = 2500;
+
+    /* 探针套接字：每协议族一个共享非阻塞 UDP 套接字（与 0.0.16 一致） */
+    socket_t fd4 = socket(AF_INET, SOCK_DGRAM, 0);
+    if (cfnat_socket_valid(fd4)) {
+#ifdef _WIN32
+        BOOL bNewBehavior = FALSE;
+        DWORD dwBytesReturned = 0;
+        WSAIoctl(fd4, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), nullptr, 0, &dwBytesReturned, nullptr, nullptr);
+#endif
+        bind_socket_to_interface(fd4, AF_INET);
+        set_nonblock(fd4, 1);
+    }
+
+    socket_t fd6 = socket(AF_INET6, SOCK_DGRAM, 0);
+    if (cfnat_socket_valid(fd6)) {
+#ifdef _WIN32
+        BOOL bNewBehavior = FALSE;
+        DWORD dwBytesReturned = 0;
+        WSAIoctl(fd6, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), nullptr, 0, &dwBytesReturned, nullptr, nullptr);
+#endif
+        bind_socket_to_interface(fd6, AF_INET6);
+        set_nonblock(fd6, 1);
+    }
+
+    if (cfnat_socket_invalid(fd4) && cfnat_socket_invalid(fd6)) {
+        warn_msg("[%s] 创建 UDP 探针套接字失败", carrier_display_name(rt->spec.mode));
+        return udp_res; /* 严禁降级假节点 */
+    }
 
 
 
@@ -4238,7 +4249,7 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
         }
 
         size_t needed = desired_count - udp_res.len;
-        size_t responded = quic_batch_probe(rt, target_port, timeout_ms, probe_items, cur_len, needed);
+        size_t responded = quic_batch_probe(rt, fd4, fd6, target_port, timeout_ms, probe_items, cur_len, needed);
 
         if (responded > 0) {
             for (size_t i = 0; i < cur_len; i++) {
@@ -4297,7 +4308,7 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
                 if (derived_count > 0) {
                     log_msg("[%s] [H3网段衍生] 基于已捕获的 %zu 个优质种子网段，裂变衍生 %zu 个同网段 IP 启动快速并发检验...",
                             carrier_display_name(rt->spec.mode), seed_count, derived_count);
-                    quic_batch_probe(rt, target_port, timeout_ms, derived_items, derived_count, desired_count - udp_res.len);
+                    quic_batch_probe(rt, fd4, fd6, target_port, timeout_ms, derived_items, derived_count, desired_count - udp_res.len);
 
                     for (size_t d = 0; d < derived_count; d++) {
                         if (derived_items[d].responded) {
@@ -4325,6 +4336,8 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
         round_idx++;
     }
 
+    if (cfnat_socket_valid(fd4)) close(fd4);
+    if (cfnat_socket_valid(fd6)) close(fd6);
 
     if (udp_res.len > 0) {
         qsort(udp_res.items, udp_res.len, sizeof(Result), cmp_result);
