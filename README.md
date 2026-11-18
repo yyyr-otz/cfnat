@@ -84,12 +84,12 @@ cfnat C 版做四件事：
   - 核心源码遵循 ISO/IEC 9899:2024 (C23) 标准规范，引入 `nullptr` 类型安全空指针、`constexpr` 编译期常量、`thread_local` 线程局部存储及数字分隔符（同时内置 C11/C17 兼容回退层）；
   - 采用 C23 标称类型枚举（`enum : uint8_t`）与 `[[nodiscard]]` 函数契约属性，压缩内存占用并杜绝关键资源返回值被疏漏丢弃。
 - **TLS 真实端口直测与首包握手熔断**：
-  - 未开启 `-colo` / `-code` 时直接在目标 TLS 端口（443）执行轻量 ClientHello 握手测速（严格对齐 1×RTT 物理口径），开启 `-colo` / `-code` 时则结合 HTTP HEAD 校验与首轮 TLS 握手验证；
+  - 统一采用 80 端口 Keep-Alive HTTP HEAD 提取 `CF-RAY` 数据中心与严格校验 HTTP 状态码，并结合首轮 443 TLS ClientHello 握手真实验证，确保三栈均能精准识别机房与剔除失效节点；
   - 首轮握手失败即刻熔断死节点，大幅缩短扫描耗时。
 - **H2 (TCP) + H3 (QUIC/UDP) 双轨独立测优与三栈透明分流**：
   - 在 `-v4-listen`、`-v6-listen` 与 `-baidu-listen` 监听端口上，TCP 流量导向 TCP 优选池，UDP/QUIC 流量导向 UDP 优选池；Xray 在三栈端口间切换时无需修改 H2/H3（`alpn`）配置。
 - **RFC 9000 规范的 1200 字节轻量 QUIC 版本协商探针**：
-  - 发送带保留版本号 `0x5A5A5A5A` 的 1200 字节 QUIC Initial 包，触发 Cloudflare 边缘节点立即回复 Version Negotiation 报文，零加密库依赖即可精准测得 UDP 443 真实延迟。
+  - 为每个候选 IP 建立独立 `connect()` 非阻塞 UDP 套接字（与真实 H3 转发路由完全一致），发送非零随机填充的 1200 字节 RFC 9000 QUIC Version Negotiation 探针（含过半备用版本号 `0x0A0A0A0A` 补发），零加密库依赖精准测得 IPv4/IPv6 UDP 443 真实延迟。
 - **网段裂变衍生与双轨协同自愈**：
   - 捕获有效 UDP 种子网段后在同 `/24`（IPv4）或 `/64`（IPv6）内快速衍生相邻 IP 并发检验，补齐满额 H3 候选池；若本地网络完全阻断 UDP 443，绝不降级伪造假节点；
   - 双缓存文件（如 `direct-cache-v4.txt` 与 `direct-cache-v4-udp.txt`）采用临时文件 + `fsync` + 原子重命名安全落盘。
@@ -227,11 +227,11 @@ journalctl --output cat -f -u cfnat
 | `-colo` / `-v4-colo` / `-v6-colo` | 匹配特定数据中心，支持反选 (前缀 `-` / `^` / `!`)，如 `HKG,SJC` 或 `-HKG,-SJC` | 留空全部匹配 |
 | `-exclude-colo` / `-v4-exclude-colo` / `-v6-exclude-colo` | 显式排除的数据中心列表，如 `HKG,SJC`（支持与 `-colo` 自动合并） | 留空不排除 |
 | `-domain` / `-v4-domain` / `-v6-domain` | 探测目标路径与 Host（用于 TLS SNI 与 HTTP 状态码检测） | `cloudflaremirrors.com/debian` |
-| `-code` / `-v4-code` / `-v6-code` | 期望的有效 HTTP 状态响应码。<br>**缺省/为 0 时：直接走目标端口轻量握手测速（极大提速）；**<br>**显式指定（如 `-code=200` 或 `-v6-code=200`）时：结合 HTTP 响应码校验与 TLS 端口验证（杜绝 IPv6 Error 1034 限制）。** | `0` (仅测连通性) |
+| `-code` / `-v4-code` / `-v6-code` | 期望的有效 HTTP 状态响应码（支持 `-v4-code` / `-v6-code` / `-baidu-code` 分栈独立覆盖）。<br>**缺省/为 0 时：通过 80 端口 HTTP HEAD 提取 `CF-RAY` 机房并校验 443 TLS 握手；**<br>**显式指定（如 `-code=200`）时：严格校验每轮 HTTP 状态码匹配（任意一轮不匹配即淘汰，405 时自动回退 80 端口 GET 二次确认）。** | `0` (仅测连通性) |
 | `-delay` / `-v4-delay` / `-v6-delay` | 有效往返延迟（1×RTT）上限（毫秒），冷启动自动启用端口预绑定（Backlog `4096`）消除初期 RST | `300` |
 | `-task` / `-v4-task` / `-v6-task` | 扫描并发线程数（上限 `2000`，并按 CPU 核心数自适应限制为 `64 × nproc`） | `200` |
 | `-ipnum` / `-v4-ipnum` / `-v6-ipnum` | 保留的最优候选 IP 数量上限（Top-N 截断，上限 `1000`），同时作为原地自愈存活水位基准 | `20` |
-| `-num` / `-v4-num` / `-v6-num` | 单 IP 探测尝试次数（上限 `50`；首包不通直接熔断，TLS 纯测速自动轻量化为最多 2 次） | `5` |
+| `-num` / `-v4-num` / `-v6-num` | 单 IP 探测尝试次数（上限 `50`；基于 80 端口 HTTP Keep-Alive 复用连接，首包不通直接熔断） | `5` |
 | `-port` / `-v4-port` / `-v6-port` | 上游 TLS 转发目标端口（注意区分本地监听与目标端口） | `443` |
 | `-http-port` / `-v4-http-port` / `-v6-http-port` | 上游非 TLS 转发目标端口 | `80` |
 | `-random` / `-v4-random` / `-v6-random` | 是否按 CIDR 随机抽样生成候选 IP | `true` |
