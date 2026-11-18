@@ -828,6 +828,12 @@ static void print_results_table(const Result *items, size_t count, long duration
 
 static long now_ms(void) {
 #ifdef _WIN32
+    static LARGE_INTEGER qpf = {0};
+    if (qpf.QuadPart == 0) QueryPerformanceFrequency(&qpf);
+    LARGE_INTEGER qpc;
+    if (qpf.QuadPart > 0 && QueryPerformanceCounter(&qpc)) {
+        return (long)((qpc.QuadPart * 1000LL) / qpf.QuadPart);
+    }
     return (long)GetTickCount64();
 #else
     struct timespec ts;
@@ -2287,7 +2293,7 @@ CFNAT_NODISCARD static int quic_probe_ip(const char *ip, int port, int timeout_m
         return 0;
     }
 
-    char resp[512];
+    char resp[2048];
     ssize_t n = recv(fd, resp, sizeof(resp), 0);
     close(fd);
 
@@ -3944,10 +3950,11 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
         [14] = 0x08
     };
 
-    uint32_t seed = (uint32_t)now_ms();
+    uint32_t seed = (uint32_t)now_ms() ^ 0xA53C9E17U;
     memcpy(pkt + 6, &seed, 4);
 
     long start_time = now_ms();
+    size_t sent_v4 = 0, sent_v6 = 0;
 
     for (size_t i = 0; i < count; i++) {
         items[i].responded = 0;
@@ -3987,14 +3994,47 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
         memcpy(pkt + 15, &scid, 4);
 
         items[i].send_time = now_ms();
-        sendto(sfd, (const char *)pkt, sizeof(pkt), 0, (struct sockaddr *)&items[i].addr, items[i].addr_len);
+        ssize_t sr = sendto(sfd, (const char *)pkt, sizeof(pkt), 0, (struct sockaddr *)&items[i].addr, items[i].addr_len);
+        if (sr > 0) {
+            if (is_v6) sent_v6++;
+            else sent_v4++;
+        } else {
+            debug_msg("%s QUIC 探针发送失败: %s (err=%d)",
+                      carrier_display_name(rt ? rt->spec.mode : nullptr), items[i].res.ip,
+#ifdef _WIN32
+                      WSAGetLastError()
+#else
+                      errno
+#endif
+            );
+        }
     }
+
+    if (sent_v4 == 0 && sent_v6 == 0) return 0;
 
     size_t responded_count = 0;
     long deadline = start_time + timeout_ms;
+    long retry_at = start_time + (timeout_ms / 2);
+    int retried = 0;
 
     while (responded_count < count && now_ms() < deadline) {
-        int left = (int)(deadline - now_ms());
+        long cur_now = now_ms();
+        /* 过半未凑齐响应时对未回包 IP 补发一次，消除单包偶发丢包或 IPv6 路由冷启动误杀 */
+        if (!retried && cur_now >= retry_at && responded_count < needed_responses) {
+            retried = 1;
+            for (size_t i = 0; i < count; i++) {
+                if (items[i].responded || items[i].addr_len == 0) continue;
+                int is_v6 = (items[i].addr.ss_family == AF_INET6);
+                socket_t sfd = is_v6 ? fd6 : fd4;
+                if (cfnat_socket_invalid(sfd)) continue;
+                uint32_t scid = seed ^ (uint32_t)(i + 1);
+                memcpy(pkt + 15, &scid, 4);
+                items[i].send_time = cur_now;
+                sendto(sfd, (const char *)pkt, sizeof(pkt), 0, (struct sockaddr *)&items[i].addr, items[i].addr_len);
+            }
+        }
+
+        int left = (int)(deadline - cur_now);
         if (left <= 0) break;
 
 #ifdef _WIN32
@@ -4003,13 +4043,14 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
         struct pollfd pfds[2];
 #endif
         int npfd = 0;
-        if (cfnat_socket_valid(fd4)) {
+        /* 仅轮询实际发出过探针的地址族，杜绝 Windows WSAPoll 传入未绑定空闲 UDP fd 异常 */
+        if (sent_v4 > 0 && cfnat_socket_valid(fd4)) {
             pfds[npfd].fd = fd4;
             pfds[npfd].events = POLLIN;
             pfds[npfd].revents = 0;
             npfd++;
         }
-        if (cfnat_socket_valid(fd6)) {
+        if (sent_v6 > 0 && cfnat_socket_valid(fd6)) {
             pfds[npfd].fd = fd6;
             pfds[npfd].events = POLLIN;
             pfds[npfd].revents = 0;
@@ -4031,8 +4072,9 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
             socket_t rfd = pfds[p].fd;
 
             while (1) {
-                char resp[512];
+                char resp[2048];
                 struct sockaddr_storage from;
+                memset(&from, 0, sizeof(from));
 #ifdef _WIN32
                 int fromlen = (int)sizeof(from);
 #else
@@ -4047,10 +4089,16 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
                 if (n <= 0) break;
                 if (n < 7 || ((uint8_t)resp[0] & 0x80) == 0) continue; /* 过滤非 QUIC 长包头噪声 */
 
+                uint32_t echoed_scid = 0;
+                int has_echoed_scid = (n >= 14 && (uint8_t)resp[5] == 8);
+                if (has_echoed_scid) memcpy(&echoed_scid, resp + 6, 4);
+
                 long r_now = now_ms();
                 for (size_t i = 0; i < count; i++) {
                     if (items[i].responded) continue;
-                    if (sockaddr_ip_equal(&from, &items[i].addr)) {
+                    uint32_t expect_scid = seed ^ (uint32_t)(i + 1);
+                    if (sockaddr_ip_equal(&from, &items[i].addr) ||
+                        (has_echoed_scid && echoed_scid == expect_scid)) {
                         items[i].responded = 1;
                         int lat = (int)(r_now - items[i].send_time);
                         if (lat <= 0) lat = 1;
@@ -4083,9 +4131,9 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
 
     int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
     if (target_port <= 0) target_port = 443;
-    int timeout_ms = (rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms;
-    if (timeout_ms < 600) timeout_ms = 600;
-    if (timeout_ms > 2000) timeout_ms = 2000;
+    int timeout_ms = udp_probe_timeout_ms((rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms);
+    if (timeout_ms < 1000) timeout_ms = 1000;
+    if (timeout_ms > 2500) timeout_ms = 2500;
 
     socket_t fd4 = socket(AF_INET, SOCK_DGRAM, 0);
     if (cfnat_socket_valid(fd4)) {
@@ -4095,6 +4143,10 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
         WSAIoctl(fd4, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), nullptr, 0, &dwBytesReturned, nullptr, nullptr);
 #endif
         bind_socket_to_interface(fd4, AF_INET);
+        struct sockaddr_in b4 = {0};
+        b4.sin_family = AF_INET;
+        b4.sin_addr.s_addr = htonl(INADDR_ANY);
+        bind(fd4, (struct sockaddr *)&b4, sizeof(b4));
         set_nonblock(fd4, 1);
     }
 
@@ -4105,7 +4157,15 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
         DWORD dwBytesReturned = 0;
         WSAIoctl(fd6, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), nullptr, 0, &dwBytesReturned, nullptr, nullptr);
 #endif
+#ifdef IPV6_V6ONLY
+        int v6only = 1;
+        setsockopt(fd6, IPPROTO_IPV6, IPV6_V6ONLY, (const char *)&v6only, sizeof(v6only));
+#endif
         bind_socket_to_interface(fd6, AF_INET6);
+        struct sockaddr_in6 b6 = {0};
+        b6.sin6_family = AF_INET6;
+        b6.sin6_addr = in6addr_any;
+        bind(fd6, (struct sockaddr *)&b6, sizeof(b6));
         set_nonblock(fd6, 1);
     }
 
@@ -4377,6 +4437,80 @@ static void explain_selected_result(const Result *best) {
     printf("结果解释: 选择 %s，因为延迟 %d ms，丢包 %d%%，综合分 %d。\n", best->ip, best->latency_ms, best->loss_rate, score_result(best));
 }
 
+typedef struct {
+    Result *items;
+    size_t len;
+    atomic_size_t next_idx;
+    int probe_port;
+    int timeout_ms;
+    const char *head_req;
+    int head_req_len;
+    BaiduProxyPool *proxy_pool;
+} ColoEnrichCtx;
+
+static void *colo_enrich_worker(void *arg) {
+    ColoEnrichCtx *ec = (ColoEnrichCtx *)arg;
+    while (atomic_load(&g_running)) {
+        size_t i = atomic_fetch_add(&ec->next_idx, 1);
+        if (i >= ec->len) break;
+        Result *r = &ec->items[i];
+        if (r->data_center[0] && strcmp(r->data_center, "UNK") != 0) continue;
+        struct sockaddr_storage sa = r->addr;
+        socklen_t salen = r->addr_len;
+        if (salen > 0) {
+            if (sa.ss_family == AF_INET6) ((struct sockaddr_in6 *)&sa)->sin6_port = htons((uint16_t)ec->probe_port);
+            else ((struct sockaddr_in *)&sa)->sin_port = htons((uint16_t)ec->probe_port);
+        }
+        int lat = 0;
+        socket_t fd = dial_target_with_proxy_sa(r->ip, &sa, salen, ec->probe_port, ec->timeout_ms, ec->proxy_pool, &lat);
+        if (cfnat_socket_invalid(fd)) continue;
+        if (send_all_timeout(fd, ec->head_req, (size_t)ec->head_req_len, ec->timeout_ms)) {
+            char hdr[2048];
+            int hn = recv_headers(fd, hdr, sizeof(hdr), ec->timeout_ms);
+            if (hn > 0) {
+                char colo[MAX_COLO_LEN] = {0};
+                if (extract_cfray(hdr, colo, sizeof(colo)) == 0 && colo[0]) {
+                    snprintf(r->data_center, sizeof(r->data_center), "%s", colo);
+                    Location *loc = find_location(colo);
+                    if (loc) {
+                        snprintf(r->region, sizeof(r->region), "%s", loc->region);
+                        snprintf(r->city, sizeof(r->city), "%s", loc->city);
+                    }
+                }
+            }
+        }
+        close(fd);
+    }
+    return nullptr;
+}
+
+static void enrich_top_results_colo(Result *items, size_t len, int probe_port, int delay_ms,
+                                    const char *head_req, int head_req_len, BaiduProxyPool *proxy_pool) {
+    if (!items || len == 0 || !head_req || head_req_len <= 0) return;
+    size_t need = 0;
+    for (size_t i = 0; i < len; i++) {
+        if (!items[i].data_center[0] || strcmp(items[i].data_center, "UNK") == 0) need++;
+    }
+    if (need == 0) return;
+    int tmo = delay_ms > 0 ? delay_ms : 500;
+    if (tmo < 500) tmo = 500;
+    if (tmo > 1000) tmo = 1000;
+    ColoEnrichCtx ec = {
+        .items = items, .len = len, .probe_port = probe_port, .timeout_ms = tmo,
+        .head_req = head_req, .head_req_len = head_req_len, .proxy_pool = proxy_pool
+    };
+    atomic_init(&ec.next_idx, 0);
+    size_t nw = need < 8 ? need : 8;
+    pthread_t tids[8] = {0};
+    for (size_t k = 1; k < nw; k++) {
+        if (create_small_thread(&tids[k], colo_enrich_worker, &ec) != 0) tids[k] = 0;
+    }
+    colo_enrich_worker(&ec);
+    for (size_t k = 1; k < nw; k++) {
+        if (tids[k]) pthread_join(tids[k], nullptr);
+    }
+}
+
 static ResultList scan_ips(StringList *ips, CidrList *cidrs, Config *cfg, BaiduProxyPool *proxy_pool) {
     ResultList rl = {0};
     uint64_t total_ips = cidrs ? cidrlist_total(cidrs) : (ips ? ips->len : 0);
@@ -4468,6 +4602,11 @@ static ResultList scan_ips(StringList *ips, CidrList *cidrs, Config *cfg, BaiduP
         qsort(rl.items, rl.len, sizeof(Result), cmp_result);
     }
     if (rl.len > (size_t)cfg->ipnum) rl.len = (size_t)cfg->ipnum;
+    /* 纯 TLS 极速扫描后，对最终保留的 Top-N 节点并发补齐 CF-RAY 数据中心信息 (~1xRTT，不影响扫描速度) */
+    if (ctx.is_tls && !(cfg->colo[0] != '\0' || cfg->code > 0) && rl.len > 0) {
+        enrich_top_results_colo(rl.items, rl.len, ctx.probe_port, cfg->delay_ms,
+                                ctx.head_req, ctx.head_req_len, ctx.proxy_pool);
+    }
     log_msg("扫描完成: 有效候选 %zu 个，耗时 %ld 秒", rl.len, (now_ms() - ctx.scan_start_ms) / 1000);
     if (cfg->log_level >= LOG_DEBUG) {
         print_results_table(rl.items, rl.len, (now_ms() - ctx.scan_start_ms) / 1000);
