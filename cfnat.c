@@ -3522,7 +3522,7 @@ static void *scan_worker(void *arg) {
                 pthread_mutex_unlock(&g_log_mu);
             }
         }
-        if (success_count <= 0 || !best_colo[0] || avg_latency <= 0 || (ctx->cfg->delay_ms > 0 && avg_latency > ctx->cfg->delay_ms)) continue;
+        if (success_count <= 0 || avg_latency <= 0 || (ctx->cfg->delay_ms > 0 && avg_latency > ctx->cfg->delay_ms)) continue;
 
         /* 若显式指定了 code (code > 0)，且初筛未完全确认（例如 HEAD 返回 405），使用 GET 做二次状态码校验 */
         if (ctx->cfg->code > 0 && !code_matched) {
@@ -4684,7 +4684,9 @@ static int relay_bidirectional(socket_t c, socket_t u) {
     /* 当前 connection_thread 线程直接执行反向转发，免除第 2 个子线程的 clone/mmap 与调度开销 */
     pipe_worker(&b);
     pthread_join(t1, nullptr);
-    return (b.bytes > 0) ? 1 : 0;
+    if (b.bytes > 0) return 1;
+    if (a.bytes > 0 && b.bytes == 0) return -2; /* 客户端已发请求但上游无应答/异常中断 */
+    return 0;
 }
 
 static void *connection_thread(void *arg) {
@@ -4693,7 +4695,6 @@ static void *connection_thread(void *arg) {
     socket_t upstream = INVALID_SOCKET;
     long conn_start_ms = now_ms();
     int conn_ok = 0;
-    int upstream_dialed = 0;
     const char *carrier_name = cc->runtime ? carrier_display_name(cc->runtime->spec.mode) : "-";
     unsigned char first = 0;
     /* P1-2: 仅用 MSG_PEEK 嗅探首字节识别 TLS (0x16) 或 HTTP，绝不从内核缓冲区消费或重组 ClientHello：
@@ -4798,8 +4799,8 @@ static void *connection_thread(void *arg) {
     int had_data = relay_bidirectional(client, upstream);
     if (had_data > 0 || (now_ms() - conn_start_ms) >= 3000) {
         conn_ok = 1;
-    } else if (had_data < 0) {
-        upstream_failed = 1; /* 上游异常重置或读超时 */
+    } else if (had_data == -2) {
+        upstream_failed = 1; /* 客户端正常发包但上游无应答或异常中断，判定上游故障 */
     }
 out:
     if (cfnat_socket_valid(upstream)) close(upstream);
@@ -5754,7 +5755,7 @@ static socket_t listen_tcp(const char *addr) {
             errno = err;
             return INVALID_SOCKET;
         }
-        if (listen(fd, 1024) != 0) {
+        if (listen(fd, 4096) != 0) {
             int err = errno;
             close(fd);
             errno = err;
@@ -5780,7 +5781,7 @@ static socket_t listen_tcp(const char *addr) {
         errno = err;
         return INVALID_SOCKET;
     }
-    if (listen(fd, 1024) != 0) {
+    if (listen(fd, 4096) != 0) {
         int err = errno;
         close(fd);
         errno = err;
@@ -6552,6 +6553,9 @@ int main(int argc, char **argv) {
                         rt->spec.prof.port, rt->spec.prof.http_port);
                 if (carrier_start_threads(rt) == 0) {
                     started_count++;
+                } else {
+                    if (cfnat_socket_valid(rt->listen_fd)) { close(rt->listen_fd); rt->listen_fd = INVALID_SOCKET; }
+                    if (cfnat_socket_valid(rt->udp_listen_fd)) { close(rt->udp_listen_fd); rt->udp_listen_fd = INVALID_SOCKET; }
                 }
                 continue;
             }
@@ -6565,12 +6569,16 @@ int main(int argc, char **argv) {
                 profile_cidrs = load_cidr_list(cur_ipfile, 0);
                 if (profile_cidrs.len == 0) {
                     warn_msg("[%s] 没有可扫描的 IP (%s 为空)", carrier_display_name(rt->spec.mode), cur_ipfile);
+                    if (cfnat_socket_valid(rt->listen_fd)) { close(rt->listen_fd); rt->listen_fd = INVALID_SOCKET; }
+                    if (cfnat_socket_valid(rt->udp_listen_fd)) { close(rt->udp_listen_fd); rt->udp_listen_fd = INVALID_SOCKET; }
                     continue;
                 }
             } else {
                 profile_ips = load_ip_list(cur_ipfile, rt->spec.prof.random_mode, cur_v6_split);
                 if (profile_ips.len == 0) {
                     warn_msg("[%s] 没有可扫描的 IP (%s 为空)", carrier_display_name(rt->spec.mode), cur_ipfile);
+                    if (cfnat_socket_valid(rt->listen_fd)) { close(rt->listen_fd); rt->listen_fd = INVALID_SOCKET; }
+                    if (cfnat_socket_valid(rt->udp_listen_fd)) { close(rt->udp_listen_fd); rt->udp_listen_fd = INVALID_SOCKET; }
                     continue;
                 }
             }
@@ -6637,6 +6645,8 @@ int main(int argc, char **argv) {
 
             if (carrier_results.len == 0) {
                 warn_msg("[%s] 未扫描到可用候选 IP", carrier_display_name(rt->spec.mode));
+                if (cfnat_socket_valid(rt->listen_fd)) { close(rt->listen_fd); rt->listen_fd = INVALID_SOCKET; }
+                if (cfnat_socket_valid(rt->udp_listen_fd)) { close(rt->udp_listen_fd); rt->udp_listen_fd = INVALID_SOCKET; }
                 continue;
             }
 
@@ -6669,6 +6679,8 @@ int main(int argc, char **argv) {
 
             if (!carrier_select_valid_ip(rt)) {
                 warn_msg("[%s] TCP 候选 IP 健康检查全部失败", carrier_display_name(rt->spec.mode));
+                if (cfnat_socket_valid(rt->listen_fd)) { close(rt->listen_fd); rt->listen_fd = INVALID_SOCKET; }
+                if (cfnat_socket_valid(rt->udp_listen_fd)) { close(rt->udp_listen_fd); rt->udp_listen_fd = INVALID_SOCKET; }
                 free(rt->candidates.items);
                 rt->candidates.items = nullptr;
                 rt->candidates.len = 0;
@@ -6719,6 +6731,9 @@ int main(int argc, char **argv) {
 
             if (carrier_start_threads(rt) == 0) {
                 started_count++;
+            } else {
+                if (cfnat_socket_valid(rt->listen_fd)) { close(rt->listen_fd); rt->listen_fd = INVALID_SOCKET; }
+                if (cfnat_socket_valid(rt->udp_listen_fd)) { close(rt->udp_listen_fd); rt->udp_listen_fd = INVALID_SOCKET; }
             }
         }
         free(carrier_specs);
