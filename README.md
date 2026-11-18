@@ -253,7 +253,7 @@ journalctl --output cat -f -u cfnat
 | `-exclude-colo` / `-v4-exclude-colo` / `-v6-exclude-colo` | 显式排除的数据中心列表，如 `HKG,SJC`（支持与 `-colo` 自动合并） | 留空不排除 |
 | `-domain` / `-v4-domain` / `-v6-domain` | 探测目标路径与 Host（用于状态码检测） | `cloudflaremirrors.com/debian` |
 | `-code` / `-v4-code` / `-v6-code` | 期望的有效 HTTP 状态响应码。<br>**缺省/为 0 时：仅测连通性与延迟，跳过 HTTP 响应码检验（极大提速）；**<br>**显式指定（如 `-code=200` 或 `-v6-code=200`）时：测得延迟后进一步校验 HTTP 状态码（杜绝 IPv6 Error 1034 限制）。** | `0` (仅测连通性) |
-| `-delay` / `-v4-delay` / `-v6-delay` | 有效单向往返延迟（1×RTT）上限（毫秒）。严格对齐真实网络 RTT，杜绝叠加 TCP 握手导致延迟虚高翻倍。冷启动阶段自动启用端口预绑定（Early Binding），消除扫描初期的 TCP RST 连接重置。 | `300` |
+| `-delay` / `-v4-delay` / `-v6-delay` | 有效单向往返延迟（1×RTT）上限（毫秒）。严格对齐真实网络 RTT，杜绝叠加 TCP 握手导致延迟虚高翻倍。冷启动阶段自动启用端口预绑定（Early Binding，内核 Backlog 4096），首包连接在扫描期间自动进入内核队列排队，彻底消除启动初期的 TCP RST 连接重置。 | `300` |
 | `-task` / `-v4-task` / `-v6-task` | 扫描并发线程数 | `200` |
 | `-ipnum` / `-v4-ipnum` / `-v6-ipnum` | 保留的最优候选 IP 数量上限（Top-N 截断）。同时作为后台实例 70% 消耗拦截与 25% 存活门槛的水位基准。 | `20` |
 | `-num` / `-v4-num` / `-v6-num` | 单 IP 探测尝试次数（首包不通直接熔断，仅连通节点发满测定丢包与抖动） | `5` |
