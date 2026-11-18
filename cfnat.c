@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.17"
+#define CFNAT_VERSION "0.0.18"
 
 /* =========================================================================
  * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
@@ -1452,7 +1452,7 @@ static void parse_args(Config *c, int argc, char **argv) {
 }
 
 static void log_current_config(const Config *c) {
-    log_msg("当前运行配置清单 (含缺省默认值):");
+    log_msg("cfnat v%s (build %s %s) 当前运行配置清单 (含缺省默认值):", CFNAT_VERSION, __DATE__, __TIME__);
     if (c->prof_v4.enabled) {
         log_msg("  [IPv4 转发实例] 监听地址: %s", c->prof_v4.listen_addr);
         log_msg("    TLS目标端口: %d | HTTP目标端口: %d", c->prof_v4.port, c->prof_v4.http_port);
@@ -6235,6 +6235,136 @@ struct UdpSession {
     struct UdpSession *hash_next;
 };
 
+#ifdef _WIN32
+#ifndef UDP_SEND_MSG_SIZE
+#define UDP_SEND_MSG_SIZE 2
+#endif
+#ifndef UDP_RECV_MAX_COALESCED_SIZE
+#define UDP_RECV_MAX_COALESCED_SIZE 3
+#endif
+#ifndef UDP_COALESCED_INFO
+#define UDP_COALESCED_INFO 3
+#endif
+
+static LPFN_WSARECVMSG g_win_wsarecvmsg = nullptr;
+static LPFN_WSASENDMSG g_win_wsasendmsg = nullptr;
+
+static void win_init_udp_offload_fns(socket_t fd) {
+    if (cfnat_socket_invalid(fd)) return;
+    if (!g_win_wsarecvmsg) {
+        GUID guid_recv = WSAID_WSARECVMSG;
+        DWORD bytes = 0;
+        LPFN_WSARECVMSG fn = nullptr;
+        if (WSAIoctl(fd, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid_recv, sizeof(guid_recv),
+                     &fn, sizeof(fn), &bytes, nullptr, nullptr) == 0 && fn) {
+            g_win_wsarecvmsg = fn;
+        }
+    }
+    if (!g_win_wsasendmsg) {
+        GUID guid_send = WSAID_WSASENDMSG;
+        DWORD bytes = 0;
+        LPFN_WSASENDMSG fn = nullptr;
+        if (WSAIoctl(fd, SIO_GET_EXTENSION_FUNCTION_POINTER, &guid_send, sizeof(guid_send),
+                     &fn, sizeof(fn), &bytes, nullptr, nullptr) == 0 && fn) {
+            g_win_wsasendmsg = fn;
+        }
+    }
+}
+
+/* Win10 2004+ / Win11 UDP 接收合并卸载 (URO)：单次 WSARecvMsg 批量收取最多 64KB 同流 QUIC 数据报 */
+static void win_enable_udp_uro(socket_t fd) {
+    if (cfnat_socket_invalid(fd) || !g_win_wsarecvmsg) return;
+    DWORD max_coalesced = 65536;
+    setsockopt(fd, IPPROTO_UDP, UDP_RECV_MAX_COALESCED_SIZE, (const char *)&max_coalesced, sizeof(max_coalesced));
+}
+
+static ssize_t win_udp_recv_coalesced(socket_t fd, char *buf, size_t bufsz,
+                                      struct sockaddr_storage *from, int *from_len, DWORD *out_seg_sz) {
+    if (out_seg_sz) *out_seg_sz = 0;
+    if (!g_win_wsarecvmsg) {
+        return from ? recvfrom(fd, buf, (int)bufsz, 0, (struct sockaddr *)from, from_len)
+                    : recv(fd, buf, (int)bufsz, 0);
+    }
+    WSABUF wbuf = { .len = (ULONG)bufsz, .buf = buf };
+    union { WSACMSGHDR align; char buf[128]; } cbuf;
+    WSAMSG msg;
+    memset(&msg, 0, sizeof(msg));
+    if (from && from_len) {
+        msg.name = (LPSOCKADDR)from;
+        msg.namelen = *from_len;
+    }
+    msg.lpBuffers = &wbuf;
+    msg.dwBufferCount = 1;
+    msg.Control.buf = cbuf.buf;
+    msg.Control.len = (ULONG)sizeof(cbuf.buf);
+
+    DWORD recvd = 0;
+    if (g_win_wsarecvmsg(fd, &msg, &recvd, nullptr, nullptr) != 0) {
+        return -1;
+    }
+    if (from && from_len) *from_len = msg.namelen;
+    if (out_seg_sz && msg.Control.len > 0) {
+        for (WSACMSGHDR *cm = WSA_CMSG_FIRSTHDR(&msg); cm != nullptr; cm = WSA_CMSG_NXTHDR(&msg, cm)) {
+            if (cm->cmsg_level == IPPROTO_UDP && cm->cmsg_type == UDP_COALESCED_INFO &&
+                cm->cmsg_len >= WSA_CMSG_LEN(sizeof(DWORD))) {
+                DWORD seg = 0;
+                memcpy(&seg, WSA_CMSG_DATA(cm), sizeof(seg));
+                *out_seg_sz = seg;
+                break;
+            }
+        }
+    }
+    return (ssize_t)recvd;
+}
+
+/* Win10/11 UDP 发送分段卸载 (USO)：单次 WSASendMsg 批量发射合并报文并精确保持 QUIC 边界，不支持时自动回退分段直发 */
+static ssize_t win_udp_send_segmented(socket_t fd, const char *buf, size_t len, DWORD seg_sz,
+                                      const struct sockaddr *to, int tolen, int *uso_ok) {
+    if (len == 0) return 0;
+    if (seg_sz == 0 || seg_sz >= len) {
+        return to ? sendto(fd, buf, (int)len, 0, to, tolen)
+                  : send(fd, buf, (int)len, 0);
+    }
+    if (uso_ok && *uso_ok && g_win_wsasendmsg) {
+        WSABUF wbuf = { .len = (ULONG)len, .buf = (CHAR *)(uintptr_t)buf };
+        union { WSACMSGHDR align; char buf[64]; } cbuf;
+        memset(&cbuf, 0, sizeof(cbuf));
+        WSAMSG msg;
+        memset(&msg, 0, sizeof(msg));
+        msg.name = (LPSOCKADDR)(uintptr_t)to;
+        msg.namelen = to ? tolen : 0;
+        msg.lpBuffers = &wbuf;
+        msg.dwBufferCount = 1;
+        msg.Control.buf = cbuf.buf;
+        msg.Control.len = (ULONG)WSA_CMSG_SPACE(sizeof(DWORD));
+        WSACMSGHDR *cm = WSA_CMSG_FIRSTHDR(&msg);
+        if (cm) {
+            cm->cmsg_len = WSA_CMSG_LEN(sizeof(DWORD));
+            cm->cmsg_level = IPPROTO_UDP;
+            cm->cmsg_type = UDP_SEND_MSG_SIZE;
+            memcpy(WSA_CMSG_DATA(cm), &seg_sz, sizeof(seg_sz));
+            DWORD sent = 0;
+            if (g_win_wsasendmsg(fd, &msg, 0, &sent, nullptr, nullptr) == 0) {
+                return (ssize_t)sent;
+            }
+            if (WSAGetLastError() != WSAEWOULDBLOCK) {
+                *uso_ok = 0; /* 当前适配器/回环不支持 USO，后续直接分段发送免除重复失败 */
+            }
+        }
+    }
+    /* USO 不可用时按 seg_sz 精确拆包发送，依然享受 URO 批量接收收益并完整保留 QUIC 报文边界 */
+    ssize_t total = 0;
+    for (size_t off = 0; off < len; off += seg_sz) {
+        size_t chunk = (len - off > seg_sz) ? seg_sz : (len - off);
+        ssize_t s = to ? sendto(fd, buf + off, (int)chunk, 0, to, tolen)
+                       : send(fd, buf + off, (int)chunk, 0);
+        if (s > 0) total += s;
+        else break;
+    }
+    return total > 0 ? total : -1;
+}
+#endif
+
 static socket_t listen_udp(const char *addr) {
     char host[128];
     int port = 0;
@@ -6270,6 +6400,10 @@ static socket_t listen_udp(const char *addr) {
             return INVALID_SOCKET;
         }
         tune_socket_buffers(fd, 1);
+#ifdef _WIN32
+        win_init_udp_offload_fns(fd);
+        win_enable_udp_uro(fd);
+#endif
         set_nonblock(fd, 1);
         return fd;
     }
@@ -6298,6 +6432,10 @@ static socket_t listen_udp(const char *addr) {
         return INVALID_SOCKET;
     }
     tune_socket_buffers(fd, 1);
+#ifdef _WIN32
+    win_init_udp_offload_fns(fd);
+    win_enable_udp_uro(fd);
+#endif
     set_nonblock(fd, 1);
     return fd;
 }
@@ -6399,6 +6537,9 @@ static socket_t udp_connect_upstream_sa(const char *ip, const struct sockaddr_st
 
     bind_socket_to_interface(fd, is_v6 ? AF_INET6 : AF_INET);
     tune_socket_buffers(fd, active_sessions > 32 ? 3 : 2); /* 低并发 (<=32) 用 1MB/512KB 提速，高并发 (>32) 收敛 256KB 防软路由 OOM */
+#ifdef _WIN32
+    win_enable_udp_uro(fd);
+#endif
     set_nonblock(fd, 1);
 
     if (connect(fd, (struct sockaddr *)&ss, slen) != 0) {
@@ -6620,6 +6761,10 @@ static void *carrier_udp_thread(void *arg) {
     unsigned long long cached_udp_epoch = (unsigned long long)-1;
     int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
     if (target_port <= 0) target_port = 443;
+#ifdef _WIN32
+    int listen_uso_ok = 1;
+    int upstream_uso_ok = 1;
+#endif
 
     while (atomic_load(&g_running)) {
         if (rt->udp_dirty) {
@@ -6739,6 +6884,25 @@ static void *carrier_udp_thread(void *arg) {
                         }
                         if (nmsg < UDP_BATCH_SZ) break;
                     }
+#elif defined(_WIN32)
+                    while (1) {
+                        DWORD seg_sz = 0;
+                        ssize_t n = win_udp_recv_coalesced(sess->upstream_fd, buf, UDP_BUF_SIZE, nullptr, nullptr, &seg_sz);
+                        if (n <= 0) break;
+                        if (sess->bytes_down == 0) {
+                            atomic_store_explicit(&rt->udp_candidates.fast_fail_count, 0, memory_order_relaxed);
+                        }
+                        sess->last_active_ms = cur_ms;
+                        ssize_t sent = win_udp_send_segmented(rt->udp_listen_fd, buf, (size_t)n, seg_sz,
+                                                              (const struct sockaddr *)&sess->client_addr, (int)sess->client_addr_len, &listen_uso_ok);
+                        if (sent > 0) {
+                            sess->bytes_down += (uint64_t)sent;
+                            sess->last_down_ms = cur_ms;
+                            sess->bytes_up_at_down = sess->bytes_up;
+                        } else {
+                            rt->udp_down_drop++;
+                        }
+                    }
 #else
                     while (1) {
                         ssize_t n = recv(sess->upstream_fd, buf, UDP_BUF_SIZE, 0);
@@ -6849,14 +7013,32 @@ static void *carrier_udp_thread(void *arg) {
                 }
                 if (nmsg < UDP_BATCH_SZ) break;
             }
+#elif defined(_WIN32)
+            while (1) {
+                struct sockaddr_storage client_ss;
+                int client_len = (int)sizeof(client_ss);
+                DWORD seg_sz = 0;
+                ssize_t n = win_udp_recv_coalesced(rt->udp_listen_fd, buf, UDP_BUF_SIZE, &client_ss, &client_len, &seg_sz);
+                if (n <= 0) break;
+
+                UdpSession *sess = rt->last_udp_sess;
+                if (!sess || !sockaddr_equal(&sess->client_addr, &client_ss) || cfnat_socket_invalid(sess->upstream_fd) || strcmp(sess->target_ip, cur_target_ip) != 0) {
+                    if (cur_target_ip[0]) {
+                        sess = find_or_create_udp_session_sa(rt, &client_ss, (socklen_t)client_len, cur_target_ip, &cur_target_sa, cur_target_salen, target_port, (uint8_t)buf[0]);
+                    } else {
+                        sess = nullptr;
+                    }
+                }
+                if (sess && cfnat_socket_valid(sess->upstream_fd)) {
+                    sess->last_active_ms = cur_ms;
+                    ssize_t sent = win_udp_send_segmented(sess->upstream_fd, buf, (size_t)n, seg_sz, nullptr, 0, &upstream_uso_ok);
+                    if (sent > 0) sess->bytes_up += (uint64_t)sent;
+                }
+            }
 #else
             while (1) {
                 struct sockaddr_storage client_ss;
-#ifdef _WIN32
-                int client_len = (int)sizeof(client_ss);
-#else
                 socklen_t client_len = sizeof(client_ss);
-#endif
                 ssize_t n = recvfrom(rt->udp_listen_fd, buf, UDP_BUF_SIZE, 0, (struct sockaddr *)&client_ss, &client_len);
                 if (n <= 0) break;
 
