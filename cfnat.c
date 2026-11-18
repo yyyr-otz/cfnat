@@ -1452,7 +1452,7 @@ static void parse_args(Config *c, int argc, char **argv) {
 }
 
 static void log_current_config(const Config *c) {
-    log_msg("cfnat v%s (build %s %s) 当前运行配置清单 (含缺省默认值):", CFNAT_VERSION, __DATE__, __TIME__);
+    log_msg("cfnat v%s 当前运行配置清单 (含缺省默认值):", CFNAT_VERSION);
     if (c->prof_v4.enabled) {
         log_msg("  [IPv4 转发实例] 监听地址: %s", c->prof_v4.listen_addr);
         log_msg("    TLS目标端口: %d | HTTP目标端口: %d", c->prof_v4.port, c->prof_v4.http_port);
