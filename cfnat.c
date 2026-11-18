@@ -4051,7 +4051,7 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
     memcpy(pkt + 6, &seed, 4);
 
     long start_time = now_ms();
-    size_t sent_count = 0;
+    size_t sent_v4 = 0, sent_v6 = 0;
 
     for (size_t i = 0; i < count; i++) {
         items[i].responded = 0;
@@ -4093,7 +4093,8 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
         items[i].send_time = now_ms();
         if (sendto(sfd, (const char *)pkt, sizeof(pkt), 0,
                    (struct sockaddr *)&items[i].addr, items[i].addr_len) > 0) {
-            sent_count++;
+            if (is_v6) sent_v6++;
+            else sent_v4++;
         }
     }
 
@@ -4110,13 +4111,14 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
         struct pollfd pfds[2];
 #endif
         int npfd = 0;
-        if (cfnat_socket_valid(fd4)) {
+        /* 仅轮询实际发过包的地址族，避免 Windows WSAPoll 传入未绑定空闲 UDP 套接字触发 POLLNVAL/WSAEINVAL */
+        if (sent_v4 > 0 && cfnat_socket_valid(fd4)) {
             pfds[npfd].fd = fd4;
             pfds[npfd].events = POLLIN;
             pfds[npfd].revents = 0;
             npfd++;
         }
-        if (cfnat_socket_valid(fd6)) {
+        if (sent_v6 > 0 && cfnat_socket_valid(fd6)) {
             pfds[npfd].fd = fd6;
             pfds[npfd].events = POLLIN;
             pfds[npfd].revents = 0;
@@ -4138,7 +4140,7 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
             socket_t rfd = pfds[p].fd;
 
             while (1) {
-                char resp[512];
+                char resp[2048];
                 struct sockaddr_storage from;
 #ifdef _WIN32
                 int fromlen = (int)sizeof(from);
@@ -4177,7 +4179,7 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
     }
 
     debug_msg("[%s] QUIC 批量探测汇总: 候选 %zu，成功发出 %zu，收到回包 %zu，超时上限 %d ms",
-              carrier_display_name(rt ? rt->spec.mode : nullptr), count, sent_count, responded_count, timeout_ms);
+              carrier_display_name(rt ? rt->spec.mode : nullptr), count, sent_v4 + sent_v6, responded_count, timeout_ms);
     return responded_count;
 }
 
