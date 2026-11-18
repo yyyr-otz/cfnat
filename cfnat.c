@@ -308,6 +308,9 @@ typedef struct {
     char v4_listen[MAX_ADDR_LEN], v6_listen[MAX_ADDR_LEN];
     char bind_if[MAX_NAME_LEN], baidu_resolver[MAX_RESOLVER_SPEC_LEN];
     int code, delay_ms, ipnum, ips_type, num, port, http_port, random_mode, task, health_log;
+    int stats_interval;       /* 三栈双协议运行指标输出间隔（秒），0=关闭。
+                               * 与健康检查节奏解耦：健康检查本身是自适应的 10s/30s/60s，
+                               * health_log 只控制「健康状态行」这类 debug 明细的输出频率。 */
     int v6_split;             /* 全局 IPv6 细分子网前缀 (默认 54) */
     int use_baidu_proxy, baidu_port, baidu_ipnum;
     int cli_mode;             /* 显式单次 CLI 测速模式 (-cli / -scan-only) */
@@ -606,6 +609,10 @@ struct CarrierRuntime {
     size_t udp_session_count;      /* 本实例活跃 UDP 会话数，独立限额防跨实例互相挤压 */
     uint64_t udp_down_drop;        /* 下行非阻塞 sendmmsg/sendto 队列满丢包计数 */
     int udp_down_drop_warned;      /* 首次下行溢出使用 warn_msg 告警，后续回落 debug_msg 防刷屏 */
+    atomic_uint tcp_switch_count;  /* H2 顺位切换累计次数（运行指标，仅统计） */
+    atomic_uint udp_switch_count;  /* H3 顺位切换累计次数（运行指标，仅统计） */
+    atomic_uint udp_up_drop;       /* 上行（客户端→上游）UDP 发送失败计数，与 udp_down_drop 对称 */
+    atomic_ullong udp_down_drop_stats; /* 下行丢包周期统计原子计数（与 5s 告警解耦，零数据竞争） */
     int udp_dirty;                 /* 会话表变更标记：未变更时直接复用 pollfd 数组，免除每轮链表遍历 */
     pthread_mutex_t udp_mu;
     atomic_int rescanning_lock;    /* 实例独享的自愈扫描互斥锁 (防跨协议阻塞) */
@@ -1116,6 +1123,8 @@ static void usage(const char *p) {
     printf("  -task=value               并发扫描线程数 (default 200)\n");
     printf("  -cli, -scan-only          仅单次 CLI 测速并打印结果表格，不启动本地端口监听\n");
     printf("  -log=value                日志级别: silent,error,warn,info,debug (default info)\n");
+    printf("  -stats-interval=value     三栈双协议运行指标汇报间隔秒数，0=关闭 (default 300)\n");
+    printf("  -health-log=value         健康状态行(debug 级明细)输出间隔秒数，0=关闭 (default 60)\n");
     printf("  注: 以上参数均支持 -v4- 或 -v6- 前缀实现精细化覆盖，如 -v6-code=200 -v4-delay=150\n");
 }
 
@@ -1168,7 +1177,8 @@ static void cfg_defaults(Config *c) {
     c->random_mode = 1;
     c->v6_split = 54;
     c->task = 200;
-    c->health_log = 60;
+    c->health_log = 60;        /* 健康状态行 (debug 级) 输出间隔（秒），0 = 关闭；与运行指标无关 */
+    c->stats_interval = 300;   /* 三栈双协议运行指标输出间隔（秒），0 = 关闭（-stats-interval=0） */
     c->use_baidu_proxy = 0;
     c->baidu_port = DEFAULT_BAIDU_PORT;
     c->baidu_ipnum = DEFAULT_BAIDU_IPNUM;
@@ -1314,6 +1324,12 @@ static void parse_args(Config *c, int argc, char **argv) {
         else if (!strcmp(key, "task") && val) c->task = atoi(val);
         else if (!strcmp(key, "cli") || !strcmp(key, "scan-only")) c->cli_mode = 1;
         else if (!strcmp(key, "health-log") && val) c->health_log = atoi(val);
+        /* 运行指标汇报间隔：与健康检查解耦（-stats-interval 为主名，-log-interval 作兼容别名）。
+         * 显式传负数一律按 0（关闭）处理，避免出现「间隔 -5 秒」这种无意义配置。 */
+        else if ((!strcmp(key, "stats-interval") || !strcmp(key, "log-interval")) && val) {
+            int v = atoi(val);
+            c->stats_interval = v > 0 ? v : 0;
+        }
     }
 
     /* 统一合并全局 exclude-colo 到 c->colo */
@@ -1493,8 +1509,12 @@ static void log_current_config(const Config *c) {
         if (c->colo[0]) log_msg("    数据中心筛选: %s", c->colo);
     }
 
-    log_msg("  全局设置: 出站网卡: %s | 健康检查间隔: %d 秒 | 日志级别: %s",
-            c->bind_if[0] ? c->bind_if : "(系统默认路由)", c->health_log, c->log_name);
+    log_msg("  全局设置: 出站网卡: %s | 运行指标间隔: %d 秒 (0=关闭) | 日志级别: %s",
+            c->bind_if[0] ? c->bind_if : "(系统默认路由)", c->stats_interval, c->log_name);
+    /* 健康检查节奏本身是自适应的（失败 10s / 稳定 30s / 连续成功 5 次后 60s），不受任何间隔参数影响；
+     * -health-log 只决定「健康状态行」这类 debug 明细的输出频率。这里显式写出来，避免把两者混为一谈。 */
+    log_msg("  健康检查节奏: 自适应 10s / 30s / 60s（与运行指标间隔解耦）| 健康状态行间隔: %d 秒 (0=关闭)",
+            c->health_log);
 }
 
 static int file_exists(const char *path) {
@@ -3647,19 +3667,14 @@ static void *scan_worker(void *arg) {
         int avg_latency = success_count > 0 ? (total_latency / success_count) : 0;
 
         uint64_t done = atomic_fetch_add(&ctx->completed, 1) + 1;
-        uint64_t step = ctx->total / 100;
-        if (step < 5) step = 5;
-        if (step > 500) step = 500;
-
-        if (done == ctx->total || done % step == 0) {
-            double pct = (double)done * 100.0 / (double)(ctx->total > 0 ? ctx->total : 1);
-            if (pct > 100.0) pct = 100.0;
-            if (g_cfg.log_level >= LOG_DEBUG) {
-                if (done == ctx->total || done % (step * 5) == 0) {
-                    log_msg("已完成: %llu 总数: %llu 已完成: %.2f%%",
-                            (unsigned long long)done, (unsigned long long)ctx->total, pct);
-                }
-            } else if (terminal_has_color(stderr)) {
+        /* debug 模式下已逐条输出探测明细，不再穿插百分比进度日志 */
+        if (g_cfg.log_level < LOG_DEBUG && terminal_has_color(stderr)) {
+            uint64_t step = ctx->total / 100;
+            if (step < 5) step = 5;
+            if (step > 500) step = 500;
+            if (done == ctx->total || done % step == 0) {
+                double pct = (double)done * 100.0 / (double)(ctx->total > 0 ? ctx->total : 1);
+                if (pct > 100.0) pct = 100.0;
                 pthread_mutex_lock(&g_log_mu);
                 fprintf(stderr, "\r" ANSI_GRAY "[扫描进度]" ANSI_RESET " 已完成: " ANSI_BOLD "%llu" ANSI_RESET " / %llu (" ANSI_GREEN "%.2f%%" ANSI_RESET ")",
                         (unsigned long long)done, (unsigned long long)ctx->total, pct);
@@ -4993,6 +5008,7 @@ static void *connection_thread(void *arg) {
                     atomic_store(&cc->runtime->candidates.cache_valid, 1);
                     log_msg("[TCP/H2] [%s] 首选节点握手超时，已实时无缝切换至备用 IP: %s (延迟 %d ms)",
                             carrier_name, try_ip, best);
+                    atomic_fetch_add_explicit(&cc->runtime->tcp_switch_count, 1, memory_order_relaxed);
                 }
                 conn_msg("[TCP/H2] #%llu [%s] 选择连接: %s:%d (延迟 %d ms)", cc->conn_id, carrier_name, cc->ip, target_port, best);
                 break;
@@ -5350,6 +5366,7 @@ static int carrier_switch_next_ip(CarrierRuntime *rt) {
             pthread_mutex_unlock(&rt->candidates.mu);
             log_msg("[TCP/H2] [%s] 并行切换/按分回灌至可用节点: %s (候选索引: %zu/%zu, 延迟 %d ms)",
                     carrier_display_name(rt->spec.mode), tasks[best_k].ip, idx + 1, total_len, tasks[best_k].lat);
+            atomic_fetch_add_explicit(&rt->tcp_switch_count, 1, memory_order_relaxed);
             atomic_store_explicit(&rt->candidates.switch_lock, 0, memory_order_release);
             return 1;
         }
@@ -5494,6 +5511,7 @@ CFNAT_NODISCARD static int carrier_switch_next_udp_ip(CarrierRuntime *rt) {
             pthread_mutex_unlock(&rt->udp_candidates.mu);
             log_msg("[UDP/H3] [%s] 并行切换/按分回灌至可用节点: %s (候选索引: %zu/%zu, 延迟 %d ms)",
                     carrier_display_name(rt->spec.mode), tasks[best_k].ip, idx + 1, total_len, tasks[best_k].lat);
+            atomic_fetch_add_explicit(&rt->udp_switch_count, 1, memory_order_relaxed);
             atomic_store_explicit(&rt->udp_candidates.switch_lock, 0, memory_order_release);
             return 1;
         }
@@ -6878,7 +6896,9 @@ static void *carrier_udp_thread(void *arg) {
                                         sess->last_down_ms = cur_ms;
                                         sess->bytes_up_at_down = sess->bytes_up;
                                     } else {
-                                        rt->udp_down_drop += (uint64_t)(out_cnt - s);
+                                        uint64_t dropped = (uint64_t)(out_cnt - s);
+                                        rt->udp_down_drop += dropped;
+                                        atomic_fetch_add_explicit(&rt->udp_down_drop_stats, (unsigned long long)dropped, memory_order_relaxed);
                                         break;
                                     }
                                 }
@@ -6903,6 +6923,7 @@ static void *carrier_udp_thread(void *arg) {
                             sess->bytes_up_at_down = sess->bytes_up;
                         } else {
                             rt->udp_down_drop++;
+                            atomic_fetch_add_explicit(&rt->udp_down_drop_stats, 1, memory_order_relaxed);
                         }
                     }
 #else
@@ -6920,6 +6941,7 @@ static void *carrier_udp_thread(void *arg) {
                             sess->bytes_up_at_down = sess->bytes_up;
                         } else {
                             rt->udp_down_drop++;
+                            atomic_fetch_add_explicit(&rt->udp_down_drop_stats, 1, memory_order_relaxed);
                         }
                     }
 #endif
@@ -7006,10 +7028,12 @@ static void *carrier_udp_thread(void *arg) {
                                 /* N2: sendmmsg 遭遇非阻塞 EAGAIN/错误时，回退单包发送首包 */
                                 ssize_t sent = send(sess->upstream_fd, batch_bufs[m], blen, 0);
                                 if (sent > 0) sess->bytes_up += (uint64_t)sent;
+                                else atomic_fetch_add_explicit(&rt->udp_up_drop, 1, memory_order_relaxed);
                             }
                         } else {
                             ssize_t sent = send(sess->upstream_fd, batch_bufs[m], blen, 0);
                             if (sent > 0) sess->bytes_up += (uint64_t)sent;
+                            else atomic_fetch_add_explicit(&rt->udp_up_drop, 1, memory_order_relaxed);
                         }
                     }
                 }
@@ -7035,6 +7059,7 @@ static void *carrier_udp_thread(void *arg) {
                     sess->last_active_ms = cur_ms;
                     ssize_t sent = win_udp_send_segmented(sess->upstream_fd, buf, (size_t)n, seg_sz, nullptr, 0, &upstream_uso_ok);
                     if (sent > 0) sess->bytes_up += (uint64_t)sent;
+                    else atomic_fetch_add_explicit(&rt->udp_up_drop, 1, memory_order_relaxed); /* 上行发送失败（原实现完全静默） */
                 }
             }
 #else
@@ -7056,6 +7081,7 @@ static void *carrier_udp_thread(void *arg) {
                     sess->last_active_ms = cur_ms;
                     ssize_t sent = send(sess->upstream_fd, buf, (size_t)n, 0);
                     if (sent > 0) sess->bytes_up += (uint64_t)sent;
+                    else atomic_fetch_add_explicit(&rt->udp_up_drop, 1, memory_order_relaxed); /* 上行发送失败（原实现完全静默） */
                 }
             }
 #endif
@@ -7146,6 +7172,97 @@ static int carrier_start_threads(CarrierRuntime *rt) {
         }
     }
     return 0;
+}
+
+static void log_runtime_stats(void) {
+    if (!g_carrier_runtimes || g_carrier_runtime_count == 0) return;
+
+    char buf[4096];
+    size_t pos = 0;
+    int active_tcp = atomic_load_explicit(&g_active_tcp_conns, memory_order_relaxed);
+    int active_udp = atomic_load_explicit(&g_active_udp_sessions, memory_order_relaxed);
+    int n = snprintf(buf + pos, sizeof(buf) - pos,
+                     "[运行指标] 活跃连接 TCP=%d, 活跃会话 UDP=%d (统计周期 %ds)",
+                     active_tcp, active_udp, g_cfg.stats_interval);
+    if (n > 0) pos += ((size_t)n < sizeof(buf) - pos) ? (size_t)n : (sizeof(buf) - pos - 1);
+
+    for (size_t i = 0; i < g_carrier_runtime_count; i++) {
+        CarrierRuntime *rt = &g_carrier_runtimes[i];
+        char tcp_ip[MAX_IP_LEN] = "";
+        char tcp_colo[MAX_COLO_LEN] = "";
+        int tcp_lat = -1;
+        size_t tcp_len = 0;
+
+        pthread_mutex_lock(&rt->candidates.mu);
+        tcp_len = rt->candidates.len;
+        if (rt->candidates.current_ip[0]) {
+            snprintf(tcp_ip, sizeof(tcp_ip), "%s", rt->candidates.current_ip);
+        }
+        if (rt->candidates.current_index < rt->candidates.len) {
+            const Result *cur = &rt->candidates.items[rt->candidates.current_index];
+            tcp_lat = (cur->ewma_latency > 0) ? cur->ewma_latency : cur->latency_ms;
+            if (cur->data_center[0]) {
+                snprintf(tcp_colo, sizeof(tcp_colo), "%s", cur->data_center);
+            }
+        }
+        pthread_mutex_unlock(&rt->candidates.mu);
+
+        char udp_ip[MAX_IP_LEN] = "";
+        char udp_colo[MAX_COLO_LEN] = "";
+        int udp_lat = -1;
+        size_t udp_len = 0;
+
+        pthread_mutex_lock(&rt->udp_candidates.mu);
+        udp_len = rt->udp_candidates.len;
+        if (rt->udp_candidates.current_ip[0]) {
+            snprintf(udp_ip, sizeof(udp_ip), "%s", rt->udp_candidates.current_ip);
+        }
+        if (rt->udp_candidates.current_index < rt->udp_candidates.len) {
+            const Result *cur = &rt->udp_candidates.items[rt->udp_candidates.current_index];
+            udp_lat = (cur->ewma_latency > 0) ? cur->ewma_latency : cur->latency_ms;
+            if (cur->data_center[0]) {
+                snprintf(udp_colo, sizeof(udp_colo), "%s", cur->data_center);
+            }
+        }
+        pthread_mutex_unlock(&rt->udp_candidates.mu);
+
+        pthread_mutex_lock(&rt->udp_mu);
+        size_t udp_sess = rt->udp_session_count;
+        pthread_mutex_unlock(&rt->udp_mu);
+
+        unsigned int tcp_sw = atomic_load_explicit(&rt->tcp_switch_count, memory_order_relaxed);
+        unsigned int udp_sw = atomic_load_explicit(&rt->udp_switch_count, memory_order_relaxed);
+        unsigned int up_drop = atomic_exchange_explicit(&rt->udp_up_drop, 0, memory_order_relaxed);
+        unsigned long long down_drop = atomic_exchange_explicit(&rt->udp_down_drop_stats, 0, memory_order_relaxed);
+
+        const char *branch = (i + 1 < g_carrier_runtime_count) ? "├─" : "└─";
+        const char *name = carrier_display_name(rt->spec.mode);
+
+        char tcp_part[256];
+        if (tcp_ip[0] && tcp_len > 0) {
+            snprintf(tcp_part, sizeof(tcp_part), "H2: %s (%s, %dms, 池%zu, 累计切%u)",
+                     tcp_ip, tcp_colo[0] ? tcp_colo : "UNK", tcp_lat >= 0 ? tcp_lat : 0, tcp_len, tcp_sw);
+        } else {
+            snprintf(tcp_part, sizeof(tcp_part), "H2: 无可用节点 (池%zu, 累计切%u)", tcp_len, tcp_sw);
+        }
+
+        char udp_part[256];
+        if (udp_ip[0] && udp_len > 0) {
+            snprintf(udp_part, sizeof(udp_part), "H3: %s (%s, %dms, 池%zu, 会话%zu, 累计切%u, 周期丢包 %u/%llu)",
+                     udp_ip, udp_colo[0] ? udp_colo : "UNK", udp_lat >= 0 ? udp_lat : 0,
+                     udp_len, udp_sess, udp_sw, up_drop, down_drop);
+        } else {
+            snprintf(udp_part, sizeof(udp_part), "H3: 无可用节点 (池%zu, 会话%zu, 累计切%u, 周期丢包 %u/%llu)",
+                     udp_len, udp_sess, udp_sw, up_drop, down_drop);
+        }
+
+        if (pos + 2 < sizeof(buf)) {
+            n = snprintf(buf + pos, sizeof(buf) - pos, "\n  %s [%s] %s | %s", branch, name, tcp_part, udp_part);
+            if (n > 0) pos += ((size_t)n < sizeof(buf) - pos) ? (size_t)n : (sizeof(buf) - pos - 1);
+        }
+    }
+
+    log_msg("%s", buf);
 }
 
 int main(int argc, char **argv) {
@@ -7240,6 +7357,10 @@ int main(int argc, char **argv) {
             atomic_init(&rt->udp_candidates.has_node_fail, 0);
             atomic_init(&rt->udp_candidates.epoch, 0);
             atomic_init(&rt->rescanning_lock, 0);
+            atomic_init(&rt->tcp_switch_count, 0);
+            atomic_init(&rt->udp_switch_count, 0);
+            atomic_init(&rt->udp_up_drop, 0);
+            atomic_init(&rt->udp_down_drop_stats, 0);
             atomic_init(&rt->maint_pending, 0);
             pthread_mutex_init(&rt->maint_mu, nullptr);
             pthread_cond_init(&rt->maint_cv, nullptr);
@@ -7538,8 +7659,16 @@ int main(int argc, char **argv) {
             g_location_count = 0;
             return 1;
         }
+        long last_stats_ms = now_ms();
         while (atomic_load(&g_running)) {
             if (sleep_interruptible_ms(1000) != 0) break;
+            if (g_cfg.stats_interval > 0) {
+                long cur_ms = now_ms();
+                if ((long long)(cur_ms - last_stats_ms) >= (long long)g_cfg.stats_interval * 1000LL) {
+                    last_stats_ms = cur_ms;
+                    log_runtime_stats();
+                }
+            }
         }
         /* 1. 广播唤醒维护线程 */
         for (size_t i = 0; i < g_carrier_runtime_count; i++) {
