@@ -13,10 +13,10 @@
 | 缓冲区层级 | 适用平台 | 容量配置 | 核心性能收益 |
 | :--- | :--- | :--- | :--- |
 | **TCP 内核套接字缓冲 (`SO_RCVBUF` / `SO_SNDBUF`)** | Windows / Linux / Android | `2 MB`（自适应回退 `1 MB` / `512 KB`） | 解除高 RTT（80~200ms）跨境链路的带宽时延积（BDP）窗口瓶颈，单流吞吐上限较 256KB 窗口提升 8 倍 |
-| **UDP 内核套接字缓冲 (`SO_RCVBUF` / `SO_SNDBUF`)** | Windows / Linux / Android | `4 MB`（自适应回退 `2 MB` / `1 MB`） | 吸收 QUIC/H3 多路复用高并发突发流量，杜绝内核接收队列溢出导致的静默丢包 |
+| **UDP 内核套接字缓冲 (`SO_RCVBUF` / `SO_SNDBUF`)** | Windows / Linux / Android | 监听 `4 MB` / 会话 `1 MB`（自适应回退 `512 KB`） | 吸收 QUIC/H3 多路复用高并发突发流量，杜绝内核接收队列溢出导致的静默丢包，同时防止多会话内存暴涨 |
 | **用户态 TCP 转发缓冲 (`COPY_BUF_SIZE`)** | Windows / Android（及 Linux 回退） | `128 KB`（虚拟线程栈 `512 KB`） | 单次 `recv`/`send` 可吞吐 8 个满载 16KB TLS 记录帧，系统调用次数减少 87.5%，且完美常驻 CPU 核心 L2 Cache |
 | **Linux 零拷贝管道 (`F_SETPIPE_SZ` + `splice`)** | Linux (`amd64` / `arm64`) | `256 KB`（回退 `128 KB` / `64 KB`） | 单次 `splice` 零拷贝系统调用可转移 64 个内核页面引用，长流大吞吐系统调用开销降低 75% |
-| **UDP/H3 批量收发队列 (`UDP_BATCH_SZ` + `recvmmsg`)** | 无 Root Android / Linux | 上下行双向 `32` 包（`64 KB`） | 上行（Xray $\to$ cfnat）与下行（Cloudflare $\to$ cfnat）双向启用 `recvmmsg`，单次系统调用即可吞吐整轮 QUIC 拥塞窗口突发 |
+| **UDP/H3 批量收发队列 (`UDP_BATCH_SZ` + `recvmmsg`)** | 无 Root Android / Linux | 上下行双向 `32` 包（单包槽位 `4096 B`，队列 `128 KB`） | 上行（Xray $\to$ cfnat）与下行（Cloudflare $\to$ cfnat）双向启用 `recvmmsg`，单包 4KB 槽位完美承载大包 QUIC 与 Jumbo Frame 杜绝截断，单次系统调用即可吞吐整轮 QUIC 拥塞窗口突发 |
 
 ### 2. 核心性能与传输层优化
 
@@ -316,11 +316,11 @@ journalctl --output cat -f -u cfnat
 ## 资源占用与缓冲区设计说明
 
 C 版在消除 Go 运行时、GC 和协程调度器额外常驻成本的基础上，针对高带宽时延积（BDP）跨境转发做了分级缓冲区设计：
-- **内核套接字窗口（`SO_RCVBUF` / `SO_SNDBUF`）**：TCP 优先设为 `2 MB`（回退 `1 MB` / `512 KB`），UDP 优先设为 `4 MB`（回退 `2 MB` / `1 MB`），充分跑满 100~200ms 高延迟跨境链路的单流带宽并吸收 QUIC 突发报文。
+- **内核套接字窗口（`SO_RCVBUF` / `SO_SNDBUF`）**：TCP 优先设为 `2 MB`（回退 `1 MB` / `512 KB`），UDP 监听套接字设为 `4 MB`、会话套接字设为 `1 MB`（自适应回退 `512 KB`），充分跑满 100~200ms 高延迟跨境链路的单流带宽并防止多会话内存膨胀。
 - **用户态转发缓冲（`COPY_BUF_SIZE = 128 KB`）**：在 Windows 11 与 Android Termux 上单次 `recv`/`send` 吞吐 8 个满载 16KB TLS 记录帧，同时 `128 KB` 容量严格控制在现代处理器核心 L2 Cache 热区内，避免冲刷缓存。
 - **Linux 零拷贝管道（`F_SETPIPE_SZ = 256 KB`）**：单次 `splice()` 零拷贝系统调用可转移 64 个内核页面引用，且用户态回退函数通过 `noinline` 强隔离，走零拷贝通道时不占用用户态缓冲页。
 - **按需分页虚拟线程栈（`512 KB`）**：扫描与转发线程虚拟栈设为 `512 KB`（动态对齐 `PTHREAD_STACK_MIN`），依托操作系统按需分页（Demand Paging）机制，未触碰的虚拟栈页不消耗物理内存（RSS）。
-- **UDP/H3 批量队列与 $O(1)$ 检索**：Linux 与 Android 上下行双向启用 32 包 `recvmmsg`（`thread_local` 静态队列仅占 `64 KB`），配合 8 字节 MRU 指针缓存与 `udp_dirty` 描述符缓存，实现高吞吐下的极低系统调用开销。
+- **UDP/H3 批量队列与 $O(1)$ 检索**：Linux 与 Android 上下行双向启用 32 包 `recvmmsg`（`thread_local` 静态队列占 `128 KB`，单包槽位 4096 字节支持大包与防截断），配合 8 字节 MRU 指针缓存与 `udp_dirty` 描述符缓存，实现高吞吐下的极低系统调用开销。
 
 ## 常见问题
 
