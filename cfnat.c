@@ -2023,20 +2023,35 @@ static void tune_socket_buffers(socket_t s, int mode) {
                      : (mode == 2) ? tiers_udp_session
                      : (mode == 3) ? tiers_udp_session_compact
                      : tiers_tcp;
-    int is_udp = (mode == 1 || mode == 2 || mode == 3);
+
 #if defined(__linux__)
-    /* Linux 下仅对 UDP 显式设 SO_RCVBUF，TCP 默认保留内核自动调优 tcp_moderate_rcvbuf */
+    /* Linux：TCP 一律不显式设缓冲。
+     * 一旦显式 setsockopt(SO_RCVBUF / SO_SNDBUF)，内核的窗口自动调优（tcp_moderate_rcvbuf / tcp_wmem）
+     * 会立即失效，窗口被钉死在 min(请求值, rmem_max / wmem_max)，高 BDP 链路反而被限速。
+     * 因此只有 UDP 才按档位显式设置。
+     * 注意：is_udp 必须声明在这个条件编译块内部——Windows / macOS 走 #else 分支，用不到它，
+     * 放在外面会被 clang -Wall 判为 unused variable（即 Windows 构建报的那条警告）。 */
+    const int is_udp = (mode != 0);
+
     if (is_udp) {
         for (int i = 0; i < 3; i++) {
             int sz = tiers[i];
             if (setsockopt(s, SOL_SOCKET, SO_RCVBUF, (const void *)&sz, sizeof(sz)) == 0) break;
         }
     } else {
-        /* A3: 限制未发送数据积压为 64KB，根除 2MB 发送缓冲带来的 Bufferbloat 延迟膨胀 */
+        /* A3: 限制未发送数据积压为 64KB，根除大发送缓冲带来的 Bufferbloat 延迟膨胀 */
         unsigned int lowat = 64 * 1024;
         setsockopt(s, IPPROTO_TCP, TCP_NOTSENT_LOWAT, &lowat, sizeof(lowat));
     }
+
+    if (is_udp) {
+        for (int i = 0; i < 3; i++) {
+            int sz = tiers[i];
+            if (setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const void *)&sz, sizeof(sz)) == 0) break;
+        }
+    }
 #else
+    /* Windows / macOS：没有 Linux 那套自动调优语义，收发两个方向都按档位显式设置 */
     for (int i = 0; i < 3; i++) {
         int sz = tiers[i];
 #ifdef _WIN32
@@ -2045,16 +2060,6 @@ static void tune_socket_buffers(socket_t s, int mode) {
         if (setsockopt(s, SOL_SOCKET, SO_RCVBUF, &sz, sizeof(sz)) == 0) break;
 #endif
     }
-#endif
-#if defined(__linux__)
-    /* Linux 下仅对 UDP 显式设 SO_SNDBUF；TCP 发送缓冲交由内核 tcp_wmem 自动调优，解除 2MB BBR 硬上限 */
-    if (is_udp) {
-        for (int i = 0; i < 3; i++) {
-            int sz = tiers[i];
-            if (setsockopt(s, SOL_SOCKET, SO_SNDBUF, (const void *)&sz, sizeof(sz)) == 0) break;
-        }
-    }
-#else
     for (int i = 0; i < 3; i++) {
         int sz = tiers[i];
 #ifdef _WIN32
