@@ -201,6 +201,9 @@ CFNAT_NODISCARD static int cfnat_poll_single(socket_t fd, int poll_type, int tim
 static const char *DEFAULT_BAIDU_DOMAIN = "cloudnproxy.baidu.com";
 CFNAT_CONSTEXPR int DEFAULT_BAIDU_PORT = 443;
 CFNAT_CONSTEXPR int DEFAULT_BAIDU_IPNUM = 12;
+/* 百度前置 CONNECT 的最小超时预算（毫秒）。CONNECT 是两跳握手（TCP 到节点 + 节点回源 CF + 200），
+ * 实测 90~1200ms，不能用 -delay 这类「单程 RTT 上限」直接当预算，否则大比例误判连接失败。 */
+CFNAT_CONSTEXPR int BAIDU_CONNECT_MIN_TIMEOUT_MS = 1500;
 static const char *DEFAULT_BAIDU_SCAN_TARGET = "myip.ipip.net:80";
 typedef struct {
     const char *label;
@@ -2229,8 +2232,15 @@ static void format_bytes(uint64_t b, char *out, size_t outsz) {
 
 /* RFC 9000 规范的 1200 字节 QUIC Version Negotiation 轻量探针
  * 利用保留版本号 0x5A5A5A5A 触发 Cloudflare 边缘节点立即回包 Version Negotiation
- * 零密钥协商，零 CPU 加密开销，单包 1200 字节符合防放大攻击标准，精准测出 UDP 443 真实延迟 */
+ * 零密钥协商，零 CPU 加密开销，单包 1200 字节符合防放大攻击标准，精准测出 UDP 443 真实延迟
+ *
+ * 注意（实测回归点）：头部之后的载荷必须保持全零。
+ * 曾把 23..1199 填成伪随机字节以「规避全零洪泛 DPI」，结果 Cloudflare 侧按 Initial 报文
+ * 结构解析载荷，随机字节被当成 Token Length / Length 变长整数，绝大多数包被判为畸形包
+ * 直接丢弃（实测同一节点：全零载荷 8/8 有 Version Negotiation 回包，随机载荷仅 1~3/8）。
+ * 表现为 v4/v6 的 H3 精筛恒为 0 个候选、health check 一直「QUIC 无响应」。 */
 static void build_quic_vn_probe(uint8_t pkt[1200], uint32_t version, uint64_t seed) {
+    memset(pkt, 0, 1200);
     pkt[0] = 0xC0;
     pkt[1] = (uint8_t)((version >> 24) & 0xFF);
     pkt[2] = (uint8_t)((version >> 16) & 0xFF);
@@ -2245,13 +2255,7 @@ static void build_quic_vn_probe(uint8_t pkt[1200], uint32_t version, uint64_t se
     x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
     uint64_t scid = x * 0x2545F4914F6CDD1DULL;
     memcpy(pkt + 15, &scid, 8);
-    /* 非零伪随机填充至 1200B，满足 RFC 9000 最小包长且规避全零 UDP 洪泛 DPI 丢弃 */
-    for (size_t off = 23; off < 1200; off += 8) {
-        x ^= x >> 12; x ^= x << 25; x ^= x >> 27;
-        uint64_t v = x * 0x2545F4914F6CDD1DULL;
-        size_t chunk = (1200 - off >= 8) ? 8 : (1200 - off);
-        memcpy(pkt + off, &v, chunk);
-    }
+    /* 23..1199 保持全零：既满足 1200B 最小包长，又让载荷按合法的空 Initial 语义被解析 */
 }
 
 CFNAT_NODISCARD static int quic_probe_ip(const char *ip, int port, int timeout_ms, int *latency_ms) {
@@ -2704,8 +2708,14 @@ CFNAT_NODISCARD static socket_t dial_target_with_proxy_sa(const char *ip, const 
     format_addr_port(ip, port, target, sizeof(target));
     BaiduProxyNode *node = baidu_pool_pick(pool);
     if (!node) return INVALID_SOCKET;
+    /* 百度前置的 CONNECT 是「TCP 连节点 + 节点回源 Cloudflare + 回 200」两跳，
+     * 实测单次耗时 90~1200ms，远大于 TCP RTT。若沿用 -delay（默认 300ms）做预算，
+     * 扫描阶段会出现 90% 以上的「连接失败」，节点少/并发高时直接全灭（baidu 扫描 0 候选）。
+     * 因此走代理时给 CONNECT 一个独立下限，直连路径不受影响。 */
+    int dial_timeout = timeout_ms;
+    if (dial_timeout < BAIDU_CONNECT_MIN_TIMEOUT_MS) dial_timeout = BAIDU_CONNECT_MIN_TIMEOUT_MS;
     atomic_fetch_add(&node->active, 1);
-    socket_t fd = tcp_connect_via_baidu_node(node, node->addr, target, timeout_ms, latency_ms);
+    socket_t fd = tcp_connect_via_baidu_node(node, node->addr, target, dial_timeout, latency_ms);
     if (cfnat_socket_valid(fd)) {
         if (latency_ms && *latency_ms > 0) atomic_store(&node->ewma_ms, (atomic_load(&node->ewma_ms) * 7 + *latency_ms) / 8);
         if (atomic_load(&node->failures) > 0) atomic_fetch_sub(&node->failures, 1);
@@ -3243,7 +3253,11 @@ static void build_baidu_pool_from_ips(BaiduProxyPool *pool, StringList *ips) {
         char addr[MAX_ADDR_LEN];
         snprintf(addr, sizeof(addr), "%s:%d", ips->items[i], g_cfg.baidu_port);
         int latency = 0;
-        int timeout_ms = g_cfg.delay_ms > 0 ? (g_cfg.delay_ms > 800 ? 800 : g_cfg.delay_ms) : 800;
+        /* 探测节点的 CONNECT 可用性同样是「两跳」，必须用 CONNECT 预算而不是 -delay：
+         * 用 300ms 时绝大多数真实节点会因为回源慢被判死，池子只剩 2~3 个节点，
+         * 后续扫描/转发的并发全压在这几个节点上，进一步恶化成功率。 */
+        int timeout_ms = g_cfg.delay_ms > 0 ? (g_cfg.delay_ms > 800 ? g_cfg.delay_ms : 800) : 800;
+        if (timeout_ms < BAIDU_CONNECT_MIN_TIMEOUT_MS) timeout_ms = BAIDU_CONNECT_MIN_TIMEOUT_MS;
         socket_t fd = tcp_connect_via_baidu_node(nullptr, addr, g_cfg.baidu_scan_target, timeout_ms, &latency);
         if (cfnat_socket_valid(fd)) {
             close(fd);
@@ -3430,12 +3444,12 @@ static void *scan_worker(void *arg) {
         int code_matched = 0;
         int code_failed = 0;
 
-        /* 判定链（TLS 目标端口时）：
+        /* 判定链（is_tls = 直连栈且目标端口非明文）：
          *   1) 唯一存活/延迟门槛 = 目标端口(443) 的 TLS 握手 —— 与真实转发路径一致；
          *   2) 80 端口仅在首轮做一次「尽力而为」的 CF-RAY / 状态码采集，不参与存活与延迟统计。
-         * 旧实现把 80 端口 HEAD 当成硬门槛（连不上 / 无 CF-RAY / 状态码不符即淘汰），
-         * 在 IPv6（国内多数线路 :80 被过滤）与百度前置（:80 经代理可达但直连不可达）场景下
-         * 会把整批健全节点误杀，表现为「v6 测不到、baidu 只有缓存」。 */
+         * 百度前置走 CONNECT 隧道，is_tls 为 0，直接走下面的「明文端口」分支：
+         * 以 80 端口 HTTP HEAD 作为存活与延迟门槛（与基线 cfnat-old 一致），
+         * 因为隧道内 CONNECT 已是两跳（90~1200ms），再叠一次 TLS 会被 -delay 预算误杀。 */
         socket_t fd = INVALID_SOCKET;     /* 仅非 TLS 分支使用的 Keep-Alive 连接 */
         int conn_lat = 0;
         int eff_probes = is_tls ? (probes > 2 ? 2 : probes) : probes;
@@ -3515,7 +3529,13 @@ static void *scan_worker(void *arg) {
                     fd = dial_target_with_proxy_sa(ip, &probe_sa, probe_salen, probe_port, ctx->cfg->delay_ms, ctx->proxy_pool, &conn_lat);
                     if (cfnat_socket_invalid(fd)) {
                         atomic_fetch_add(&ctx->connect_fail, 1);
-                        if (attempt == 0) break;
+                        /* 直连：首轮握手失败即判定死节点（避免对死 IP 无效等待）；
+                         * 百度前置：每次拨号随机挑节点，某个节点劣化不代表该 IP 不可用，允许换节点重试一次。 */
+                        if (ctx->proxy_pool) {
+                            if (attempt >= 1) break;
+                        } else {
+                            break;
+                        }
                         continue;
                     }
                 }
@@ -3556,9 +3576,13 @@ static void *scan_worker(void *arg) {
                 }
 
                 if (extract_cfray(hdr, cur_colo, sizeof(cur_colo)) != 0) {
+                    /* 仅统计：确实有部分边缘/部分时段 80 端口不回 CF-RAY（或本地 ISP 改写了响应头），
+                     * 曾经「缺失即淘汰」会把这类健全节点整批误杀。只有用户显式要求按机房筛选时才必须淘汰。 */
                     atomic_fetch_add(&ctx->cfray_miss, 1);
-                    code_failed = 1;
-                    break; /* 明文端口本身依赖 CF-RAY 识别，缺失即淘汰 */
+                    if (ctx->cfg->colo[0]) {
+                        code_failed = 1;
+                        break;
+                    }
                 }
                 if (!colo_rule_allowed(ctx->cfg->colo, cur_colo)) {
                     atomic_fetch_add(&ctx->colo_skip, 1);
@@ -4478,7 +4502,14 @@ static ResultList scan_ips(StringList *ips, CidrList *cidrs, Config *cfg, BaiduP
     }
     int target_port = cfg->port > 0 ? cfg->port : 443;
     int is_cleartext = is_cleartext_port(target_port);
-    int is_tls = !is_cleartext;
+    /* 直连：以目标端口(443) TLS 握手作为存活与延迟门槛，与真实转发路径一致。
+     * 百度前置：HTTP CONNECT 隧道只能承载 TCP，且隧道内的 CONNECT 本身是两跳
+     * （TCP 到节点 + 节点回源 Cloudflare + 200），实测 90~1200ms，与 -delay 这类
+     * 单程 RTT 上限不是一个量级；在隧道里再做一次完整 TLS 握手既拖慢扫描又极易
+     * 因 CONNECT 预算不足被判「连接失败」。因此这里沿用基线（cfnat-old）的语义：
+     * 走代理时用 80 端口 HTTP HEAD 取 CF-RAY + 测延迟，443 的真实可用性交给
+     * 启动/周期健康检查（HC_FULL，走同一条隧道做 TLS）兜底。 */
+    int is_tls = !is_cleartext && proxy_pool == nullptr;
     int probe_port = cfg->http_port > 0 ? cfg->http_port : 80;
     int hdr_timeout = cfg->delay_ms > 0 ? cfg->delay_ms * 2 : 1000;
     if (hdr_timeout < 500) hdr_timeout = 500;
