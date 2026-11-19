@@ -839,11 +839,24 @@ static void print_results_table(const Result *items, size_t count, long duration
 
 static long now_ms(void) {
 #ifdef _WIN32
-    static LARGE_INTEGER qpf = {0};
-    if (qpf.QuadPart == 0) QueryPerformanceFrequency(&qpf);
+    static atomic_llong s_qpf = 0;
+    static atomic_llong s_qpc_base = 0;
+    long long freq = atomic_load_explicit(&s_qpf, memory_order_acquire);
+    if (freq == 0) {
+        LARGE_INTEGER li_freq = {0}, li_now = {0};
+        if (QueryPerformanceFrequency(&li_freq) && li_freq.QuadPart > 0 && QueryPerformanceCounter(&li_now)) {
+            long long expected = 0;
+            atomic_compare_exchange_strong(&s_qpc_base, &expected, (long long)li_now.QuadPart);
+            atomic_store_explicit(&s_qpf, (long long)li_freq.QuadPart, memory_order_release);
+            freq = (long long)li_freq.QuadPart;
+        }
+    }
     LARGE_INTEGER qpc;
-    if (qpf.QuadPart > 0 && QueryPerformanceCounter(&qpc)) {
-        return (long)((qpc.QuadPart * 1000LL) / qpf.QuadPart);
+    if (freq > 0 && QueryPerformanceCounter(&qpc)) {
+        long long base = atomic_load_explicit(&s_qpc_base, memory_order_relaxed);
+        long long delta = (long long)qpc.QuadPart - base;
+        if (delta < 0) delta = 0;
+        return (long)((delta * 1000LL) / freq);
     }
     return (long)GetTickCount64();
 #else
@@ -4365,8 +4378,8 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
     }
 
     long total_start = now_ms();
-    /* H3 并发批次严格按 2 * num 执行（上下界保护 [2, 128]） */
-    size_t batch_size = (size_t)probe_rounds * 2;
+    /* H3 并发批次至多 2 * ipnum（上下界保护 [2, 128]） */
+    size_t batch_size = desired_count * 2;
     if (batch_size < 2) batch_size = 2;
     if (batch_size > 128) batch_size = 128;
 
@@ -6313,6 +6326,8 @@ static socket_t listen_tcp(const char *addr) {
             close(fd);
             return INVALID_SOCKET;
         }
+        /* Windows SIO_LOOPBACK_FAST_PATH 必须在 bind/listen 之前设置才生效 */
+        set_loopback_fast_path(fd);
         if (bind(fd, (struct sockaddr *)&sa6, sizeof(sa6)) != 0) {
             int err = errno;
             close(fd);
@@ -6325,7 +6340,6 @@ static socket_t listen_tcp(const char *addr) {
             errno = err;
             return INVALID_SOCKET;
         }
-        set_loopback_fast_path(fd);
         return fd;
     }
     socket_t fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -6339,6 +6353,8 @@ static socket_t listen_tcp(const char *addr) {
         close(fd);
         return INVALID_SOCKET;
     }
+    /* Windows SIO_LOOPBACK_FAST_PATH 必须在 bind/listen 之前设置才生效 */
+    set_loopback_fast_path(fd);
     if (bind(fd, (struct sockaddr *)&sa, sizeof(sa)) != 0) {
         int err = errno;
         close(fd);
@@ -6351,7 +6367,6 @@ static socket_t listen_tcp(const char *addr) {
         errno = err;
         return INVALID_SOCKET;
     }
-    set_loopback_fast_path(fd);
     return fd;
 }
 
@@ -6446,6 +6461,11 @@ static ssize_t win_udp_recv_coalesced(socket_t fd, char *buf, size_t bufsz,
     if (g_win_wsarecvmsg(fd, &msg, &recvd, nullptr, nullptr) != 0) {
         return -1;
     }
+#ifdef MSG_TRUNC
+    if (msg.dwFlags & MSG_TRUNC) {
+        return -1;
+    }
+#endif
     if (from && from_len) *from_len = msg.namelen;
     if (out_seg_sz && msg.Control.len > 0) {
         for (WSACMSGHDR *cm = WSA_CMSG_FIRSTHDR(&msg); cm != nullptr; cm = WSA_CMSG_NXTHDR(&msg, cm)) {
@@ -6463,11 +6483,14 @@ static ssize_t win_udp_recv_coalesced(socket_t fd, char *buf, size_t bufsz,
 
 /* Win10/11 UDP 发送分段卸载 (USO)：单次 WSASendMsg 批量发射合并报文并精确保持 QUIC 边界，不支持时自动回退分段直发 */
 static ssize_t win_udp_send_segmented(socket_t fd, const char *buf, size_t len, DWORD seg_sz,
-                                      const struct sockaddr *to, int tolen, int *uso_ok) {
+                                      const struct sockaddr *to, int tolen, int *uso_ok, uint64_t *out_dropped) {
+    if (out_dropped) *out_dropped = 0;
     if (len == 0) return 0;
     if (seg_sz == 0 || seg_sz >= len) {
-        return to ? sendto(fd, buf, (int)len, 0, to, tolen)
-                  : send(fd, buf, (int)len, 0);
+        ssize_t s = to ? sendto(fd, buf, (int)len, 0, to, tolen)
+                       : send(fd, buf, (int)len, 0);
+        if (s <= 0 && out_dropped) *out_dropped = 1;
+        return s;
     }
     if (uso_ok && *uso_ok && g_win_wsasendmsg) {
         WSABUF wbuf = { .len = (ULONG)len, .buf = (CHAR *)(uintptr_t)buf };
@@ -6491,9 +6514,13 @@ static ssize_t win_udp_send_segmented(socket_t fd, const char *buf, size_t len, 
             if (g_win_wsasendmsg(fd, &msg, 0, &sent, nullptr, nullptr) == 0) {
                 return (ssize_t)sent;
             }
-            if (WSAGetLastError() != WSAEWOULDBLOCK) {
-                *uso_ok = 0; /* 当前适配器/回环不支持 USO，后续直接分段发送免除重复失败 */
+            int werr = WSAGetLastError();
+            if (werr == WSAEWOULDBLOCK) {
+                /* 发送队列已满：直接返回并精确上报丢包数，避免跌落循环重复空打 */
+                if (out_dropped) *out_dropped = (uint64_t)((len + seg_sz - 1) / seg_sz);
+                return -1;
             }
+            *uso_ok = 0; /* 当前适配器/回环不支持 USO，后续直接分段发送免除重复失败 */
         }
     }
     /* USO 不可用时按 seg_sz 精确拆包发送，依然享受 URO 批量接收收益并完整保留 QUIC 报文边界 */
@@ -6502,8 +6529,12 @@ static ssize_t win_udp_send_segmented(socket_t fd, const char *buf, size_t len, 
         size_t chunk = (len - off > seg_sz) ? seg_sz : (len - off);
         ssize_t s = to ? sendto(fd, buf + off, (int)chunk, 0, to, tolen)
                        : send(fd, buf + off, (int)chunk, 0);
-        if (s > 0) total += s;
-        else break;
+        if (s > 0) {
+            total += s;
+        } else {
+            if (out_dropped) *out_dropped = (uint64_t)(((len - off) + seg_sz - 1) / seg_sz);
+            break;
+        }
     }
     return total > 0 ? total : -1;
 }
@@ -7039,15 +7070,17 @@ static void *carrier_udp_thread(void *arg) {
                             atomic_store_explicit(&rt->udp_candidates.fast_fail_count, 0, memory_order_relaxed);
                         }
                         sess->last_active_ms = cur_ms;
+                        uint64_t dropped = 0;
                         ssize_t sent = win_udp_send_segmented(rt->udp_listen_fd, buf, (size_t)n, seg_sz,
-                                                              (const struct sockaddr *)&sess->client_addr, (int)sess->client_addr_len, &listen_uso_ok);
+                                                              (const struct sockaddr *)&sess->client_addr, (int)sess->client_addr_len, &listen_uso_ok, &dropped);
                         if (sent > 0) {
                             sess->bytes_down += (uint64_t)sent;
                             sess->last_down_ms = cur_ms;
                             sess->bytes_up_at_down = sess->bytes_up;
-                        } else {
-                            rt->udp_down_drop++;
-                            atomic_fetch_add_explicit(&rt->udp_down_drop_stats, 1, memory_order_relaxed);
+                        }
+                        if (dropped > 0) {
+                            rt->udp_down_drop += dropped;
+                            atomic_fetch_add_explicit(&rt->udp_down_drop_stats, (unsigned long long)dropped, memory_order_relaxed);
                         }
                     }
 #else
@@ -7181,9 +7214,10 @@ static void *carrier_udp_thread(void *arg) {
                 }
                 if (sess && cfnat_socket_valid(sess->upstream_fd)) {
                     sess->last_active_ms = cur_ms;
-                    ssize_t sent = win_udp_send_segmented(sess->upstream_fd, buf, (size_t)n, seg_sz, nullptr, 0, &upstream_uso_ok);
+                    uint64_t dropped = 0;
+                    ssize_t sent = win_udp_send_segmented(sess->upstream_fd, buf, (size_t)n, seg_sz, nullptr, 0, &upstream_uso_ok, &dropped);
                     if (sent > 0) sess->bytes_up += (uint64_t)sent;
-                    else atomic_fetch_add_explicit(&rt->udp_up_drop, 1, memory_order_relaxed); /* 上行发送失败（原实现完全静默） */
+                    if (dropped > 0) atomic_fetch_add_explicit(&rt->udp_up_drop, (unsigned int)dropped, memory_order_relaxed);
                 }
             }
 #else
@@ -7864,6 +7898,9 @@ int main(int argc, char **argv) {
         free(g_locations);
         g_locations = nullptr;
         g_location_count = 0;
+#ifdef _WIN32
+        WSACleanup();
+#endif
         return 0;
     }
     long start = now_ms();
