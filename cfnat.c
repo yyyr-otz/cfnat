@@ -314,6 +314,7 @@ typedef struct {
     int v6_split;             /* 全局 IPv6 细分子网前缀 (默认 54) */
     int use_baidu_proxy, baidu_port, baidu_ipnum;
     int cli_mode;             /* 显式单次 CLI 测速模式 (-cli / -scan-only) */
+    int h3_client;            /* 1=使用真实加密 RFC 9001 QUIC v1 Initial (TLS 1.3 ClientHello) 探测 H3; 0=默认轻量 VN 探针 */
     LogLevel log_level;
     ProfileConfig prof_v4;
     ProfileConfig prof_v6;
@@ -1140,6 +1141,7 @@ static void usage(const char *p) {
     printf("  -log=value                日志级别: silent,error,warn,info,debug (default info)\n");
     printf("  -stats-interval=value     三栈双协议运行指标汇报间隔秒数，0=关闭 (default 300)\n");
     printf("  -health-log=value         健康状态行(debug 级明细)输出间隔秒数，0=关闭 (default 60)\n");
+    printf("  -h3-client[=bool]         H3 探测启用真实 QUIC v1 Initial (TLS 1.3 ClientHello) 模拟 (default false)\n");
     printf("  注: 以上参数均支持 -v4- 或 -v6- 前缀实现精细化覆盖，如 -v6-code=200 -v4-delay=150\n");
 }
 
@@ -1194,6 +1196,7 @@ static void cfg_defaults(Config *c) {
     c->task = 200;
     c->health_log = 60;        /* 健康状态行 (debug 级) 输出间隔（秒），0 = 关闭；与运行指标无关 */
     c->stats_interval = 300;   /* 三栈双协议运行指标输出间隔（秒），0 = 关闭（-stats-interval=0） */
+    c->h3_client = 0;          /* 默认关闭真实 QUIC ClientHello 模拟，使用轻量 VN 探针 */
     c->use_baidu_proxy = 0;
     c->baidu_port = DEFAULT_BAIDU_PORT;
     c->baidu_ipnum = DEFAULT_BAIDU_IPNUM;
@@ -1349,6 +1352,7 @@ static void parse_args(Config *c, int argc, char **argv) {
         else if (!strcmp(key, "task") && val) c->task = atoi(val);
         else if (!strcmp(key, "cli") || !strcmp(key, "scan-only")) c->cli_mode = 1;
         else if (!strcmp(key, "health-log") && val) c->health_log = atoi(val);
+        else if (!strcmp(key, "h3-client")) c->h3_client = parse_bool(val);
         /* 运行指标汇报间隔：与健康检查解耦（-stats-interval 为主名，-log-interval 作兼容别名）。
          * 显式传负数一律按 0（关闭）处理，避免出现「间隔 -5 秒」这种无意义配置。 */
         else if ((!strcmp(key, "stats-interval") || !strcmp(key, "log-interval")) && val) {
@@ -1559,8 +1563,9 @@ static void log_current_config(const Config *c) {
         if (c->colo[0]) log_msg("    数据中心筛选: %s", c->colo);
     }
 
-    log_msg("  全局设置: 出站网卡: %s | 运行指标间隔: %d 秒 (0=关闭) | 日志级别: %s",
-            c->bind_if[0] ? c->bind_if : "(系统默认路由)", c->stats_interval, c->log_name);
+    log_msg("  全局设置: 出站网卡: %s | 运行指标间隔: %d 秒 (0=关闭) | H3探针: %s | 日志级别: %s",
+            c->bind_if[0] ? c->bind_if : "(系统默认路由)", c->stats_interval,
+            c->h3_client ? "QUIC-v1-ClientHello" : "轻量VN", c->log_name);
     /* 健康检查节奏本身是自适应的（失败 10s / 稳定 30s / 连续成功 5 次后 60s），不受任何间隔参数影响；
      * -health-log 只决定「健康状态行」这类 debug 明细的输出频率。这里显式写出来，避免把两者混为一谈。 */
     log_msg("  健康检查节奏: 自适应 10s / 30s / 60s（与运行指标间隔解耦）| 健康状态行间隔: %d 秒 (0=关闭)",
@@ -2313,6 +2318,379 @@ static void format_bytes(uint64_t b, char *out, size_t outsz) {
  * Cloudflare 会按 Initial 报文结构解析载荷，把随机字节当作 Token Length / Length 变长整数，
  * 绝大多数包被判为畸形包直接丢弃（同一节点实测：全零载荷 8/8 有回包，随机载荷仅 1~3/8）。
  * 一旦填充随机数据，表现为 v4/v6 的 H3 精筛恒为 0 个候选、健康检查一直「QUIC 无响应」。 */
+/* ---- 自包含 RFC 9000 / RFC 9001 QUIC v1 Initial (TLS 1.3 ClientHello) 构造器（零外部加密库依赖） ---- */
+static const uint32_t CF_SHA256_K[64] = {
+    0x428a2f98u,0x71374491u,0xb5c0fbcfu,0xe9b5dba5u,0x3956c25bu,0x59f111f1u,0x923f82a4u,0xab1c5ed5u,
+    0xd807aa98u,0x12835b01u,0x243185beu,0x550c7dc3u,0x72be5d74u,0x80deb1feu,0x9bdc06a7u,0xc19bf174u,
+    0xe49b69c1u,0xefbe4786u,0x0fc19dc6u,0x240ca1ccu,0x2de92c6fu,0x4a7484aau,0x5cb0a9dcu,0x76f988dau,
+    0x983e5152u,0xa831c66du,0xb00327c8u,0xbf597fc7u,0xc6e00bf3u,0xd5a79147u,0x06ca6351u,0x14292967u,
+    0x27b70a85u,0x2e1b2138u,0x4d2c6dfcu,0x53380d13u,0x650a7354u,0x766a0abbu,0x81c2c92eu,0x92722c85u,
+    0xa2bfe8a1u,0xa81a664bu,0xc24b8b70u,0xc76c51a3u,0xd192e819u,0xd6990624u,0xf40e3585u,0x106aa070u,
+    0x19a4c116u,0x1e376c08u,0x2748774cu,0x34b0bcb5u,0x391c0cb3u,0x4ed8aa4au,0x5b9cca4fu,0x682e6ff3u,
+    0x748f82eeu,0x78a5636fu,0x84c87814u,0x8cc70208u,0x90befffau,0xa4506cebu,0xbef9a3f7u,0xc67178f2u
+};
+
+static inline uint32_t cf_rotr32(uint32_t x, int n) { return (x >> n) | (x << (32 - n)); }
+
+static void cf_sha256_transform(uint32_t s[8], const uint8_t b[64]) {
+    uint32_t w[64];
+    for (int i = 0; i < 16; i++) {
+        w[i] = ((uint32_t)b[i*4] << 24) | ((uint32_t)b[i*4+1] << 16) | ((uint32_t)b[i*4+2] << 8) | b[i*4+3];
+    }
+    for (int i = 16; i < 64; i++) {
+        uint32_t s0 = cf_rotr32(w[i-15], 7) ^ cf_rotr32(w[i-15], 18) ^ (w[i-15] >> 3);
+        uint32_t s1 = cf_rotr32(w[i-2], 17) ^ cf_rotr32(w[i-2], 19) ^ (w[i-2] >> 10);
+        w[i] = w[i-16] + s0 + w[i-7] + s1;
+    }
+    uint32_t a=s[0], bb=s[1], c=s[2], d=s[3], e=s[4], f=s[5], g=s[6], h=s[7];
+    for (int i = 0; i < 64; i++) {
+        uint32_t S1 = cf_rotr32(e, 6) ^ cf_rotr32(e, 11) ^ cf_rotr32(e, 25);
+        uint32_t ch = (e & f) ^ ((~e) & g);
+        uint32_t t1 = h + S1 + ch + CF_SHA256_K[i] + w[i];
+        uint32_t S0 = cf_rotr32(a, 2) ^ cf_rotr32(a, 13) ^ cf_rotr32(a, 22);
+        uint32_t maj = (a & bb) ^ (a & c) ^ (bb & c);
+        uint32_t t2 = S0 + maj;
+        h = g; g = f; f = e; e = d + t1;
+        d = c; c = bb; bb = a; a = t1 + t2;
+    }
+    s[0]+=a; s[1]+=bb; s[2]+=c; s[3]+=d; s[4]+=e; s[5]+=f; s[6]+=g; s[7]+=h;
+}
+
+static void cf_sha256(const uint8_t *data, size_t len, uint8_t out[32]) {
+    uint32_t s[8] = {
+        0x6a09e667u,0xbb67ae85u,0x3c6ef372u,0xa54ff53au,
+        0x510e527fu,0x9b05688cu,0x1f83d9abu,0x5be0cd19u
+    };
+    size_t i = 0;
+    while (i + 64 <= len) { cf_sha256_transform(s, data + i); i += 64; }
+    uint8_t pad[128] = {0};
+    size_t rem = len - i;
+    if (rem > 0) memcpy(pad, data + i, rem);
+    pad[rem] = 0x80;
+    size_t total = (rem < 56) ? 64 : 128;
+    uint64_t bitlen = (uint64_t)len * 8ULL;
+    for (int k = 0; k < 8; k++) pad[total - 1 - k] = (uint8_t)(bitlen >> (k * 8));
+    cf_sha256_transform(s, pad);
+    if (total == 128) cf_sha256_transform(s, pad + 64);
+    for (int k = 0; k < 8; k++) {
+        out[k*4]   = (uint8_t)(s[k] >> 24);
+        out[k*4+1] = (uint8_t)(s[k] >> 16);
+        out[k*4+2] = (uint8_t)(s[k] >> 8);
+        out[k*4+3] = (uint8_t)(s[k]);
+    }
+}
+
+static void cf_hmac_sha256(const uint8_t *key, size_t key_len, const uint8_t *msg, size_t msg_len, uint8_t out[32]) {
+    uint8_t k0[64] = {0};
+    if (key_len > 64) cf_sha256(key, key_len, k0);
+    else if (key_len > 0) memcpy(k0, key, key_len);
+    uint8_t ibuf[64 + 128];
+    for (int i = 0; i < 64; i++) ibuf[i] = k0[i] ^ 0x36;
+    if (msg_len > 128) msg_len = 128;
+    if (msg_len > 0) memcpy(ibuf + 64, msg, msg_len);
+    uint8_t ihash[32];
+    cf_sha256(ibuf, 64 + msg_len, ihash);
+    uint8_t obuf[64 + 32];
+    for (int i = 0; i < 64; i++) obuf[i] = k0[i] ^ 0x5c;
+    memcpy(obuf + 64, ihash, 32);
+    cf_sha256(obuf, 96, out);
+}
+
+static void cf_hkdf_expand_label(const uint8_t secret[32], const char *label, uint8_t *out, size_t out_len) {
+    uint8_t info[64];
+    size_t l_len = strlen(label);
+    size_t pos = 0;
+    info[pos++] = (uint8_t)(out_len >> 8);
+    info[pos++] = (uint8_t)(out_len & 0xff);
+    info[pos++] = (uint8_t)(6 + l_len);
+    memcpy(info + pos, "tls13 ", 6); pos += 6;
+    memcpy(info + pos, label, l_len); pos += l_len;
+    info[pos++] = 0x00;
+    info[pos++] = 0x01;
+    uint8_t t[32];
+    cf_hmac_sha256(secret, 32, info, pos, t);
+    memcpy(out, t, out_len);
+}
+
+static const uint8_t CF_AES_SBOX[256] = {
+    0x63,0x7c,0x77,0x7b,0xf2,0x6b,0x6f,0xc5,0x30,0x01,0x67,0x2b,0xfe,0xd7,0xab,0x76,
+    0xca,0x82,0xc9,0x7d,0xfa,0x59,0x47,0xf0,0xad,0xd4,0xa2,0xaf,0x9c,0xa4,0x72,0xc0,
+    0xb7,0xfd,0x93,0x26,0x36,0x3f,0xf7,0xcc,0x34,0xa5,0xe5,0xf1,0x71,0xd8,0x31,0x15,
+    0x04,0xc7,0x23,0xc3,0x18,0x96,0x05,0x9a,0x07,0x12,0x80,0xe2,0xeb,0x27,0xb2,0x75,
+    0x09,0x83,0x2c,0x1a,0x1b,0x6e,0x5a,0xa0,0x52,0x3b,0xd6,0xb3,0x29,0xe3,0x2f,0x84,
+    0x53,0xd1,0x00,0xed,0x20,0xfc,0xb1,0x5b,0x6a,0xcb,0xbe,0x39,0x4a,0x4c,0x58,0xcf,
+    0xd0,0xef,0xaa,0xfb,0x43,0x4d,0x33,0x85,0x45,0xf9,0x02,0x7f,0x50,0x3c,0x9f,0xa8,
+    0x51,0xa3,0x40,0x8f,0x92,0x9d,0x38,0xf5,0xbc,0xb6,0xda,0x21,0x10,0xff,0xf3,0xd2,
+    0xcd,0x0c,0x13,0xec,0x5f,0x97,0x44,0x17,0xc4,0xa7,0x7e,0x3d,0x64,0x5d,0x19,0x73,
+    0x60,0x81,0x4f,0xdc,0x22,0x2a,0x90,0x88,0x46,0xee,0xb8,0x14,0xde,0x5e,0x0b,0xdb,
+    0xe0,0x32,0x3a,0x0a,0x49,0x06,0x24,0x5c,0xc2,0xd3,0xac,0x62,0x91,0x95,0xe4,0x79,
+    0xe7,0xc8,0x37,0x6d,0x8d,0xd5,0x4e,0xa9,0x6c,0x56,0xf4,0xea,0x65,0x7a,0xae,0x08,
+    0xba,0x78,0x25,0x2e,0x1c,0xa6,0xb4,0xc6,0xe8,0xdd,0x74,0x1f,0x4b,0xbd,0x8b,0x8a,
+    0x70,0x3e,0xb5,0x66,0x48,0x03,0xf6,0x0e,0x61,0x35,0x57,0xb9,0x86,0xc1,0x1d,0x9e,
+    0xe1,0xf8,0x98,0x11,0x69,0xd9,0x8e,0x94,0x9b,0x1e,0x87,0xe9,0xce,0x55,0x28,0xdf,
+    0x8c,0xa1,0x89,0x0d,0xbf,0xe6,0x42,0x68,0x41,0x99,0x2d,0x0f,0xb0,0x54,0xbb,0x16
+};
+
+static inline uint8_t cf_xtime(uint8_t x) { return (uint8_t)((x << 1) ^ ((x & 0x80) ? 0x1b : 0x00)); }
+
+static void cf_aes128_expand(const uint8_t key[16], uint8_t rk[176]) {
+    static const uint8_t rcon[10] = {0x01,0x02,0x04,0x08,0x10,0x20,0x40,0x80,0x1b,0x36};
+    memcpy(rk, key, 16);
+    for (int i = 4; i < 44; i++) {
+        uint8_t t[4];
+        memcpy(t, rk + (i - 1) * 4, 4);
+        if (i % 4 == 0) {
+            uint8_t tmp = t[0];
+            t[0] = CF_AES_SBOX[t[1]] ^ rcon[i / 4 - 1];
+            t[1] = CF_AES_SBOX[t[2]];
+            t[2] = CF_AES_SBOX[t[3]];
+            t[3] = CF_AES_SBOX[tmp];
+        }
+        for (int j = 0; j < 4; j++) rk[i * 4 + j] = rk[(i - 4) * 4 + j] ^ t[j];
+    }
+}
+
+static void cf_aes128_encrypt_block(const uint8_t rk[176], const uint8_t in[16], uint8_t out[16]) {
+    uint8_t s[16];
+    for (int i = 0; i < 16; i++) s[i] = in[i] ^ rk[i];
+    for (int r = 1; r <= 10; r++) {
+        for (int i = 0; i < 16; i++) s[i] = CF_AES_SBOX[s[i]];
+        uint8_t t;
+        t = s[1]; s[1] = s[5]; s[5] = s[9]; s[9] = s[13]; s[13] = t;
+        t = s[2]; s[2] = s[10]; s[10] = t; t = s[6]; s[6] = s[14]; s[14] = t;
+        t = s[15]; s[15] = s[11]; s[11] = s[7]; s[7] = s[3]; s[3] = t;
+        if (r < 10) {
+            for (int c = 0; c < 4; c++) {
+                uint8_t a0 = s[c*4], a1 = s[c*4+1], a2 = s[c*4+2], a3 = s[c*4+3];
+                uint8_t xr = a0 ^ a1 ^ a2 ^ a3;
+                s[c*4]   ^= xr ^ cf_xtime(a0 ^ a1);
+                s[c*4+1] ^= xr ^ cf_xtime(a1 ^ a2);
+                s[c*4+2] ^= xr ^ cf_xtime(a2 ^ a3);
+                s[c*4+3] ^= xr ^ cf_xtime(a3 ^ a0);
+            }
+        }
+        for (int i = 0; i < 16; i++) s[i] ^= rk[r * 16 + i];
+    }
+    memcpy(out, s, 16);
+}
+
+static void cf_ghash_mul(uint8_t x[16], const uint8_t h[16]) {
+    uint8_t z[16] = {0}, v[16];
+    memcpy(v, h, 16);
+    for (int i = 0; i < 128; i++) {
+        if ((x[i >> 3] >> (7 - (i & 7))) & 1) {
+            for (int j = 0; j < 16; j++) z[j] ^= v[j];
+        }
+        int lsb = v[15] & 1;
+        for (int j = 15; j > 0; j--) v[j] = (uint8_t)((v[j] >> 1) | (v[j - 1] << 7));
+        v[0] >>= 1;
+        if (lsb) v[0] ^= 0xe1;
+    }
+    memcpy(x, z, 16);
+}
+
+static void cf_ghash_update(uint8_t y[16], const uint8_t h[16], const uint8_t *data, size_t len) {
+    size_t i = 0;
+    while (i < len) {
+        size_t chunk = (len - i >= 16) ? 16 : (len - i);
+        for (size_t j = 0; j < chunk; j++) y[j] ^= data[i + j];
+        cf_ghash_mul(y, h);
+        i += chunk;
+    }
+}
+
+static void cf_aes128_gcm_encrypt(const uint8_t key[16], const uint8_t iv[12],
+                                  const uint8_t *aad, size_t aad_len,
+                                  const uint8_t *pt, size_t pt_len,
+                                  uint8_t *ct, uint8_t tag[16]) {
+    uint8_t rk[176], h[16], zero[16] = {0};
+    cf_aes128_expand(key, rk);
+    cf_aes128_encrypt_block(rk, zero, h);
+
+    uint8_t j0[16] = {0};
+    memcpy(j0, iv, 12);
+    j0[15] = 1;
+
+    uint8_t ctr[16], ek[16];
+    memcpy(ctr, j0, 16);
+    for (size_t i = 0; i < pt_len; i += 16) {
+        for (int k = 15; k >= 12; k--) { if (++ctr[k] != 0) break; }
+        cf_aes128_encrypt_block(rk, ctr, ek);
+        size_t chunk = (pt_len - i >= 16) ? 16 : (pt_len - i);
+        for (size_t j = 0; j < chunk; j++) ct[i + j] = pt[i + j] ^ ek[j];
+    }
+
+    uint8_t y[16] = {0};
+    cf_ghash_update(y, h, aad, aad_len);
+    cf_ghash_update(y, h, ct, pt_len);
+    uint8_t len_blk[16] = {0};
+    uint64_t ab = (uint64_t)aad_len * 8ULL, cb = (uint64_t)pt_len * 8ULL;
+    for (int k = 0; k < 8; k++) {
+        len_blk[7 - k] = (uint8_t)(ab >> (k * 8));
+        len_blk[15 - k] = (uint8_t)(cb >> (k * 8));
+    }
+    cf_ghash_update(y, h, len_blk, 16);
+
+    cf_aes128_encrypt_block(rk, j0, ek);
+    for (int j = 0; j < 16; j++) tag[j] = y[j] ^ ek[j];
+}
+
+static void quic_extract_sni_host(const char *domain, char *out, size_t outsz) {
+    if (!out || outsz == 0) return;
+    const char *src = (domain && *domain) ? domain : "cloudflaremirrors.com";
+    if (strncmp(src, "https://", 8) == 0) src += 8;
+    else if (strncmp(src, "http://", 7) == 0) src += 7;
+    size_t n = 0;
+    while (src[n] && src[n] != '/' && src[n] != ':' && src[n] != '?' && n + 1 < outsz) {
+        out[n] = src[n];
+        n++;
+    }
+    out[n] = '\0';
+    if (n == 0) snprintf(out, outsz, "%s", "cloudflaremirrors.com");
+}
+
+static size_t quic_put_varint(uint8_t *p, uint64_t v) {
+    if (v < 64) { p[0] = (uint8_t)v; return 1; }
+    if (v < 16384) { p[0] = (uint8_t)(0x40 | (v >> 8)); p[1] = (uint8_t)(v & 0xff); return 2; }
+    p[0] = (uint8_t)(0x80 | ((v >> 24) & 0x3f));
+    p[1] = (uint8_t)((v >> 16) & 0xff);
+    p[2] = (uint8_t)((v >> 8) & 0xff);
+    p[3] = (uint8_t)(v & 0xff);
+    return 4;
+}
+
+static void quic_build_initial_client_hello(uint8_t pkt[1200], const uint8_t dcid[8], const uint8_t scid[8], const char *domain) {
+    static const uint8_t QUIC_V1_SALT[20] = {
+        0x38,0x76,0x2c,0xf7,0xf5,0x59,0x34,0xb3,0x4d,0x17,
+        0x9a,0xe6,0xa4,0xc8,0x0c,0xad,0xcc,0xbb,0x7f,0x0a
+    };
+    char sni[128];
+    quic_extract_sni_host(domain, sni, sizeof(sni));
+    size_t sni_len = strlen(sni);
+    if (sni_len > 100) sni_len = 100;
+
+    /* 1. 构造 TLS 1.3 ClientHello (SNI + ALPN h3 + x25519 + quic_transport_parameters) */
+    uint8_t ch[512];
+    size_t cp = 0;
+    ch[cp++] = 0x01; /* HandshakeType: client_hello */
+    size_t ch_len_pos = cp; cp += 3;
+    ch[cp++] = 0x03; ch[cp++] = 0x03; /* legacy_version = TLS 1.2 */
+    for (int i = 0; i < 32; i++) ch[cp++] = (uint8_t)(dcid[i & 7] ^ scid[(i + 3) & 7] ^ (uint8_t)(i * 37 + 11));
+    ch[cp++] = 0x00; /* legacy_session_id: empty (RFC 9001 Section 8.4) */
+    ch[cp++] = 0x00; ch[cp++] = 0x06;
+    ch[cp++] = 0x13; ch[cp++] = 0x01;
+    ch[cp++] = 0x13; ch[cp++] = 0x02;
+    ch[cp++] = 0x13; ch[cp++] = 0x03;
+    ch[cp++] = 0x01; ch[cp++] = 0x00;
+
+    size_t ext_len_pos = cp; cp += 2;
+
+    /* ext: server_name (0x0000) */
+    ch[cp++] = 0x00; ch[cp++] = 0x00;
+    ch[cp++] = (uint8_t)((sni_len + 5) >> 8); ch[cp++] = (uint8_t)((sni_len + 5) & 0xff);
+    ch[cp++] = (uint8_t)((sni_len + 3) >> 8); ch[cp++] = (uint8_t)((sni_len + 3) & 0xff);
+    ch[cp++] = 0x00;
+    ch[cp++] = (uint8_t)(sni_len >> 8); ch[cp++] = (uint8_t)(sni_len & 0xff);
+    memcpy(ch + cp, sni, sni_len); cp += sni_len;
+
+    /* ext: supported_groups (0x000a): x25519, secp256r1 */
+    ch[cp++] = 0x00; ch[cp++] = 0x0a;
+    ch[cp++] = 0x00; ch[cp++] = 0x06;
+    ch[cp++] = 0x00; ch[cp++] = 0x04;
+    ch[cp++] = 0x00; ch[cp++] = 0x1d;
+    ch[cp++] = 0x00; ch[cp++] = 0x17;
+
+    /* ext: signature_algorithms (0x000d) */
+    ch[cp++] = 0x00; ch[cp++] = 0x0d;
+    ch[cp++] = 0x00; ch[cp++] = 0x08;
+    ch[cp++] = 0x00; ch[cp++] = 0x06;
+    ch[cp++] = 0x04; ch[cp++] = 0x03;
+    ch[cp++] = 0x08; ch[cp++] = 0x04;
+    ch[cp++] = 0x04; ch[cp++] = 0x01;
+
+    /* ext: ALPN (0x0010): "h3" */
+    ch[cp++] = 0x00; ch[cp++] = 0x10;
+    ch[cp++] = 0x00; ch[cp++] = 0x05;
+    ch[cp++] = 0x00; ch[cp++] = 0x03;
+    ch[cp++] = 0x02; ch[cp++] = 'h'; ch[cp++] = '3';
+
+    /* ext: supported_versions (0x002b): TLS 1.3 (0x0304) */
+    ch[cp++] = 0x00; ch[cp++] = 0x2b;
+    ch[cp++] = 0x00; ch[cp++] = 0x03;
+    ch[cp++] = 0x02; ch[cp++] = 0x03; ch[cp++] = 0x04;
+
+    /* ext: key_share (0x0033): x25519 32B */
+    ch[cp++] = 0x00; ch[cp++] = 0x33;
+    ch[cp++] = 0x00; ch[cp++] = 0x26;
+    ch[cp++] = 0x00; ch[cp++] = 0x24;
+    ch[cp++] = 0x00; ch[cp++] = 0x1d;
+    ch[cp++] = 0x00; ch[cp++] = 0x20;
+    for (int i = 0; i < 32; i++) ch[cp++] = (uint8_t)(scid[i & 7] ^ (uint8_t)(i * 19 + 0x5a));
+
+    /* ext: quic_transport_parameters (0x0039) */
+    uint8_t tp[64];
+    size_t tpp = 0;
+    tp[tpp++] = 0x01; tp[tpp++] = 0x04; tpp += quic_put_varint(tp + tpp, 30000);
+    tp[tpp++] = 0x04; tp[tpp++] = 0x04; tpp += quic_put_varint(tp + tpp, 0x400000);
+    tp[tpp++] = 0x05; tp[tpp++] = 0x04; tpp += quic_put_varint(tp + tpp, 0x100000);
+    tp[tpp++] = 0x06; tp[tpp++] = 0x04; tpp += quic_put_varint(tp + tpp, 0x100000);
+    tp[tpp++] = 0x08; tp[tpp++] = 0x02; tpp += quic_put_varint(tp + tpp, 100);
+    tp[tpp++] = 0x0f; tp[tpp++] = 0x08; memcpy(tp + tpp, scid, 8); tpp += 8;
+
+    ch[cp++] = 0x00; ch[cp++] = 0x39;
+    ch[cp++] = (uint8_t)(tpp >> 8); ch[cp++] = (uint8_t)(tpp & 0xff);
+    memcpy(ch + cp, tp, tpp); cp += tpp;
+
+    size_t ext_len = cp - (ext_len_pos + 2);
+    ch[ext_len_pos]     = (uint8_t)(ext_len >> 8);
+    ch[ext_len_pos + 1] = (uint8_t)(ext_len & 0xff);
+
+    size_t ch_body_len = cp - (ch_len_pos + 3);
+    ch[ch_len_pos]     = (uint8_t)(ch_body_len >> 16);
+    ch[ch_len_pos + 1] = (uint8_t)((ch_body_len >> 8) & 0xff);
+    ch[ch_len_pos + 2] = (uint8_t)(ch_body_len & 0xff);
+
+    /* 2. 组装 QUIC v1 Initial Header (固定 27 字节含 1 字节 PN=0) */
+    uint8_t hdr[32];
+    size_t hp_len = 0;
+    hdr[hp_len++] = 0xC0;
+    hdr[hp_len++] = 0x00; hdr[hp_len++] = 0x00; hdr[hp_len++] = 0x00; hdr[hp_len++] = 0x01;
+    hdr[hp_len++] = 0x08; memcpy(hdr + hp_len, dcid, 8); hp_len += 8;
+    hdr[hp_len++] = 0x08; memcpy(hdr + hp_len, scid, 8); hp_len += 8;
+    hdr[hp_len++] = 0x00;
+    size_t pn_offset = hp_len + 2;
+    size_t pt_len = 1200 - (pn_offset + 1) - 16;
+    size_t quic_len = 1 + pt_len + 16;
+    hdr[hp_len++] = (uint8_t)(0x40 | (quic_len >> 8));
+    hdr[hp_len++] = (uint8_t)(quic_len & 0xff);
+    hdr[hp_len++] = 0x00;
+
+    /* 3. 构造明文载荷: CRYPTO Frame + PADDING 至 pt_len */
+    uint8_t pt[1200] = {0};
+    size_t pp = 0;
+    pt[pp++] = 0x06;
+    pt[pp++] = 0x00;
+    pp += quic_put_varint(pt + pp, cp);
+    memcpy(pt + pp, ch, cp);
+
+    /* 4. RFC 9001 初始密钥派生 + AES-128-GCM 加密 + Header Protection */
+    uint8_t init_sec[32], client_in[32], key[16], iv[12], hp_key[16];
+    cf_hmac_sha256(QUIC_V1_SALT, 20, dcid, 8, init_sec);
+    cf_hkdf_expand_label(init_sec, "client in", client_in, 32);
+    cf_hkdf_expand_label(client_in, "quic key", key, 16);
+    cf_hkdf_expand_label(client_in, "quic iv", iv, 12);
+    cf_hkdf_expand_label(client_in, "quic hp", hp_key, 16);
+
+    memcpy(pkt, hdr, hp_len);
+    cf_aes128_gcm_encrypt(key, iv, hdr, hp_len, pt, pt_len, pkt + hp_len, pkt + hp_len + pt_len);
+
+    uint8_t hp_rk[176], mask[16];
+    cf_aes128_expand(hp_key, hp_rk);
+    cf_aes128_encrypt_block(hp_rk, pkt + pn_offset + 4, mask);
+    pkt[0] ^= (uint8_t)(mask[0] & 0x0f);
+    pkt[pn_offset] ^= mask[1];
+}
+
 CFNAT_NODISCARD static int quic_probe_ip(const char *ip, int port, int timeout_ms, int *latency_ms) {
     if (!ip || !*ip || port <= 0) return 0;
     int is_v6 = (strchr(ip, ':') != nullptr);
@@ -2332,15 +2710,24 @@ CFNAT_NODISCARD static int quic_probe_ip(const char *ip, int port, int timeout_m
     set_nonblock(fd, 1);
 
     uint8_t pkt[1200];
-    memset(pkt, 0, sizeof(pkt));
-    pkt[0] = 0xC0;
-    pkt[1] = 0x5A; pkt[2] = 0x5A; pkt[3] = 0x5A; pkt[4] = 0x5A;
-    pkt[5] = 0x08; /* DCID Len */
     uint32_t seed = (uint32_t)now_ms();
-    memcpy(pkt + 6, &seed, 4);
-    pkt[14] = 0x08; /* SCID Len */
-    uint32_t scid = ~seed;
-    memcpy(pkt + 15, &scid, 4);
+    if (g_cfg.h3_client) {
+        uint64_t d_val = rand_u64() ^ ((uint64_t)seed << 17);
+        uint64_t s_val = rand_u64() ^ ((uint64_t)(~seed) << 11);
+        uint8_t dcid[8], scid_b[8];
+        memcpy(dcid, &d_val, 8);
+        memcpy(scid_b, &s_val, 8);
+        quic_build_initial_client_hello(pkt, dcid, scid_b, g_cfg.domain);
+    } else {
+        memset(pkt, 0, sizeof(pkt));
+        pkt[0] = 0xC0;
+        pkt[1] = 0x5A; pkt[2] = 0x5A; pkt[3] = 0x5A; pkt[4] = 0x5A;
+        pkt[5] = 0x08; /* DCID Len */
+        memcpy(pkt + 6, &seed, 4);
+        pkt[14] = 0x08; /* SCID Len */
+        uint32_t scid = ~seed;
+        memcpy(pkt + 15, &scid, 4);
+    }
 
     struct sockaddr_storage ss;
     socklen_t sslen = 0;
@@ -4159,11 +4546,24 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
         if (i > 0 && pacing_ms > 0) {
             if (sleep_interruptible_ms(pacing_ms) != 0) break;
         }
-        uint32_t scid = seed ^ (uint32_t)(i + 1);
-        memcpy(pkt + 15, &scid, 4);
+        uint8_t ch_pkt[1200];
+        const uint8_t *send_buf = pkt;
+        if (g_cfg.h3_client) {
+            uint64_t d_val = rand_u64() ^ ((uint64_t)seed << 17) ^ (uint64_t)(i + 1);
+            uint64_t s_val = rand_u64() ^ ((uint64_t)(~seed) << 11) ^ ((uint64_t)(i + 1) << 29);
+            uint8_t dcid[8], scid_b[8];
+            memcpy(dcid, &d_val, 8);
+            memcpy(scid_b, &s_val, 8);
+            const char *dom = (rt && rt->spec.prof.domain[0]) ? rt->spec.prof.domain : g_cfg.domain;
+            quic_build_initial_client_hello(ch_pkt, dcid, scid_b, dom);
+            send_buf = ch_pkt;
+        } else {
+            uint32_t scid = seed ^ (uint32_t)(i + 1);
+            memcpy(pkt + 15, &scid, 4);
+        }
 
         items[i].send_time = now_ms();
-        if (sendto(sfd, (const char *)pkt, sizeof(pkt), 0,
+        if (sendto(sfd, (const char *)send_buf, sizeof(pkt), 0,
                    (struct sockaddr *)&items[i].addr, items[i].addr_len) > 0) {
             if (is_v6) sent_v6++;
             else sent_v4++;
