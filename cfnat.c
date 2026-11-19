@@ -803,6 +803,11 @@ static inline int cfnat_write_utf8(FILE *stream, const char *text, size_t len) {
 
 static int terminal_has_color(FILE *stream) {
     if (!stream) return 0;
+    const char *no_color = getenv("NO_COLOR");
+    if (no_color && no_color[0] != '\0' && strcmp(no_color, "0") != 0) return 0;
+    const char *force = getenv("FORCE_COLOR");
+    if (!force || !force[0]) force = getenv("CLICOLOR_FORCE");
+    if (force && force[0] != '\0' && strcmp(force, "0") != 0) return 1;
     int fd = fileno(stream);
     if (fd < 0) return 0;
     return isatty(fd);
