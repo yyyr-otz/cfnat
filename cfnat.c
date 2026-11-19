@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.0.18"
+#define CFNAT_VERSION "0.1.0"
 
 /* =========================================================================
  * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
@@ -299,6 +299,8 @@ typedef struct {
     char domain[MAX_DOMAIN_LEN]; /* 状态码检查域名/路径 */
     char colo[256];           /* 数据中心筛选规则 (含排除) */
     int use_baidu_proxy;      /* 0: 直连, 1: 百度前置, 2: 混合 */
+    int enable_h2;            /* 1=启用 TCP/H2 监听与测活, 0=关闭 (纯 H3 模式) */
+    int enable_h3;            /* 1=启用 UDP/H3 测优与转发, 0=关闭 (纯 H2 模式) */
 } ProfileConfig;
 
 typedef struct {
@@ -315,6 +317,8 @@ typedef struct {
     int use_baidu_proxy, baidu_port, baidu_ipnum;
     int cli_mode;             /* 显式单次 CLI 测速模式 (-cli / -scan-only) */
     int h3_client;            /* 1=使用真实加密 RFC 9001 QUIC v1 Initial (TLS 1.3 ClientHello) 探测 H3; 0=默认轻量 VN 探针 */
+    int enable_h2;            /* 全局默认启用 TCP/H2 (默认 1) */
+    int enable_h3;            /* 全局默认启用 UDP/H3 (默认 1) */
     LogLevel log_level;
     ProfileConfig prof_v4;
     ProfileConfig prof_v6;
@@ -1146,6 +1150,7 @@ static void usage(const char *p) {
     printf("  -stats-interval=value     三栈双协议运行指标汇报间隔秒数，0=关闭 (default 300)\n");
     printf("  -health-log=value         健康状态行(debug 级明细)输出间隔秒数，0=关闭 (default 60)\n");
     printf("  -h3-client[=bool]         H3 探测启用真实 QUIC v1 Initial (TLS 1.3 ClientHello) 模拟 (default false)\n");
+    printf("  -h2[=bool] / -h3[=bool]   启用或关闭 H2(TCP) / H3(UDP) 协议，支持 -v4-/-v6-/-baidu- 前缀 (default true)\n");
     printf("  注: 以上参数均支持 -v4- 或 -v6- 前缀实现精细化覆盖，如 -v6-code=200 -v4-delay=150\n");
 }
 
@@ -1201,6 +1206,8 @@ static void cfg_defaults(Config *c) {
     c->health_log = 60;        /* 健康状态行 (debug 级) 输出间隔（秒），0 = 关闭；与运行指标无关 */
     c->stats_interval = 300;   /* 三栈双协议运行指标输出间隔（秒），0 = 关闭（-stats-interval=0） */
     c->h3_client = 0;          /* 默认关闭真实 QUIC ClientHello 模拟，使用轻量 VN 探针 */
+    c->enable_h2 = 1;          /* 默认双协议启用 */
+    c->enable_h3 = 1;
     c->use_baidu_proxy = 0;
     c->baidu_port = DEFAULT_BAIDU_PORT;
     c->baidu_ipnum = DEFAULT_BAIDU_IPNUM;
@@ -1229,6 +1236,7 @@ static void parse_args(Config *c, int argc, char **argv) {
     int v4_num = 0, v6_num = 0;
     int v4_code = -1, v6_code = -1, baidu_code = -1; /* -1 表示未指定专属 */
     int v4_random = -1, v6_random = -1;
+    int v4_h2 = -1, v4_h3 = -1, v6_h2 = -1, v6_h3 = -1, baidu_h2 = -1, baidu_h3 = -1;
     int v6_split_val = -1;
     char v4_colo[256] = {0}, v6_colo[256] = {0};
     char v4_domain[MAX_DOMAIN_LEN] = {0}, v6_domain[MAX_DOMAIN_LEN] = {0};
@@ -1357,6 +1365,14 @@ static void parse_args(Config *c, int argc, char **argv) {
         else if (!strcmp(key, "cli") || !strcmp(key, "scan-only")) c->cli_mode = 1;
         else if (!strcmp(key, "health-log") && val) c->health_log = atoi(val);
         else if (!strcmp(key, "h3-client")) c->h3_client = parse_bool(val);
+        else if (!strcmp(key, "h2")) c->enable_h2 = parse_bool(val);
+        else if (!strcmp(key, "h3")) c->enable_h3 = parse_bool(val);
+        else if (!strcmp(key, "v4-h2")) v4_h2 = parse_bool(val);
+        else if (!strcmp(key, "v4-h3")) v4_h3 = parse_bool(val);
+        else if (!strcmp(key, "v6-h2")) v6_h2 = parse_bool(val);
+        else if (!strcmp(key, "v6-h3")) v6_h3 = parse_bool(val);
+        else if (!strcmp(key, "baidu-h2")) baidu_h2 = parse_bool(val);
+        else if (!strcmp(key, "baidu-h3")) baidu_h3 = parse_bool(val);
         /* 运行指标汇报间隔：与健康检查解耦（-stats-interval 为主名，-log-interval 作兼容别名）。
          * 显式传负数一律按 0（关闭）处理，避免出现「间隔 -5 秒」这种无意义配置。 */
         else if ((!strcmp(key, "stats-interval") || !strcmp(key, "log-interval")) && val) {
@@ -1432,7 +1448,8 @@ static void parse_args(Config *c, int argc, char **argv) {
         if (c->listen_order[k] == 1) pos_v4 = k;
         else if (c->listen_order[k] == 3) pos_bd = k;
     }
-    if (pos_v4 >= 0 && pos_bd >= 0 && pos_bd < pos_v4) {
+    int eff_baidu_h3 = (baidu_h3 >= 0) ? baidu_h3 : c->enable_h3;
+    if (pos_v4 >= 0 && pos_bd >= 0 && pos_bd < pos_v4 && eff_baidu_h3) {
         for (int k = pos_v4; k > pos_bd; k--) {
             c->listen_order[k] = c->listen_order[k - 1];
         }
@@ -1441,6 +1458,8 @@ static void parse_args(Config *c, int argc, char **argv) {
 
     /* 初始化 prof_v4 */
     c->prof_v4.enabled = has_v4_listen;
+    c->prof_v4.enable_h2 = (v4_h2 >= 0) ? v4_h2 : c->enable_h2;
+    c->prof_v4.enable_h3 = (v4_h3 >= 0) ? v4_h3 : c->enable_h3;
     c->prof_v4.ips_type = 4;
     snprintf(c->prof_v4.name, sizeof(c->prof_v4.name), "v4");
     snprintf(c->prof_v4.listen_addr, sizeof(c->prof_v4.listen_addr), "%s", v4_listen_val[0] ? v4_listen_val : "0.0.0.0:4443");
@@ -1474,6 +1493,8 @@ static void parse_args(Config *c, int argc, char **argv) {
 
     /* 初始化 prof_v6 */
     c->prof_v6.enabled = has_v6_listen;
+    c->prof_v6.enable_h2 = (v6_h2 >= 0) ? v6_h2 : c->enable_h2;
+    c->prof_v6.enable_h3 = (v6_h3 >= 0) ? v6_h3 : c->enable_h3;
     c->prof_v6.ips_type = 6;
     snprintf(c->prof_v6.name, sizeof(c->prof_v6.name), "v6");
     snprintf(c->prof_v6.listen_addr, sizeof(c->prof_v6.listen_addr), "%s", v6_listen_val[0] ? v6_listen_val : "[::]:6443");
@@ -1522,13 +1543,22 @@ static void parse_args(Config *c, int argc, char **argv) {
     snprintf(c->prof_baidu.domain, sizeof(c->prof_baidu.domain), "%s", c->domain);
     snprintf(c->prof_baidu.colo, sizeof(c->prof_baidu.colo), "%s", c->colo);
     c->prof_baidu.use_baidu_proxy = 1;
+    c->prof_baidu.enable_h2 = (baidu_h2 >= 0) ? baidu_h2 : c->enable_h2;
+    c->prof_baidu.enable_h3 = (baidu_h3 >= 0) ? baidu_h3 : c->enable_h3;
     if (has_baidu_listen) c->use_baidu_proxy = 1;
+    if ((c->prof_v4.enabled && !c->prof_v4.enable_h2 && !c->prof_v4.enable_h3) ||
+        (c->prof_v6.enabled && !c->prof_v6.enable_h2 && !c->prof_v6.enable_h3) ||
+        (c->prof_baidu.enabled && !c->prof_baidu.enable_h2 && !c->prof_baidu.enable_h3)) {
+        fprintf(stderr, "配置错误: 已启用的监听实例不能同时关闭 H2 与 H3 (-h2=0 -h3=0)\n");
+        exit(1);
+    }
 }
 
 static void log_current_config(const Config *c) {
     log_msg("cfnat v%s 当前运行配置清单 (含缺省默认值):", CFNAT_VERSION);
     if (c->prof_v4.enabled) {
-        log_msg("  [IPv4 转发实例] 监听地址: %s", c->prof_v4.listen_addr);
+        log_msg("  [IPv4 转发实例] 监听地址: %s | 协议: %s", c->prof_v4.listen_addr,
+                (c->prof_v4.enable_h2 && c->prof_v4.enable_h3) ? "H2+H3" : (c->prof_v4.enable_h2 ? "仅H2" : "仅H3"));
         log_msg("    TLS目标端口: %d | HTTP目标端口: %d", c->prof_v4.port, c->prof_v4.http_port);
         log_msg("    并发扫描线程: %d | 延迟上限: %d ms | 候选IP保留: %d", c->prof_v4.task, c->prof_v4.delay_ms, c->prof_v4.ipnum);
         log_msg("    状态码校验 (-code): %s", c->prof_v4.code > 0 ? "启用" : "未启用 (仅测连通性)");
@@ -1539,7 +1569,8 @@ static void log_current_config(const Config *c) {
     }
 
     if (c->prof_v6.enabled) {
-        log_msg("  [IPv6 转发实例] 监听地址: %s", c->prof_v6.listen_addr);
+        log_msg("  [IPv6 转发实例] 监听地址: %s | 协议: %s", c->prof_v6.listen_addr,
+                (c->prof_v6.enable_h2 && c->prof_v6.enable_h3) ? "H2+H3" : (c->prof_v6.enable_h2 ? "仅H2" : "仅H3"));
         log_msg("    TLS目标端口: %d | HTTP目标端口: %d", c->prof_v6.port, c->prof_v6.http_port);
         log_msg("    并发扫描线程: %d | 延迟上限: %d ms | 候选IP保留: %d", c->prof_v6.task, c->prof_v6.delay_ms, c->prof_v6.ipnum);
         log_msg("    IPv6 子网切分 (-v6-split): /%d (每个/48抽样 %d 个样本)", c->prof_v6.v6_split, 1 << (c->prof_v6.v6_split - 48));
@@ -1551,7 +1582,11 @@ static void log_current_config(const Config *c) {
     }
 
     if (c->prof_baidu.enabled) {
-        log_msg("  [百度前置实例] 监听地址: %s", c->prof_baidu.listen_addr);
+        log_msg("  [百度前置实例] 监听地址: %s | 协议: %s", c->prof_baidu.listen_addr,
+                (c->prof_baidu.enable_h2 && c->prof_baidu.enable_h3) ? "H2+H3" : (c->prof_baidu.enable_h2 ? "仅H2" : "仅H3"));
+        if (!c->prof_baidu.enable_h2 && c->prof_baidu.enable_h3) {
+            warn_msg("  [百度前置实例] 提示: 百度前置仅代理 TCP，纯 H3 模式下 UDP 始终走本机直连");
+        }
         log_msg("    百度解析器 (-baidu-resolver): %s", c->baidu_resolver);
         log_msg("    百度前置目标: %s:%d (候选数: %d)", c->baidu_domain, c->baidu_port, c->baidu_ipnum);
     } else {
@@ -5097,9 +5132,73 @@ static size_t cache_quick_check_parallel(CarrierRuntime *rt, const Result *items
 
 static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
     if (!rt) return 0;
+    int use_h2 = rt->spec.prof.enable_h2;
+    int use_h3 = rt->spec.prof.enable_h3;
     int ips_type = rt->spec.prof.ips_type > 0 ? rt->spec.prof.ips_type : g_cfg.ips_type;
     const char *tcp_path = candidate_cache_file_for_profile(rt->spec.mode, ips_type);
     const char *udp_path = candidate_cache_file_for_profile_udp(rt->spec.mode, ips_type);
+    int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
+    if (target_port <= 0) target_port = 443;
+    int delay_ms = udp_probe_timeout_ms((rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms);
+    size_t target_ipnum = (size_t)(rt->spec.prof.ipnum > 0 ? rt->spec.prof.ipnum : g_cfg.ipnum);
+    if (target_ipnum == 0) target_ipnum = 20;
+
+    /* 纯 H3 模式：优先命中 udpcache 直接秒启；无有效 udpcache 时再读 tcpcache 作种子精筛 H3；两者皆无才走全量扫描 */
+    if (!use_h2 && use_h3) {
+        ResultList cached_udp = load_candidate_cache_for_profile(udp_path, &rt->spec.prof);
+        size_t first_good_udp = (cached_udp.len > 0)
+                                ? cache_quick_check_parallel(rt, cached_udp.items, cached_udp.len, 1, target_port, delay_ms)
+                                : (size_t)-1;
+        if (first_good_udp != (size_t)-1) {
+            rt->udp_candidates.items = cached_udp.items;
+            rt->udp_candidates.len = cached_udp.len;
+            carrier_set_current_udp_candidate(rt, first_good_udp);
+            atomic_store(&rt->udp_candidates.cache_valid, 1);
+            int udp_lat = rt->udp_candidates.items[rt->udp_candidates.current_index].latency_ms;
+            log_msg("[%s] 纯 H3 模式命中 UDP 缓存快速启动:\n"
+                    "  └─ [UDP/H3] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
+                    carrier_display_name(rt->spec.mode),
+                    rt->udp_candidates.current_ip, udp_lat, rt->udp_candidates.len);
+            if (g_cfg.log_level >= LOG_DEBUG) {
+                debug_msg("[UDP/H3] [%s] 已载入缓存的候选 IP 列表 (共 %zu 个):", carrier_display_name(rt->spec.mode), rt->udp_candidates.len);
+                print_results_table(rt->udp_candidates.items, rt->udp_candidates.len, 0);
+            }
+            return 1;
+        }
+        free(cached_udp.items);
+
+        ResultList cached_tcp = load_candidate_cache_for_profile(tcp_path, &rt->spec.prof);
+        if (cached_tcp.len == 0) return 0;
+        size_t first_good_tcp = cache_quick_check_parallel(rt, cached_tcp.items, cached_tcp.len, 0, 0, 0);
+        if (first_good_tcp == (size_t)-1) {
+            warn_msg("[%s] 纯 H3 模式无有效 UDP/TCP 缓存，将执行前置 TCP 扫描生成 H3 种子", carrier_display_name(rt->spec.mode));
+            free(cached_tcp.items);
+            return 0;
+        }
+        /* 保留 tcpcache 作为种子池供后续空池自愈，但不开启 TCP 监听与测活 */
+        rt->candidates.items = cached_tcp.items;
+        rt->candidates.len = cached_tcp.len;
+        carrier_set_current_candidate(rt, first_good_tcp);
+        atomic_store(&rt->candidates.cache_valid, 1);
+
+        ResultList fresh_udp = filter_udp_candidates_from_tcp(rt, cached_tcp.items, cached_tcp.len, target_ipnum);
+        if (fresh_udp.len > 0) {
+            rt->udp_candidates.items = fresh_udp.items;
+            rt->udp_candidates.len = fresh_udp.len;
+            carrier_set_current_udp_candidate(rt, 0);
+            atomic_store(&rt->udp_candidates.cache_valid, 1);
+            save_candidate_cache(udp_path, fresh_udp.items, fresh_udp.len);
+            int udp_lat = rt->udp_candidates.items[0].latency_ms;
+            log_msg("[%s] 纯 H3 模式基于 TCP 缓存精筛快速启动:\n"
+                    "  └─ [UDP/H3] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
+                    carrier_display_name(rt->spec.mode),
+                    rt->udp_candidates.current_ip, udp_lat, rt->udp_candidates.len);
+        } else {
+            log_msg("[%s] 纯 H3 模式基于 TCP 缓存启动，暂未捕获有效 H3 节点 (0 个候选，等待空池退避自愈)",
+                    carrier_display_name(rt->spec.mode));
+        }
+        return 1;
+    }
 
     ResultList cached_tcp = load_candidate_cache_for_profile(tcp_path, &rt->spec.prof);
     if (cached_tcp.len == 0) {
@@ -5118,32 +5217,26 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
     carrier_set_current_candidate(rt, first_good_tcp);
     atomic_store(&rt->candidates.cache_valid, 1);
 
-    // 尝试载入并并行验证 UDP 缓存
-    ResultList cached_udp = load_candidate_cache_for_profile(udp_path, &rt->spec.prof);
-    int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
-    if (target_port <= 0) target_port = 443;
-    int delay_ms = udp_probe_timeout_ms((rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms);
-
-    size_t first_good_udp = (cached_udp.len > 0)
-                            ? cache_quick_check_parallel(rt, cached_udp.items, cached_udp.len, 1, target_port, delay_ms)
-                            : (size_t)-1;
-
-    if (first_good_udp != (size_t)-1) {
-        rt->udp_candidates.items = cached_udp.items;
-        rt->udp_candidates.len = cached_udp.len;
-        carrier_set_current_udp_candidate(rt, first_good_udp);
-        atomic_store(&rt->udp_candidates.cache_valid, 1);
-    } else {
-        // UDP 缓存未命中或失效：从 TCP 缓存的前 2x 个现场精筛
-        free(cached_udp.items);
-        size_t target_ipnum = (size_t)(rt->spec.prof.ipnum > 0 ? rt->spec.prof.ipnum : g_cfg.ipnum);
-        ResultList fresh_udp = filter_udp_candidates_from_tcp(rt, cached_tcp.items, cached_tcp.len, target_ipnum > 0 ? target_ipnum : 20);
-        if (fresh_udp.len > 0) {
-            rt->udp_candidates.items = fresh_udp.items;
-            rt->udp_candidates.len = fresh_udp.len;
-            carrier_set_current_udp_candidate(rt, 0);
+    if (use_h3) {
+        ResultList cached_udp = load_candidate_cache_for_profile(udp_path, &rt->spec.prof);
+        size_t first_good_udp = (cached_udp.len > 0)
+                                ? cache_quick_check_parallel(rt, cached_udp.items, cached_udp.len, 1, target_port, delay_ms)
+                                : (size_t)-1;
+        if (first_good_udp != (size_t)-1) {
+            rt->udp_candidates.items = cached_udp.items;
+            rt->udp_candidates.len = cached_udp.len;
+            carrier_set_current_udp_candidate(rt, first_good_udp);
             atomic_store(&rt->udp_candidates.cache_valid, 1);
-            save_candidate_cache(udp_path, fresh_udp.items, fresh_udp.len);
+        } else {
+            free(cached_udp.items);
+            ResultList fresh_udp = filter_udp_candidates_from_tcp(rt, cached_tcp.items, cached_tcp.len, target_ipnum);
+            if (fresh_udp.len > 0) {
+                rt->udp_candidates.items = fresh_udp.items;
+                rt->udp_candidates.len = fresh_udp.len;
+                carrier_set_current_udp_candidate(rt, 0);
+                atomic_store(&rt->udp_candidates.cache_valid, 1);
+                save_candidate_cache(udp_path, fresh_udp.items, fresh_udp.len);
+            }
         }
     }
 
@@ -5152,7 +5245,12 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
     int udp_lat = (rt->udp_candidates.items && rt->udp_candidates.current_index < rt->udp_candidates.len) ?
                   rt->udp_candidates.items[rt->udp_candidates.current_index].latency_ms : 0;
 
-    if (rt->udp_candidates.len > 0 && rt->udp_candidates.current_ip[0]) {
+    if (!use_h3) {
+        log_msg("[%s] 纯 H2 模式命中 TCP 候选缓存快速启动:\n"
+                "  └─ [TCP/H2] 最优 IP: %s (延迟 %d ms, 候选 %zu 个) | [UDP/H3] 已禁用",
+                carrier_display_name(rt->spec.mode),
+                rt->candidates.current_ip, tcp_lat, rt->candidates.len);
+    } else if (rt->udp_candidates.len > 0 && rt->udp_candidates.current_ip[0]) {
         log_msg("[%s] 命中双轨候选缓存快速启动:\n"
                 "  ├─ [TCP/H2] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)\n"
                 "  └─ [UDP/H3] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
@@ -5169,13 +5267,14 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
     if (g_cfg.log_level >= LOG_DEBUG) {
         debug_msg("[TCP/H2] [%s] 已载入缓存的候选 IP 列表 (共 %zu 个):", carrier_display_name(rt->spec.mode), rt->candidates.len);
         print_results_table(rt->candidates.items, rt->candidates.len, 0);
-        if (rt->udp_candidates.len > 0) {
+        if (use_h3 && rt->udp_candidates.len > 0) {
             debug_msg("[UDP/H3] [%s] 已载入缓存的候选 IP 列表 (共 %zu 个):", carrier_display_name(rt->spec.mode), rt->udp_candidates.len);
             print_results_table(rt->udp_candidates.items, rt->udp_candidates.len, 0);
         }
     }
     return 1;
 }
+
 
 static void explain_selected_result(const Result *best) {
     if (!best) return;
@@ -6385,8 +6484,20 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
 
     int can_heal_inplace = 0;
     ResultList inplace_udp = {0};
+    if (!rt->spec.prof.enable_h2 && rt->spec.prof.enable_h3 && survivors.len < tcp_heal_min) {
+        const char *tcp_cache_path = candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type > 0 ? rt->spec.prof.ips_type : g_cfg.ips_type);
+        ResultList cached_tcp = load_candidate_cache_for_profile(tcp_cache_path, &rt->spec.prof);
+        if (cached_tcp.len > 0 && cache_quick_check_parallel(rt, cached_tcp.items, cached_tcp.len, 0, 0, 0) != (size_t)-1) {
+            log_msg("[%s] 纯 H3 自愈命中 TCP 缓存 (%zu 个种子)，跳过全量 TCP 扫描", carrier_display_name(rt->spec.mode), cached_tcp.len);
+            free(survivors.items);
+            survivors = cached_tcp;
+        } else {
+            free(cached_tcp.items);
+        }
+    }
+
     if (survivors.len >= tcp_heal_min) {
-        if (cfnat_socket_valid(rt->udp_listen_fd)) {
+        if (rt->spec.prof.enable_h3 && cfnat_socket_valid(rt->udp_listen_fd)) {
             ResultList test_udp = filter_udp_candidates_from_tcp(rt, survivors.items, survivors.len, target_ipnum);
             if (test_udp.len >= heal_threshold) {
                 can_heal_inplace = 1;
@@ -6514,9 +6625,14 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
         atomic_store(&rt->candidates.cache_valid, 1);
     }
 
-    /* 4. 分发给 UDP 候选池 (多轮滑动检验 + 网段裂变衍生) */
-    ResultList udp_res = (inplace_udp.len > 0) ? inplace_udp :
-        filter_udp_candidates_from_tcp(rt, all_candidates.items, all_candidates.len, target_ipnum);
+    /* 4. 分发给 UDP 候选池 (仅在启用 H3 时执行) */
+    ResultList udp_res = {0};
+    if (rt->spec.prof.enable_h3) {
+        udp_res = (inplace_udp.len > 0) ? inplace_udp :
+            filter_udp_candidates_from_tcp(rt, all_candidates.items, all_candidates.len, target_ipnum);
+    } else {
+        free(inplace_udp.items);
+    }
     if (udp_res.len > 0) {
         pthread_mutex_lock(&rt->udp_candidates.mu);
         Result *old_udp_items = rt->udp_candidates.items;
@@ -6730,8 +6846,18 @@ static void *carrier_udp_health_thread(void *arg) {
             pthread_mutex_unlock(&rt->candidates.mu);
 
             if (tcp_len == 0) {
-                empty_backoff_s = (empty_backoff_s < 150) ? (empty_backoff_s * 2) : 300;
-                continue;
+                /* 纯 H3 从 udpcache 启动时可能尚未加载 tcp 种子池：先读 tcpcache，仍为空则触发后台自愈补扫 */
+                const char *tcp_path = candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type > 0 ? rt->spec.prof.ips_type : g_cfg.ips_type);
+                ResultList cached_tcp = load_candidate_cache_for_profile(tcp_path, &rt->spec.prof);
+                if (cached_tcp.len > 0 && cache_quick_check_parallel(rt, cached_tcp.items, cached_tcp.len, 0, 0, 0) != (size_t)-1) {
+                    tcp_copy = cached_tcp.items;
+                    tcp_len = cached_tcp.len;
+                } else {
+                    free(cached_tcp.items);
+                    carrier_trigger_maintenance(rt, MAINT_RESCAN);
+                    empty_backoff_s = (empty_backoff_s < 150) ? (empty_backoff_s * 2) : 300;
+                    continue;
+                }
             }
 
             int probe_ok = 0;
@@ -7797,22 +7923,27 @@ static void install_signals(void) {
 
 static int carrier_start_threads(CarrierRuntime *rt) {
     if (!rt) return -1;
+    int use_h2 = rt->spec.prof.enable_h2;
+    int use_h3 = rt->spec.prof.enable_h3;
     if (create_small_thread(&rt->maint_tid, carrier_maintenance_thread, rt) != 0) {
         log_msg("[ERROR] [%s] 创建后台维护线程失败: %s", carrier_display_name(rt->spec.mode), strerror(errno));
     }
-    if (create_small_thread(&rt->health_tid, carrier_health_thread, rt) != 0) {
-        log_msg("[ERROR] [%s] 创建 TCP 健康检查线程失败: %s", carrier_display_name(rt->spec.mode), strerror(errno));
+    if (use_h2) {
+        if (create_small_thread(&rt->health_tid, carrier_health_thread, rt) != 0) {
+            log_msg("[ERROR] [%s] 创建 TCP 健康检查线程失败: %s", carrier_display_name(rt->spec.mode), strerror(errno));
+        }
+        if (create_small_thread(&rt->accept_tid, carrier_accept_thread, rt) != 0) {
+            log_msg("[FATAL] [%s] 创建 TCP 监听线程失败: %s", carrier_display_name(rt->spec.mode), strerror(errno));
+            return -1;
+        }
     }
-    if (create_small_thread(&rt->udp_health_tid, carrier_udp_health_thread, rt) != 0) {
-        log_msg("[ERROR] [%s] 创建 UDP 健康检查线程失败: %s", carrier_display_name(rt->spec.mode), strerror(errno));
-    }
-    if (create_small_thread(&rt->accept_tid, carrier_accept_thread, rt) != 0) {
-        log_msg("[FATAL] [%s] 创建 TCP 监听线程失败: %s", carrier_display_name(rt->spec.mode), strerror(errno));
-        return -1;
-    }
-    if (cfnat_socket_valid(rt->udp_listen_fd)) {
+    if (use_h3 && cfnat_socket_valid(rt->udp_listen_fd)) {
+        if (create_small_thread(&rt->udp_health_tid, carrier_udp_health_thread, rt) != 0) {
+            log_msg("[ERROR] [%s] 创建 UDP 健康检查线程失败: %s", carrier_display_name(rt->spec.mode), strerror(errno));
+        }
         if (create_small_thread(&rt->udp_tid, carrier_udp_thread, rt) != 0) {
-            log_msg("[ERROR] [%s] 创建 UDP 转发线程失败: %s", carrier_display_name(rt->spec.mode), strerror(errno));
+            log_msg("[FATAL] [%s] 创建 UDP 转发线程失败: %s", carrier_display_name(rt->spec.mode), strerror(errno));
+            if (!use_h2) return -1;
         }
     }
     return 0;
@@ -7883,7 +8014,9 @@ static void log_runtime_stats(void) {
         const char *name = carrier_display_name(rt->spec.mode);
 
         char tcp_part[256];
-        if (tcp_ip[0] && tcp_len > 0) {
+        if (!rt->spec.prof.enable_h2) {
+            snprintf(tcp_part, sizeof(tcp_part), "H2: 已禁用");
+        } else if (tcp_ip[0] && tcp_len > 0) {
             snprintf(tcp_part, sizeof(tcp_part), "H2: %s (%s, %dms, 池%zu, 累计切%u)",
                      tcp_ip, tcp_colo[0] ? tcp_colo : "UNK", tcp_lat >= 0 ? tcp_lat : 0, tcp_len, tcp_sw);
         } else {
@@ -7891,7 +8024,9 @@ static void log_runtime_stats(void) {
         }
 
         char udp_part[256];
-        if (udp_ip[0] && udp_len > 0) {
+        if (!rt->spec.prof.enable_h3) {
+            snprintf(udp_part, sizeof(udp_part), "H3: 已禁用");
+        } else if (udp_ip[0] && udp_len > 0) {
             snprintf(udp_part, sizeof(udp_part), "H3: %s (%s, %dms, 池%zu, 会话%zu, 累计切%u, 周期丢包 %u/%llu)",
                      udp_ip, udp_colo[0] ? udp_colo : "UNK", udp_lat >= 0 ? udp_lat : 0,
                      udp_len, udp_sess, udp_sw, up_drop, down_drop);
@@ -8056,16 +8191,19 @@ int main(int argc, char **argv) {
             CarrierRuntime *rt = &g_carrier_runtimes[i];
 
             ResultList carrier_results = {0};
-            // 先尝试读取候选缓存 (TCP + UDP 双轨缓存)
+            int use_h2 = rt->spec.prof.enable_h2;
+            int use_h3 = rt->spec.prof.enable_h3;
+            const char *proto_desc = (use_h2 && use_h3) ? "双轨分流: TCP/H2 + UDP/H3" : (use_h2 ? "仅 TCP/H2" : "仅 UDP/H3");
+
+            // 先尝试读取候选缓存 (按启用的协议走对应快路径)
             if (carrier_try_use_candidate_caches(rt)) {
-                rt->listen_fd = listen_tcp(rt->spec.addr);
-                rt->udp_listen_fd = listen_udp(rt->spec.addr);
-                if (cfnat_socket_invalid(rt->listen_fd)) {
-                    log_msg("[%s] 无法监听 %s: %s", carrier_display_name(rt->spec.mode), rt->spec.addr, strerror(errno));
-                    if (cfnat_socket_valid(rt->udp_listen_fd)) {
-                        close(rt->udp_listen_fd);
-                        rt->udp_listen_fd = INVALID_SOCKET;
-                    }
+                if (use_h2) rt->listen_fd = listen_tcp(rt->spec.addr);
+                if (use_h3) rt->udp_listen_fd = listen_udp(rt->spec.addr);
+                if ((use_h2 && cfnat_socket_invalid(rt->listen_fd)) ||
+                    (use_h3 && cfnat_socket_invalid(rt->udp_listen_fd))) {
+                    log_msg("[%s] 无法监听 %s (%s): %s", carrier_display_name(rt->spec.mode), rt->spec.addr, proto_desc, strerror(errno));
+                    if (cfnat_socket_valid(rt->listen_fd)) { close(rt->listen_fd); rt->listen_fd = INVALID_SOCKET; }
+                    if (cfnat_socket_valid(rt->udp_listen_fd)) { close(rt->udp_listen_fd); rt->udp_listen_fd = INVALID_SOCKET; }
                     free(rt->candidates.items);
                     rt->candidates.items = nullptr;
                     rt->candidates.len = 0;
@@ -8074,8 +8212,8 @@ int main(int argc, char **argv) {
                     rt->udp_candidates.len = 0;
                     continue;
                 }
-                log_msg("[%s] 正在监听 %s (双轨分流: TCP/H2 + UDP/H3)，TLS目标端口：%d，非TLS目标端口：%d",
-                        carrier_display_name(rt->spec.mode), rt->spec.addr,
+                log_msg("[%s] 正在监听 %s (%s)，TLS目标端口：%d，非TLS目标端口：%d",
+                        carrier_display_name(rt->spec.mode), rt->spec.addr, proto_desc,
                         rt->spec.prof.port, rt->spec.prof.http_port);
                 if (carrier_start_threads(rt) == 0) {
                     started_count++;
@@ -8109,14 +8247,16 @@ int main(int argc, char **argv) {
                 }
             }
 
-            /* 冷启动预监听：在执行 20~30s IP 扫描前提前绑定端口，让客户端连接在内核队列排队，彻底杜绝 RST */
-            if (cfnat_socket_invalid(rt->listen_fd)) {
+            /* 冷启动预监听：按启用的协议提前绑定端口，让客户端连接在内核队列排队，彻底杜绝 RST */
+            if (use_h2 && cfnat_socket_invalid(rt->listen_fd)) {
                 rt->listen_fd = listen_tcp(rt->spec.addr);
+            }
+            if (use_h3 && cfnat_socket_invalid(rt->udp_listen_fd)) {
                 rt->udp_listen_fd = listen_udp(rt->spec.addr);
-                if (cfnat_socket_valid(rt->listen_fd)) {
-                    log_msg("[%s] 预绑定监听端口成功 %s (消除冷启动 RST，握手先入内核队列)",
-                            carrier_display_name(rt->spec.mode), rt->spec.addr);
-                }
+            }
+            if ((use_h2 && cfnat_socket_valid(rt->listen_fd)) || (!use_h2 && use_h3 && cfnat_socket_valid(rt->udp_listen_fd))) {
+                log_msg("[%s] 预绑定监听端口成功 %s (%s)",
+                        carrier_display_name(rt->spec.mode), rt->spec.addr, proto_desc);
             }
 
             Config scan_cfg = g_cfg;
@@ -8188,35 +8328,34 @@ int main(int argc, char **argv) {
                 save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), rt->candidates.items, rt->candidates.len);
             }
 
-            // 2. 设置 UDP 候选池 (多轮滑动检验 + 网段裂变衍生)
-            ResultList udp_res = filter_udp_candidates_from_tcp(rt, carrier_results.items, carrier_results.len, target_ipnum);
-            if (udp_res.len > 0) {
-                rt->udp_candidates.items = udp_res.items;
-                rt->udp_candidates.len = udp_res.len;
-                carrier_set_current_udp_candidate(rt, 0);
-                atomic_store(&rt->udp_candidates.cache_valid, 1);
-                save_candidate_cache(candidate_cache_file_for_profile_udp(rt->spec.mode, rt->spec.prof.ips_type), udp_res.items, udp_res.len);
-            } else {
-                warn_msg("[%s] 经过多轮滑动检验，未捕获到有效 UDP/QUIC 节点（当地网络可能阻断境外 UDP 443），绝不使用假节点降级，等待自愈重扫",
-                         carrier_display_name(rt->spec.mode));
-                /* 百度前置的 UDP 通道始终是本机直连（HTTP CONNECT 无法承载 UDP），
-                 * 而它筛出来的 TCP 候选是按「代理出口可达性」选出的，本机直连 UDP 未必可达。
-                 * 因此这里复用已经过本机直连 UDP 验证的直连 H3 缓存，避免「百度前置 H3 永远无候选」。 */
-                if (rt->spec.use_baidu_proxy) {
-                    int uport = (rt->spec.prof.port > 0) ? rt->spec.prof.port : (g_cfg.port > 0 ? g_cfg.port : 443);
-                    int udelay = udp_probe_timeout_ms((rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms);
-                    ResultList fb = load_candidate_cache_for_profile(
-                        candidate_cache_file_for_profile_udp("direct", rt->spec.prof.ips_type), &rt->spec.prof);
-                    if (fb.len > 0 &&
-                        cache_quick_check_parallel(rt, fb.items, fb.len, 1, uport, udelay) != (size_t)-1) {
-                        rt->udp_candidates.items = fb.items;
-                        rt->udp_candidates.len = fb.len;
-                        carrier_set_current_udp_candidate(rt, 0);
-                        atomic_store(&rt->udp_candidates.cache_valid, 1);
-                        log_msg("[%s] 已复用直连 H3 候选缓存（本机直连 UDP 可达），共 %zu 个节点：百度前置仅代理 TCP，UDP 走直连",
-                                carrier_display_name(rt->spec.mode), fb.len);
-                    } else {
-                        free(fb.items);
+            // 2. 设置 UDP 候选池 (仅在启用 H3 时执行)
+            if (use_h3) {
+                ResultList udp_res = filter_udp_candidates_from_tcp(rt, carrier_results.items, carrier_results.len, target_ipnum);
+                if (udp_res.len > 0) {
+                    rt->udp_candidates.items = udp_res.items;
+                    rt->udp_candidates.len = udp_res.len;
+                    carrier_set_current_udp_candidate(rt, 0);
+                    atomic_store(&rt->udp_candidates.cache_valid, 1);
+                    save_candidate_cache(candidate_cache_file_for_profile_udp(rt->spec.mode, rt->spec.prof.ips_type), udp_res.items, udp_res.len);
+                } else {
+                    warn_msg("[%s] 经过多轮滑动检验，未捕获到有效 UDP/QUIC 节点（当地网络可能阻断境外 UDP 443），绝不使用假节点降级，等待自愈重扫",
+                             carrier_display_name(rt->spec.mode));
+                    if (rt->spec.use_baidu_proxy) {
+                        int uport = (rt->spec.prof.port > 0) ? rt->spec.prof.port : (g_cfg.port > 0 ? g_cfg.port : 443);
+                        int udelay = udp_probe_timeout_ms((rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms);
+                        ResultList fb = load_candidate_cache_for_profile(
+                            candidate_cache_file_for_profile_udp("direct", rt->spec.prof.ips_type), &rt->spec.prof);
+                        if (fb.len > 0 &&
+                            cache_quick_check_parallel(rt, fb.items, fb.len, 1, uport, udelay) != (size_t)-1) {
+                            rt->udp_candidates.items = fb.items;
+                            rt->udp_candidates.len = fb.len;
+                            carrier_set_current_udp_candidate(rt, 0);
+                            atomic_store(&rt->udp_candidates.cache_valid, 1);
+                            log_msg("[%s] 已复用直连 H3 候选缓存（本机直连 UDP 可达），共 %zu 个节点：百度前置仅代理 TCP，UDP 走直连",
+                                    carrier_display_name(rt->spec.mode), fb.len);
+                        } else {
+                            free(fb.items);
+                        }
                     }
                 }
             }
@@ -8236,16 +8375,17 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            if (cfnat_socket_invalid(rt->listen_fd)) {
+            if (use_h2 && cfnat_socket_invalid(rt->listen_fd)) {
                 rt->listen_fd = listen_tcp(rt->spec.addr);
+            }
+            if (use_h3 && cfnat_socket_invalid(rt->udp_listen_fd)) {
                 rt->udp_listen_fd = listen_udp(rt->spec.addr);
             }
-            if (cfnat_socket_invalid(rt->listen_fd)) {
-                log_msg("[%s] 无法监听 %s: %s", carrier_display_name(rt->spec.mode), rt->spec.addr, strerror(errno));
-                if (cfnat_socket_valid(rt->udp_listen_fd)) {
-                    close(rt->udp_listen_fd);
-                    rt->udp_listen_fd = INVALID_SOCKET;
-                }
+            if ((use_h2 && cfnat_socket_invalid(rt->listen_fd)) ||
+                (use_h3 && cfnat_socket_invalid(rt->udp_listen_fd))) {
+                log_msg("[%s] 无法监听 %s (%s): %s", carrier_display_name(rt->spec.mode), rt->spec.addr, proto_desc, strerror(errno));
+                if (cfnat_socket_valid(rt->listen_fd)) { close(rt->listen_fd); rt->listen_fd = INVALID_SOCKET; }
+                if (cfnat_socket_valid(rt->udp_listen_fd)) { close(rt->udp_listen_fd); rt->udp_listen_fd = INVALID_SOCKET; }
                 free(rt->candidates.items);
                 rt->candidates.items = nullptr;
                 rt->candidates.len = 0;
@@ -8259,19 +8399,38 @@ int main(int argc, char **argv) {
             int udp_lat = (rt->udp_candidates.items && rt->udp_candidates.current_index < rt->udp_candidates.len) ?
                           rt->udp_candidates.items[rt->udp_candidates.current_index].latency_ms : 0;
 
-            if (rt->udp_candidates.len > 0 && rt->udp_candidates.current_ip[0]) {
-                log_msg("[%s] 正在监听 %s (双轨分流: TCP/H2 + UDP/H3)，TLS目标端口：%d，非TLS目标端口：%d\n"
+            if (!use_h3) {
+                log_msg("[%s] 正在监听 %s (%s)，TLS目标端口：%d，非TLS目标端口：%d\n"
+                        "  └─ [TCP/H2] 最优 IP: %s (延迟 %d ms, 候选 %zu 个) | [UDP/H3] 已禁用",
+                        carrier_display_name(rt->spec.mode), rt->spec.addr, proto_desc,
+                        rt->spec.prof.port, rt->spec.prof.http_port,
+                        rt->candidates.current_ip, tcp_lat, rt->candidates.len);
+            } else if (!use_h2) {
+                if (rt->udp_candidates.len > 0 && rt->udp_candidates.current_ip[0]) {
+                    log_msg("[%s] 正在监听 %s (%s)，目标端口：%d\n"
+                            "  └─ [UDP/H3] 最优 IP: %s (延迟 %d ms, 候选 %zu 个) | [TCP/H2] 已禁用",
+                            carrier_display_name(rt->spec.mode), rt->spec.addr, proto_desc,
+                            rt->spec.prof.port,
+                            rt->udp_candidates.current_ip, udp_lat, rt->udp_candidates.len);
+                } else {
+                    log_msg("[%s] 正在监听 %s (%s)，目标端口：%d\n"
+                            "  └─ [UDP/H3] 无可用节点 (0 个候选，等待空池退避自愈) | [TCP/H2] 已禁用",
+                            carrier_display_name(rt->spec.mode), rt->spec.addr, proto_desc,
+                            rt->spec.prof.port);
+                }
+            } else if (rt->udp_candidates.len > 0 && rt->udp_candidates.current_ip[0]) {
+                log_msg("[%s] 正在监听 %s (%s)，TLS目标端口：%d，非TLS目标端口：%d\n"
                         "  ├─ [TCP/H2] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)\n"
                         "  └─ [UDP/H3] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
-                        carrier_display_name(rt->spec.mode), rt->spec.addr,
+                        carrier_display_name(rt->spec.mode), rt->spec.addr, proto_desc,
                         rt->spec.prof.port, rt->spec.prof.http_port,
                         rt->candidates.current_ip, tcp_lat, rt->candidates.len,
                         rt->udp_candidates.current_ip, udp_lat, rt->udp_candidates.len);
             } else {
-                log_msg("[%s] 正在监听 %s (双轨分流: TCP/H2 + UDP/H3)，TLS目标端口：%d，非TLS目标端口：%d\n"
+                log_msg("[%s] 正在监听 %s (%s)，TLS目标端口：%d，非TLS目标端口：%d\n"
                         "  ├─ [TCP/H2] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)\n"
                         "  └─ [UDP/H3] 无可用节点 (0 个候选)",
-                        carrier_display_name(rt->spec.mode), rt->spec.addr,
+                        carrier_display_name(rt->spec.mode), rt->spec.addr, proto_desc,
                         rt->spec.prof.port, rt->spec.prof.http_port,
                         rt->candidates.current_ip, tcp_lat, rt->candidates.len);
             }
