@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.1.0"
+#define CFNAT_VERSION "0.1.1"
 
 /* =========================================================================
  * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
@@ -624,6 +624,7 @@ struct CarrierRuntime {
     atomic_int active_udp_conns;       /* 本栈当前活跃 UDP 会话数（无锁读取，供健康检查判断活跃态） */
     atomic_llong last_tcp_active_ms;   /* 本栈最近一次 TCP 活跃时间戳 */
     atomic_llong last_udp_active_ms;   /* 本栈最近一次 UDP 活跃时间戳 */
+    atomic_int last_udp_loss_pct;      /* 最近一轮 UDP 健康检查链路丢包率 (0..100, -1=未测) */
     int udp_dirty;                 /* 会话表变更标记：未变更时直接复用 pollfd 数组，免除每轮链表遍历 */
     pthread_mutex_t udp_mu;
     atomic_int rescanning_lock;    /* 实例独享的自愈扫描互斥锁 (防跨协议阻塞) */
@@ -951,12 +952,12 @@ static void vlog_line(const char *tag, const char *fmt, va_list ap) {
     }
 
     /* 紧凑栈帧：常规日志行长 < 200 字节，1KB/2KB 缓冲比原 12KB 栈帧缩减 75% 消耗 */
-    char raw_msg[1024];
+    char raw_msg[2048];
     int n = vsnprintf(raw_msg, sizeof(raw_msg), fmt, ap);
     if (n < 0) return;
 
     /* 单一完整行缓冲输出，彻底杜绝并发日志交错与字符截断 */
-    char line_buf[2048];
+    char line_buf[4096];
     size_t out_len = 0;
 
     int prefix_len = snprintf(line_buf, sizeof(line_buf), "%s%s%s [%s%s%s] ",
@@ -4244,7 +4245,7 @@ static void *scan_worker(void *arg) {
             } else {
                 snprintf(loc_buf, sizeof(loc_buf), "Unknown");
             }
-            debug_msg("发现有效IP %s%s%s 位置信息 %s%s%s 延迟 %s%d%s 毫秒",
+            debug_msg("[TCP/H2] 发现有效IP %s%s%s 位置信息 %s%s%s 延迟 %s%d%s 毫秒",
                       c_ip, r.ip, reset,
                       c_loc, loc_buf, reset,
                       c_ms, r.latency_ms, reset);
@@ -4676,7 +4677,7 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
                         if (lat <= 0) lat = 1;
                         items[i].latency_ms = lat;
                         responded_count++;
-                        debug_msg("%s QUIC 探针响应成功: %s 延迟 %d ms",
+                        debug_msg("[UDP/H3] [%s] QUIC 探针响应成功: %s 延迟 %d ms",
                                   carrier_display_name(rt ? rt->spec.mode : nullptr), items[i].res.ip, lat);
                         break;
                     }
@@ -4689,7 +4690,7 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
         }
     }
 
-    debug_msg("[%s] QUIC 批量探测汇总: 候选 %zu，成功发出 %zu，收到回包 %zu，超时上限 %d ms",
+    debug_msg("[UDP/H3] [%s] QUIC 批量探测汇总: 候选 %zu，成功发出 %zu，收到回包 %zu，超时上限 %d ms",
               carrier_display_name(rt ? rt->spec.mode : nullptr), count, sent_v4 + sent_v6, responded_count, timeout_ms);
     return responded_count;
 }
@@ -4882,14 +4883,14 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
             canary_ok = 1;
             canary_idx = c;
             canary_lat = c_lat;
-            debug_msg("[%s] [H3金丝雀探路] 节点 %s UDP/QUIC 连通正常 (延迟 %d ms)，启动低突发小批次测速",
+            debug_msg("[UDP/H3] [%s] [金丝雀探路] 节点 %s UDP/QUIC 连通正常 (延迟 %d ms)，启动低突发小批次测速",
                       carrier_display_name(rt->spec.mode), tcp_results[c].ip, c_lat);
             break;
         }
         if (c + 1 < canary_tries && sleep_interruptible_ms(800) != 0) return udp_res;
     }
     if (!canary_ok) {
-        warn_msg("[%s] [H3金丝雀探路] 连续 %zu 个头部节点均无 UDP 回包（当前链路可能阻断 UDP 443 或处于 QoS 惩罚窗），提前止损等待自愈重扫",
+        warn_msg("[UDP/H3] [%s] [金丝雀探路] 连续 %zu 个头部节点均无 UDP 回包（当前链路可能阻断 UDP 443 或处于 QoS 惩罚窗），提前止损等待自愈重扫",
                  carrier_display_name(rt->spec.mode), canary_tries);
         return udp_res;
     }
@@ -4929,7 +4930,7 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
         size_t cur_len = count - offset;
         if (cur_len > batch_size) cur_len = batch_size;
 
-        log_msg("[%s] [H3筛选/第%d批] 并发检验第 %zu~%zu 个 TCP 候选 IP (批次 %zu, 测速 %d 轮)...",
+        log_msg("[UDP/H3] [%s] [筛选/第%d批] 并发检验第 %zu~%zu 个 TCP 候选 IP (批次 %zu, 测速 %d 轮)...",
                 carrier_display_name(rt->spec.mode), batch_idx, offset + 1, offset + cur_len, cur_len, probe_rounds);
 
         memset(probe_items, 0, cur_len * sizeof(QuicProbeItem));
@@ -4945,7 +4946,7 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
         stage1_any_resp += batch_resp;
         if (batch_idx == 1 && batch_resp == 0) {
             gentle_mode = 1;
-            log_msg("[%s] [H3降速自保] 金丝雀连通但首批并发无回包（疑似并发触发短时 QoS），冷却 1.2s 后切换为单点慢速节拍测速",
+            log_msg("[UDP/H3] [%s] [降速自保] 金丝雀连通但首批并发无回包（疑似并发触发短时 QoS），冷却 1.2s 后切换为单点慢速节拍测速",
                     carrier_display_name(rt->spec.mode));
             if (sleep_interruptible_ms(1200) != 0) break;
             int consec_miss = 0;
@@ -5046,7 +5047,7 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
 
                 if (derived_count == 0) break;
 
-                log_msg("[%s] [H3子网裂变/第%d轮] 当前合格 %zu/%zu，从原 %zu 个 IP 各裂变 2 个共 %zu 个同网段 IP (批次 %zu, 测速 %d 轮)...",
+                log_msg("[UDP/H3] [%s] [子网裂变/第%d轮] 当前合格 %zu/%zu，从原 %zu 个 IP 各裂变 2 个共 %zu 个同网段 IP (批次 %zu, 测速 %d 轮)...",
                         carrier_display_name(rt->spec.mode), f_round, udp_res.len, desired_count,
                         base_count, derived_count, batch_size, probe_rounds);
 
@@ -6952,20 +6953,30 @@ static void *carrier_udp_health_thread(void *arg) {
         int probe_n = active_now ? 3 : 1;
         int ok_cnt = 0;
         int total_lat = 0;
+        int lats[3] = {-1, -1, -1};
         for (int p = 0; p < probe_n && atomic_load(&g_running); p++) {
             if (p > 0 && sleep_interruptible_ms(50) != 0) break;
             int plat = 0;
             if (quic_probe_ip(ip, target_port, delay_ms, &plat)) {
+                lats[p] = plat;
                 ok_cnt++;
                 total_lat += plat;
             }
         }
         int latency = (ok_cnt > 0) ? (total_lat / ok_cnt) : 0;
-        int ok = active_now ? (ok_cnt >= 2) : (ok_cnt >= 1);
-        if (active_now && ok && ok_cnt < probe_n) {
-            debug_msg("[UDP/H3] [%s] 活跃态健康检查轻微抖动: 当前 IP %s 收到 %d/%d 包 (均值 %d ms)",
-                      carrier_display_name(rt->spec.mode), ip, ok_cnt, probe_n, latency);
+        int loss_pct = ((probe_n - ok_cnt) * 100) / probe_n;
+        atomic_store_explicit(&rt->last_udp_loss_pct, loss_pct, memory_order_relaxed);
+
+        char detail_buf[64] = {0};
+        if (active_now) {
+            char s0[12], s1[12], s2[12];
+            if (lats[0] >= 0) snprintf(s0, sizeof(s0), "%d", lats[0]); else snprintf(s0, sizeof(s0), "-");
+            if (lats[1] >= 0) snprintf(s1, sizeof(s1), "%d", lats[1]); else snprintf(s1, sizeof(s1), "-");
+            if (lats[2] >= 0) snprintf(s2, sizeof(s2), "%d", lats[2]); else snprintf(s2, sizeof(s2), "-");
+            snprintf(detail_buf, sizeof(detail_buf), "[%s, %s, %s]ms", s0, s1, s2);
         }
+
+        int ok = active_now ? (ok_cnt >= 2) : (ok_cnt >= 1);
         if (!ok) {
             fail++;
             consecutive_success = 0;
@@ -6980,10 +6991,15 @@ static void *carrier_udp_health_thread(void *arg) {
             }
             pthread_mutex_unlock(&rt->udp_candidates.mu);
             if (active_now) {
-                warn_msg("[UDP/H3] [%s] 活跃态状态检查失败 (%d/2): 当前 IP %s 高丢包/无响应 (%d/%d 包)",
-                         carrier_display_name(rt->spec.mode), fail, ip, ok_cnt, probe_n);
+                if (ok_cnt > 0) {
+                    warn_msg("[UDP/H3] [%s] 活跃态检查失败 (%d/2): %s (丢包 %d%%, %d/%d 包, 明细 %s, 均延迟 %dms)",
+                             carrier_display_name(rt->spec.mode), fail, ip, loss_pct, ok_cnt, probe_n, detail_buf, latency);
+                } else {
+                    warn_msg("[UDP/H3] [%s] 活跃态检查失败 (%d/2): %s (丢包 100%%, 0/%d 包, 明细 %s)",
+                             carrier_display_name(rt->spec.mode), fail, ip, probe_n, detail_buf);
+                }
             } else {
-                warn_msg("[UDP/H3] [%s] 状态检查失败 (%d/2): 当前 IP %s QUIC 无响应",
+                warn_msg("[UDP/H3] [%s] 闲置态检查失败 (%d/2): %s (丢包 100%%, 0/1 包, QUIC 无响应)",
                          carrier_display_name(rt->spec.mode), fail, ip);
             }
         } else {
@@ -6999,9 +7015,18 @@ static void *carrier_udp_health_thread(void *arg) {
             }
             pthread_mutex_unlock(&rt->udp_candidates.mu);
             long n = now_ms();
-            if (g_cfg.log_level >= LOG_DEBUG && g_cfg.health_log > 0 && n - last_log >= g_cfg.health_log * 1000L) {
-                debug_msg("[UDP/H3] [%s] 状态检查正常: 当前 IP %s 可用 (延迟 %d ms)",
-                          carrier_display_name(rt->spec.mode), ip, latency);
+            if (active_now && ok_cnt < probe_n) {
+                debug_msg("[UDP/H3] [%s] 活跃态检查抖动: %s (丢包 %d%%, %d/%d 包, 明细 %s, 均延迟 %dms)",
+                          carrier_display_name(rt->spec.mode), ip, loss_pct, ok_cnt, probe_n, detail_buf, latency);
+                last_log = n;
+            } else if (g_cfg.log_level >= LOG_DEBUG && g_cfg.health_log > 0 && n - last_log >= g_cfg.health_log * 1000L) {
+                if (active_now) {
+                    debug_msg("[UDP/H3] [%s] 活跃态检查正常: %s (丢包 0%%, %d/%d 包, 明细 %s, 均延迟 %dms)",
+                              carrier_display_name(rt->spec.mode), ip, ok_cnt, probe_n, detail_buf, latency);
+                } else {
+                    debug_msg("[UDP/H3] [%s] 闲置态检查正常: %s (丢包 0%%, 1/1 包, 延迟 %dms)",
+                              carrier_display_name(rt->spec.mode), ip, latency);
+                }
                 last_log = n;
             }
         }
@@ -8010,33 +8035,44 @@ static void log_runtime_stats(void) {
         unsigned int up_drop = atomic_exchange_explicit(&rt->udp_up_drop, 0, memory_order_relaxed);
         unsigned long long down_drop = atomic_exchange_explicit(&rt->udp_down_drop_stats, 0, memory_order_relaxed);
 
-        const char *branch = (i + 1 < g_carrier_runtime_count) ? "├─" : "└─";
+        int last_loss = atomic_load_explicit(&rt->last_udp_loss_pct, memory_order_relaxed);
+        char loss_str[24];
+        if (last_loss >= 0) snprintf(loss_str, sizeof(loss_str), "%d%%", last_loss);
+        else snprintf(loss_str, sizeof(loss_str), "-");
+
+        int is_last_rt = (i + 1 >= g_carrier_runtime_count);
+        const char *tcp_branch = "├─";
+        const char *udp_branch = is_last_rt ? "└─" : "├─";
         const char *name = carrier_display_name(rt->spec.mode);
 
         char tcp_part[256];
         if (!rt->spec.prof.enable_h2) {
-            snprintf(tcp_part, sizeof(tcp_part), "H2: 已禁用");
+            snprintf(tcp_part, sizeof(tcp_part), "已禁用");
         } else if (tcp_ip[0] && tcp_len > 0) {
-            snprintf(tcp_part, sizeof(tcp_part), "H2: %s (%s, %dms, 池%zu, 累计切%u)",
+            snprintf(tcp_part, sizeof(tcp_part), "%s (%s, %dms, 池%zu, 累计切%u)",
                      tcp_ip, tcp_colo[0] ? tcp_colo : "UNK", tcp_lat >= 0 ? tcp_lat : 0, tcp_len, tcp_sw);
         } else {
-            snprintf(tcp_part, sizeof(tcp_part), "H2: 无可用节点 (池%zu, 累计切%u)", tcp_len, tcp_sw);
+            snprintf(tcp_part, sizeof(tcp_part), "无可用节点 (池%zu, 累计切%u)", tcp_len, tcp_sw);
         }
 
         char udp_part[256];
         if (!rt->spec.prof.enable_h3) {
-            snprintf(udp_part, sizeof(udp_part), "H3: 已禁用");
+            snprintf(udp_part, sizeof(udp_part), "已禁用");
         } else if (udp_ip[0] && udp_len > 0) {
-            snprintf(udp_part, sizeof(udp_part), "H3: %s (%s, %dms, 池%zu, 会话%zu, 累计切%u, 周期丢包 %u/%llu)",
+            snprintf(udp_part, sizeof(udp_part), "%s (%s, %dms, 链路丢包%s, 池%zu, 会话%zu, 累计切%u, 队列丢包 %u/%llu)",
                      udp_ip, udp_colo[0] ? udp_colo : "UNK", udp_lat >= 0 ? udp_lat : 0,
-                     udp_len, udp_sess, udp_sw, up_drop, down_drop);
+                     loss_str, udp_len, udp_sess, udp_sw, up_drop, down_drop);
         } else {
-            snprintf(udp_part, sizeof(udp_part), "H3: 无可用节点 (池%zu, 会话%zu, 累计切%u, 周期丢包 %u/%llu)",
-                     udp_len, udp_sess, udp_sw, up_drop, down_drop);
+            snprintf(udp_part, sizeof(udp_part), "无可用节点 (链路丢包%s, 池%zu, 会话%zu, 累计切%u, 队列丢包 %u/%llu)",
+                     loss_str, udp_len, udp_sess, udp_sw, up_drop, down_drop);
         }
 
         if (pos + 2 < sizeof(buf)) {
-            n = snprintf(buf + pos, sizeof(buf) - pos, "\n  %s [%s] %s | %s", branch, name, tcp_part, udp_part);
+            n = snprintf(buf + pos, sizeof(buf) - pos, "\n  %s [TCP/H2] [%s] %s", tcp_branch, name, tcp_part);
+            if (n > 0) pos += ((size_t)n < sizeof(buf) - pos) ? (size_t)n : (sizeof(buf) - pos - 1);
+        }
+        if (pos + 2 < sizeof(buf)) {
+            n = snprintf(buf + pos, sizeof(buf) - pos, "\n  %s [UDP/H3] [%s] %s", udp_branch, name, udp_part);
             if (n > 0) pos += ((size_t)n < sizeof(buf) - pos) ? (size_t)n : (sizeof(buf) - pos - 1);
         }
     }
@@ -8144,6 +8180,7 @@ int main(int argc, char **argv) {
             atomic_init(&rt->active_udp_conns, 0);
             atomic_init(&rt->last_tcp_active_ms, 0);
             atomic_init(&rt->last_udp_active_ms, 0);
+            atomic_init(&rt->last_udp_loss_pct, -1);
             atomic_init(&rt->maint_pending, 0);
             pthread_mutex_init(&rt->maint_mu, nullptr);
             pthread_cond_init(&rt->maint_cv, nullptr);
