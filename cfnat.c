@@ -318,6 +318,8 @@ typedef struct {
     ProfileConfig prof_v4;
     ProfileConfig prof_v6;
     ProfileConfig prof_baidu;
+    int listen_order[3];      /* 命令行传参顺序: 1=v4, 2=v6, 3=baidu (baidu 强制排在 v4 之后) */
+    int listen_order_len;
 } Config;
 
 typedef struct {
@@ -1207,6 +1209,7 @@ static void parse_args(Config *c, int argc, char **argv) {
 
     /* 标记哪些专属参数被显式指定了 */
     int has_v4_listen = 0, has_v6_listen = 0, has_baidu_listen = 0;
+    c->listen_order_len = 0;
     char v4_listen_val[MAX_ADDR_LEN] = {0};
     char v6_listen_val[MAX_ADDR_LEN] = {0};
     char baidu_listen_val[MAX_ADDR_LEN] = {0};
@@ -1253,18 +1256,27 @@ static void parse_args(Config *c, int argc, char **argv) {
             }
         }
 
-        /* 本地监听参数解析: 支持 -v4-listen, -v6-listen, -baidu-listen, -direct-listen */
+        /* 本地监听参数解析: 支持 -v4-listen, -v6-listen, -baidu-listen, -direct-listen，记录传参顺序 */
         if (!strcmp(key, "v4-listen")) {
             has_v4_listen = 1;
             format_listen_endpoint(val, 4443, "0.0.0.0", v4_listen_val, sizeof(v4_listen_val));
+            int dup = 0; for (int k = 0; k < c->listen_order_len; k++) if (c->listen_order[k] == 1) dup = 1;
+            if (!dup && c->listen_order_len < 3) c->listen_order[c->listen_order_len++] = 1;
         } else if (!strcmp(key, "v6-listen")) {
             has_v6_listen = 1;
             format_listen_endpoint(val, 6443, "[::]", v6_listen_val, sizeof(v6_listen_val));
+            int dup = 0; for (int k = 0; k < c->listen_order_len; k++) if (c->listen_order[k] == 2) dup = 1;
+            if (!dup && c->listen_order_len < 3) c->listen_order[c->listen_order_len++] = 2;
         } else if (!strcmp(key, "baidu-listen")) {
             has_baidu_listen = 1;
             format_listen_endpoint(val, 5444, "0.0.0.0", baidu_listen_val, sizeof(baidu_listen_val));
+            int dup = 0; for (int k = 0; k < c->listen_order_len; k++) if (c->listen_order[k] == 3) dup = 1;
+            if (!dup && c->listen_order_len < 3) c->listen_order[c->listen_order_len++] = 3;
         } else if (!strcmp(key, "direct-listen") && val) {
             snprintf(c->direct_listen, sizeof(c->direct_listen), "%s", val);
+            int kind = (c->ips_type == 6) ? 2 : 1;
+            int dup = 0; for (int k = 0; k < c->listen_order_len; k++) if (c->listen_order[k] == kind) dup = 1;
+            if (!dup && c->listen_order_len < 3) c->listen_order[c->listen_order_len++] = kind;
         }
         /* v4 专属覆盖参数 */
         else if (!strcmp(key, "v4-port") && val) v4_port = atoi(val);
@@ -1392,6 +1404,31 @@ static void parse_args(Config *c, int argc, char **argv) {
             has_v4_listen = 1;
             format_listen_endpoint(c->direct_listen, 4443, "0.0.0.0", v4_listen_val, sizeof(v4_listen_val));
         }
+    }
+
+    /* 补齐未在循环中入队的启用项并强制保证: 若同时启用 v4 与 baidu，v4 必须在 baidu 之前 */
+    if (has_v4_listen) {
+        int dup = 0; for (int k = 0; k < c->listen_order_len; k++) if (c->listen_order[k] == 1) dup = 1;
+        if (!dup && c->listen_order_len < 3) c->listen_order[c->listen_order_len++] = 1;
+    }
+    if (has_v6_listen) {
+        int dup = 0; for (int k = 0; k < c->listen_order_len; k++) if (c->listen_order[k] == 2) dup = 1;
+        if (!dup && c->listen_order_len < 3) c->listen_order[c->listen_order_len++] = 2;
+    }
+    if (has_baidu_listen) {
+        int dup = 0; for (int k = 0; k < c->listen_order_len; k++) if (c->listen_order[k] == 3) dup = 1;
+        if (!dup && c->listen_order_len < 3) c->listen_order[c->listen_order_len++] = 3;
+    }
+    int pos_v4 = -1, pos_bd = -1;
+    for (int k = 0; k < c->listen_order_len; k++) {
+        if (c->listen_order[k] == 1) pos_v4 = k;
+        else if (c->listen_order[k] == 3) pos_bd = k;
+    }
+    if (pos_v4 >= 0 && pos_bd >= 0 && pos_bd < pos_v4) {
+        for (int k = pos_v4; k > pos_bd; k--) {
+            c->listen_order[k] = c->listen_order[k - 1];
+        }
+        c->listen_order[pos_bd] = 1;
     }
 
     /* 初始化 prof_v4 */
@@ -2764,27 +2801,31 @@ CFNAT_NODISCARD static int parse_listen_modes(const Config *cfg, CarrierListenSp
     CarrierListenSpec *specs = calloc(4, sizeof(CarrierListenSpec));
     if (!specs) return -1;
 
-    /* 优先使用分协议 profile (prof_v4, prof_v6, prof_baidu) */
-    if (cfg->prof_v4.enabled) {
-        snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "direct-v4");
-        snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->prof_v4.listen_addr);
-        specs[len].use_baidu_proxy = 0;
-        specs[len].prof = cfg->prof_v4;
-        len++;
-    }
-    if (cfg->prof_v6.enabled) {
-        snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "direct-v6");
-        snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->prof_v6.listen_addr);
-        specs[len].use_baidu_proxy = 0;
-        specs[len].prof = cfg->prof_v6;
-        len++;
-    }
-    if (cfg->prof_baidu.enabled) {
-        snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "baidu");
-        snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->prof_baidu.listen_addr);
-        specs[len].use_baidu_proxy = 1;
-        specs[len].prof = cfg->prof_baidu;
-        len++;
+    /* 按命令行传参顺序（且 baidu 强制排在 v4 之后）依次激活分协议 profile */
+    int fallback_order[3] = {1, 2, 3};
+    const int *order = (cfg->listen_order_len > 0) ? cfg->listen_order : fallback_order;
+    int order_len = (cfg->listen_order_len > 0) ? cfg->listen_order_len : 3;
+    for (int oi = 0; oi < order_len && len < 3; oi++) {
+        int kind = order[oi];
+        if (kind == 1 && cfg->prof_v4.enabled) {
+            snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "direct-v4");
+            snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->prof_v4.listen_addr);
+            specs[len].use_baidu_proxy = 0;
+            specs[len].prof = cfg->prof_v4;
+            len++;
+        } else if (kind == 2 && cfg->prof_v6.enabled) {
+            snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "direct-v6");
+            snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->prof_v6.listen_addr);
+            specs[len].use_baidu_proxy = 0;
+            specs[len].prof = cfg->prof_v6;
+            len++;
+        } else if (kind == 3 && cfg->prof_baidu.enabled) {
+            snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "baidu");
+            snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->prof_baidu.listen_addr);
+            specs[len].use_baidu_proxy = 1;
+            specs[len].prof = cfg->prof_baidu;
+            len++;
+        }
     }
 
     /* 兼容旧的 -direct-listen / -baidu-listen 单独指定但未走 profile 时的逻辑 */
@@ -4066,7 +4107,7 @@ typedef struct {
  * 不使用 per-IP connect()：连通性探针一旦被内核/防火墙记上 ICMP 错误，per-IP 套接字会整条失效，
  * 且 32~64 个 fd 在 Windows 上更容易触发瞬时耗尽；共享套接字是 0.0.16 实测三栈可用的唯一形态。 */
 static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, int target_port,
-                               int timeout_ms, QuicProbeItem *items, size_t count, size_t needed_responses) {
+                               int timeout_ms, QuicProbeItem *items, size_t count, size_t needed_responses, int pacing_ms) {
     if (!items || count == 0) return 0;
 
     /* C23 thread_local 预格式化探针模板：头部 0..22 固定，其余 1177 字节必须保持全零 */
@@ -4115,6 +4156,9 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
             }
         }
 
+        if (i > 0 && pacing_ms > 0) {
+            if (sleep_interruptible_ms(pacing_ms) != 0) break;
+        }
         uint32_t scid = seed ^ (uint32_t)(i + 1);
         memcpy(pkt + 15, &scid, 4);
 
@@ -4234,14 +4278,42 @@ static int ip_in_resultlist(const ResultList *rl, const char *ip) {
     return 0;
 }
 
-/* 对单个批次执行 num 轮 QUIC 测速（首轮无回包即熔断，避免死节点耗尽超时预算），
+static socket_t quic_open_probe_socket(int af) {
+    socket_t fd = socket(af, SOCK_DGRAM, 0);
+    if (cfnat_socket_invalid(fd)) return INVALID_SOCKET;
+#ifdef _WIN32
+#ifndef SIO_UDP_CONNRESET
+#define SIO_UDP_CONNRESET _WSAIOW(IOC_VENDOR, 12)
+#endif
+    BOOL bNewBehavior = FALSE;
+    DWORD dwBytesReturned = 0;
+    WSAIoctl(fd, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), nullptr, 0, &dwBytesReturned, nullptr, nullptr);
+#endif
+    bind_socket_to_interface(fd, af);
+    set_nonblock(fd, 1);
+    return fd;
+}
+
+/* 对单个小批次执行 num 轮 QUIC 测速（每批重建共享 socket 轮换源端口 + 发包节拍 + 首轮无回包熔断），
  * 将满足延迟阈值的合格节点合并进 udp_res，并通过 out_any_resp 返回本批次收到过回包的节点数。 */
-static size_t quic_probe_batch_multi_round(CarrierRuntime *rt, socket_t fd4, socket_t fd6,
+static size_t quic_probe_batch_multi_round(CarrierRuntime *rt,
                                            int target_port, int timeout_ms, int max_delay, int probe_rounds,
                                            const QuicProbeItem *batch, size_t cur_len,
                                            ResultList *udp_res, size_t *out_any_resp) {
     if (out_any_resp) *out_any_resp = 0;
     if (!batch || cur_len == 0) return 0;
+
+    int need_v4 = 0, need_v6 = 0;
+    for (size_t i = 0; i < cur_len; i++) {
+        if (strchr(batch[i].res.ip, ':')) need_v6 = 1;
+        else need_v4 = 1;
+    }
+
+    socket_t fd4 = need_v4 ? quic_open_probe_socket(AF_INET) : INVALID_SOCKET;
+    socket_t fd6 = need_v6 ? quic_open_probe_socket(AF_INET6) : INVALID_SOCKET;
+    if (cfnat_socket_invalid(fd4) && cfnat_socket_invalid(fd6)) {
+        return 0;
+    }
 
     QuicProbeItem *round_items = calloc(cur_len, sizeof(QuicProbeItem));
     size_t *idx_map = calloc(cur_len, sizeof(size_t));
@@ -4258,6 +4330,8 @@ static size_t quic_probe_batch_multi_round(CarrierRuntime *rt, socket_t fd4, soc
         free(min_lat);
         free(max_lat);
         free(active);
+        if (cfnat_socket_valid(fd4)) close(fd4);
+        if (cfnat_socket_valid(fd6)) close(fd6);
         return 0;
     }
 
@@ -4267,6 +4341,8 @@ static size_t quic_probe_batch_multi_round(CarrierRuntime *rt, socket_t fd4, soc
     }
 
     for (int r = 0; r < probe_rounds && atomic_load(&g_running); r++) {
+        if (r > 0 && sleep_interruptible_ms(200) != 0) break;
+
         size_t active_cnt = 0;
         for (size_t i = 0; i < cur_len; i++) {
             if (!active[i]) continue;
@@ -4280,7 +4356,7 @@ static size_t quic_probe_batch_multi_round(CarrierRuntime *rt, socket_t fd4, soc
 
         quic_drain_socket(fd4);
         quic_drain_socket(fd6);
-        quic_batch_probe(rt, fd4, fd6, target_port, timeout_ms, round_items, active_cnt, active_cnt);
+        quic_batch_probe(rt, fd4, fd6, target_port, timeout_ms, round_items, active_cnt, active_cnt, 20);
 
         for (size_t k = 0; k < active_cnt; k++) {
             size_t orig = idx_map[k];
@@ -4326,10 +4402,12 @@ static size_t quic_probe_batch_multi_round(CarrierRuntime *rt, socket_t fd4, soc
     free(min_lat);
     free(max_lat);
     free(active);
+    if (cfnat_socket_valid(fd4)) close(fd4);
+    if (cfnat_socket_valid(fd6)) close(fd6);
     return added;
 }
 
-/* P0-H3: 高性能多轮 QUIC 测速 + 原池子网裂变循环补齐引擎 (真实验证，绝不降级假节点) */
+/* P0-H3: 方案C抗QoS多轮QUIC测速引擎（冷却 -> 金丝雀探路 -> 小批次换源端口+节拍 -> 子网裂变循环补齐） */
 static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Result *tcp_results, size_t count, size_t target_ipnum) {
     ResultList udp_res = {0};
     if (!tcp_results || count == 0 || target_ipnum == 0) return udp_res;
@@ -4349,39 +4427,34 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
     if (timeout_ms < 1000) timeout_ms = 1000;
     if (timeout_ms > 2500) timeout_ms = 2500;
 
-    /* 探针套接字：每协议族一个共享非阻塞 UDP 套接字（与 0.0.16 一致） */
-    socket_t fd4 = socket(AF_INET, SOCK_DGRAM, 0);
-    if (cfnat_socket_valid(fd4)) {
-#ifdef _WIN32
-        BOOL bNewBehavior = FALSE;
-        DWORD dwBytesReturned = 0;
-        WSAIoctl(fd4, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), nullptr, 0, &dwBytesReturned, nullptr, nullptr);
-#endif
-        bind_socket_to_interface(fd4, AF_INET);
-        set_nonblock(fd4, 1);
-    }
-
-    socket_t fd6 = socket(AF_INET6, SOCK_DGRAM, 0);
-    if (cfnat_socket_valid(fd6)) {
-#ifdef _WIN32
-        BOOL bNewBehavior = FALSE;
-        DWORD dwBytesReturned = 0;
-        WSAIoctl(fd6, SIO_UDP_CONNRESET, &bNewBehavior, sizeof(bNewBehavior), nullptr, 0, &dwBytesReturned, nullptr, nullptr);
-#endif
-        bind_socket_to_interface(fd6, AF_INET6);
-        set_nonblock(fd6, 1);
-    }
-
-    if (cfnat_socket_invalid(fd4) && cfnat_socket_invalid(fd6)) {
-        warn_msg("[%s] 创建 UDP 探针套接字失败", carrier_display_name(rt->spec.mode));
-        return udp_res; /* 严禁降级假节点 */
-    }
-
     long total_start = now_ms();
-    /* H3 并发批次至多 2 * ipnum（上下界保护 [2, 128]） */
-    size_t batch_size = desired_count * 2;
+
+    /* 1. TCP 扫描结束后冷却 500ms，让路由器 conntrack 与出口突发配额先回落 */
+    if (sleep_interruptible_ms(500) != 0) return udp_res;
+
+    /* 2. 金丝雀单点探路：批量开测前先单发验证头部节点，确认未触发 UDP QoS / 阻断 */
+    size_t canary_tries = count < 3 ? count : 3;
+    int canary_ok = 0;
+    for (size_t c = 0; c < canary_tries && atomic_load(&g_running); c++) {
+        int c_lat = 0;
+        if (quic_probe_ip(tcp_results[c].ip, target_port, timeout_ms, &c_lat)) {
+            canary_ok = 1;
+            debug_msg("[%s] [H3金丝雀探路] 节点 %s UDP/QUIC 连通正常 (延迟 %d ms)，启动低突发小批次测速",
+                      carrier_display_name(rt->spec.mode), tcp_results[c].ip, c_lat);
+            break;
+        }
+        if (c + 1 < canary_tries && sleep_interruptible_ms(800) != 0) return udp_res;
+    }
+    if (!canary_ok) {
+        warn_msg("[%s] [H3金丝雀探路] 连续 %zu 个头部节点均无 UDP 回包（当前链路可能阻断 UDP 443 或处于 QoS 惩罚窗），提前止损等待自愈重扫",
+                 carrier_display_name(rt->spec.mode), canary_tries);
+        return udp_res;
+    }
+
+    /* 3. 小批次 (<= 6) + 每批重建 socket 换源端口 + 发包节拍 */
+    size_t batch_size = 6;
+    if (desired_count * 2 < batch_size) batch_size = desired_count * 2;
     if (batch_size < 2) batch_size = 2;
-    if (batch_size > 128) batch_size = 128;
 
     QuicProbeItem *probe_items = calloc(batch_size, sizeof(QuicProbeItem));
     size_t tried_cap = 1024;
@@ -4390,8 +4463,6 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
     if (!probe_items || !tried_ips) {
         free(probe_items);
         free(tried_ips);
-        if (cfnat_socket_valid(fd4)) close(fd4);
-        if (cfnat_socket_valid(fd6)) close(fd6);
         return udp_res;
     }
 
@@ -4403,8 +4474,10 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
     size_t offset = 0;
     int batch_idx = 1;
 
-    /* 阶段一：按 2*num 批次遍历原 TCP 候选池，每批进行 num 轮 QUIC 测速 */
+    /* 阶段一：小批次遍历原 TCP 候选池，每批独立源端口并测 num 轮 */
     while (offset < count && udp_res.len < desired_count && atomic_load(&g_running)) {
+        if (batch_idx > 1 && sleep_interruptible_ms(250) != 0) break;
+
         size_t cur_len = count - offset;
         if (cur_len > batch_size) cur_len = batch_size;
 
@@ -4419,7 +4492,7 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
         }
 
         size_t batch_resp = 0;
-        size_t added = quic_probe_batch_multi_round(rt, fd4, fd6, target_port, timeout_ms, max_delay, probe_rounds,
+        size_t added = quic_probe_batch_multi_round(rt, target_port, timeout_ms, max_delay, probe_rounds,
                                                     probe_items, cur_len, &udp_res, &batch_resp);
         stage1_any_resp += batch_resp;
         if (added == 0 && batch_resp == 0) {
@@ -4431,8 +4504,7 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
         batch_idx++;
     }
 
-    /* 阶段二：若合格 H3 节点不足 ipnum 个（且阶段一确认 UDP 443 可达），
-     * 从原 ipnum 个 IP 的 IPv6 /64 或 IPv4 /24 子网循环裂变（每 IP 裂变 2 个，按 2*num 批次测 num 轮）直至补足 */
+    /* 阶段二：若合格 H3 节点不足 ipnum 个，从原 ipnum 个 IP 的 IPv6 /64 或 IPv4 /24 子网循环裂变补齐 */
     if (stage1_any_resp > 0 && udp_res.len < desired_count && atomic_load(&g_running)) {
         size_t base_count = (count < desired_count) ? count : desired_count;
         size_t max_derived = base_count * 2;
@@ -4477,10 +4549,11 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
                 size_t round_added = 0;
                 size_t round_resp = 0;
                 for (size_t d_off = 0; d_off < derived_count && udp_res.len < desired_count && atomic_load(&g_running); d_off += batch_size) {
+                    if (sleep_interruptible_ms(250) != 0) break;
                     size_t d_len = derived_count - d_off;
                     if (d_len > batch_size) d_len = batch_size;
                     size_t b_resp = 0;
-                    round_added += quic_probe_batch_multi_round(rt, fd4, fd6, target_port, timeout_ms, max_delay, probe_rounds,
+                    round_added += quic_probe_batch_multi_round(rt, target_port, timeout_ms, max_delay, probe_rounds,
                                                                 &derived_items[d_off], d_len, &udp_res, &b_resp);
                     round_resp += b_resp;
                 }
@@ -4495,8 +4568,6 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
 
     free(probe_items);
     free(tried_ips);
-    if (cfnat_socket_valid(fd4)) close(fd4);
-    if (cfnat_socket_valid(fd6)) close(fd6);
 
     if (udp_res.len > 0) {
         qsort(udp_res.items, udp_res.len, sizeof(Result), cmp_result);
