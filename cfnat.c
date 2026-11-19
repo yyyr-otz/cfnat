@@ -4435,10 +4435,14 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
     /* 2. 金丝雀单点探路：批量开测前先单发验证头部节点，确认未触发 UDP QoS / 阻断 */
     size_t canary_tries = count < 3 ? count : 3;
     int canary_ok = 0;
+    size_t canary_idx = 0;
+    int canary_lat = 0;
     for (size_t c = 0; c < canary_tries && atomic_load(&g_running); c++) {
         int c_lat = 0;
         if (quic_probe_ip(tcp_results[c].ip, target_port, timeout_ms, &c_lat)) {
             canary_ok = 1;
+            canary_idx = c;
+            canary_lat = c_lat;
             debug_msg("[%s] [H3金丝雀探路] 节点 %s UDP/QUIC 连通正常 (延迟 %d ms)，启动低突发小批次测速",
                       carrier_display_name(rt->spec.mode), tcp_results[c].ip, c_lat);
             break;
@@ -4450,6 +4454,9 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
                  carrier_display_name(rt->spec.mode), canary_tries);
         return udp_res;
     }
+
+    /* 金丝雀成功后间隔 300ms 再开首批，避免紧贴金丝雀触发瞬时令牌桶 */
+    if (sleep_interruptible_ms(300) != 0) return udp_res;
 
     /* 3. 小批次 (<= 6) + 每批重建 socket 换源端口 + 发包节拍 */
     size_t batch_size = 6;
@@ -4473,8 +4480,10 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
     size_t stage1_any_resp = 0;
     size_t offset = 0;
     int batch_idx = 1;
+    int gentle_mode = 0;
 
-    /* 阶段一：小批次遍历原 TCP 候选池，每批独立源端口并测 num 轮 */
+    /* 阶段一：小批次遍历原 TCP 候选池，每批独立源端口并测 num 轮；
+     * 若金丝雀刚通但第 1 批并发全无回包，自动降级为单点节拍模式（每 IP 独立 socket + 150ms 间隔），避免继续齐射加深 QoS */
     while (offset < count && udp_res.len < desired_count && atomic_load(&g_running)) {
         if (batch_idx > 1 && sleep_interruptible_ms(250) != 0) break;
 
@@ -4495,6 +4504,62 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
         size_t added = quic_probe_batch_multi_round(rt, target_port, timeout_ms, max_delay, probe_rounds,
                                                     probe_items, cur_len, &udp_res, &batch_resp);
         stage1_any_resp += batch_resp;
+        if (batch_idx == 1 && batch_resp == 0) {
+            gentle_mode = 1;
+            log_msg("[%s] [H3降速自保] 金丝雀连通但首批并发无回包（疑似并发触发短时 QoS），冷却 1.2s 后切换为单点慢速节拍测速",
+                    carrier_display_name(rt->spec.mode));
+            if (sleep_interruptible_ms(1200) != 0) break;
+            int consec_miss = 0;
+            size_t scan_limit = count < desired_count ? count : desired_count;
+            for (size_t i = 0; i < scan_limit && udp_res.len < desired_count && atomic_load(&g_running); i++) {
+                if (i > 0 && sleep_interruptible_ms(150) != 0) break;
+                int ok_cnt = 0, total_lat = 0, min_lat = 1000000, max_lat = 0;
+                for (int r = 0; r < probe_rounds && atomic_load(&g_running); r++) {
+                    if (r > 0 && sleep_interruptible_ms(120) != 0) break;
+                    int lat = 0;
+                    if (quic_probe_ip(tcp_results[i].ip, target_port, timeout_ms, &lat)) {
+                        ok_cnt++;
+                        total_lat += lat;
+                        if (lat < min_lat) min_lat = lat;
+                        if (lat > max_lat) max_lat = lat;
+                    } else if (r == 0) {
+                        break;
+                    }
+                }
+                if (ok_cnt > 0) {
+                    consec_miss = 0;
+                    stage1_any_resp++;
+                    int avg_lat = total_lat / ok_cnt;
+                    if (avg_lat > 0 && (max_delay <= 0 || avg_lat <= max_delay) && !ip_in_resultlist(&udp_res, tcp_results[i].ip)) {
+                        Result res = tcp_results[i];
+                        res.latency_ms = avg_lat;
+                        res.ewma_latency = avg_lat;
+                        res.jitter_ms = (ok_cnt > 1 && max_lat >= min_lat) ? (max_lat - min_lat) : 0;
+                        res.probe_count = probe_rounds;
+                        res.success_count = ok_cnt;
+                        res.loss_rate = ((probe_rounds - ok_cnt) * 100) / probe_rounds;
+                        resultlist_add(&udp_res, &res);
+                    }
+                } else {
+                    consec_miss++;
+                    if (consec_miss >= 5 && udp_res.len > 0) break;
+                    if (consec_miss >= 5 && udp_res.len == 0) break;
+                }
+            }
+            /* 若降速后仍暂未捕到新节点，保留金丝雀刚验证通过的真实节点避免白白归零 */
+            if (udp_res.len == 0 && canary_lat > 0 && (max_delay <= 0 || canary_lat <= max_delay)) {
+                Result res = tcp_results[canary_idx];
+                res.latency_ms = canary_lat;
+                res.ewma_latency = canary_lat;
+                res.jitter_ms = 0;
+                res.probe_count = 1;
+                res.success_count = 1;
+                res.loss_rate = 0;
+                resultlist_add(&udp_res, &res);
+                stage1_any_resp++;
+            }
+            break;
+        }
         if (added == 0 && batch_resp == 0) {
             debug_msg("[%s] 第 %zu~%zu 个 TCP 候选 IP 全无 UDP 回包，向后滑动选取下一批...",
                       carrier_display_name(rt->spec.mode), offset + 1, offset + cur_len);
@@ -4505,7 +4570,7 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
     }
 
     /* 阶段二：若合格 H3 节点不足 ipnum 个，从原 ipnum 个 IP 的 IPv6 /64 或 IPv4 /24 子网循环裂变补齐 */
-    if (stage1_any_resp > 0 && udp_res.len < desired_count && atomic_load(&g_running)) {
+    if (!gentle_mode && stage1_any_resp > 0 && udp_res.len < desired_count && atomic_load(&g_running)) {
         size_t base_count = (count < desired_count) ? count : desired_count;
         size_t max_derived = base_count * 2;
         QuicProbeItem *derived_items = calloc(max_derived, sizeof(QuicProbeItem));
@@ -6221,16 +6286,123 @@ static void *carrier_udp_health_thread(void *arg) {
     CarrierRuntime *rt = (CarrierRuntime *)arg;
     int fail = 0;
     int consecutive_success = 0;
+    int empty_backoff_s = 30; /* H3 空池轻量自愈退避: 30s -> 60s -> 120s -> 240s -> 300s */
     long last_log = 0;
     while (atomic_load(&g_running)) {
-        int sleep_dur = (fail > 0) ? 10000 : ((consecutive_success >= 5) ? 60000 : 30000);
+        char cur_ip[MAX_IP_LEN] = {0};
+        carrier_get_current_udp_ip(rt, cur_ip, sizeof(cur_ip));
+        int sleep_dur = !cur_ip[0]
+                            ? (empty_backoff_s * 1000)
+                            : ((fail > 0) ? 10000 : ((consecutive_success >= 5) ? 60000 : 30000));
         if (sleep_interruptible_ms(sleep_dur) != 0) break;
+
         char ip[MAX_IP_LEN] = {0};
         carrier_get_current_udp_ip(rt, ip, sizeof(ip));
-        if (!ip[0]) continue;
-
         int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
+        if (target_port <= 0) target_port = 443;
         int delay_ms = udp_probe_timeout_ms((rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms);
+
+        if (!ip[0]) {
+            /* 空池轻量自愈：仅单发 1~2 个探针确认 QoS 是否解除，绝不打扰 TCP 转发，也不在限流窗内盲目齐射 */
+            Result *tcp_copy = nullptr;
+            size_t tcp_len = 0;
+            pthread_mutex_lock(&rt->candidates.mu);
+            if (rt->candidates.len > 0 && rt->candidates.items) {
+                tcp_len = rt->candidates.len;
+                tcp_copy = malloc(tcp_len * sizeof(Result));
+                if (tcp_copy) memcpy(tcp_copy, rt->candidates.items, tcp_len * sizeof(Result));
+                else tcp_len = 0;
+            }
+            pthread_mutex_unlock(&rt->candidates.mu);
+
+            if (tcp_len == 0) {
+                empty_backoff_s = (empty_backoff_s < 150) ? (empty_backoff_s * 2) : 300;
+                continue;
+            }
+
+            int probe_ok = 0;
+            int probe_lat = 0;
+            size_t probe_idx = 0;
+            size_t tries = tcp_len < 2 ? tcp_len : 2;
+            for (size_t t = 0; t < tries && atomic_load(&g_running); t++) {
+                int lat = 0;
+                if (quic_probe_ip(tcp_copy[t].ip, target_port, delay_ms, &lat)) {
+                    probe_ok = 1;
+                    probe_lat = lat;
+                    probe_idx = t;
+                    break;
+                }
+                if (t + 1 < tries && sleep_interruptible_ms(500) != 0) break;
+            }
+
+            if (probe_ok && atomic_load(&g_running)) {
+                if (atomic_exchange_explicit(&rt->rescanning_lock, 1, memory_order_acq_rel) == 0) {
+                    size_t target_ipnum = (rt->spec.prof.ipnum > 0) ? (size_t)rt->spec.prof.ipnum
+                                                                    : (g_cfg.ipnum > 0 ? (size_t)g_cfg.ipnum : 20);
+                    log_msg("[UDP/H3] [%s] 空池退避试探成功 (%s 延迟 %d ms)，开始无感重建 H3 候选池...",
+                            carrier_display_name(rt->spec.mode), tcp_copy[probe_idx].ip, probe_lat);
+                    ResultList udp_res = filter_udp_candidates_from_tcp(rt, tcp_copy, tcp_len, target_ipnum);
+                    if (udp_res.len > 0) {
+                        pthread_mutex_lock(&rt->udp_candidates.mu);
+                        free(rt->udp_candidates.items);
+                        rt->udp_candidates.items = udp_res.items;
+                        rt->udp_candidates.len = udp_res.len;
+                        pthread_mutex_unlock(&rt->udp_candidates.mu);
+                        carrier_set_current_udp_candidate(rt, 0);
+                        atomic_store(&rt->udp_candidates.cache_valid, 1);
+                        save_candidate_cache(candidate_cache_file_for_profile_udp(rt->spec.mode, rt->spec.prof.ips_type),
+                                             udp_res.items, udp_res.len);
+                        log_msg("[UDP/H3] [%s] 空池自愈恢复成功: 捕获 %zu 个 H3 候选，最优 IP: %s (延迟 %d ms)",
+                                carrier_display_name(rt->spec.mode), udp_res.len,
+                                udp_res.items[0].ip, udp_res.items[0].latency_ms);
+                        empty_backoff_s = 30;
+                        fail = 0;
+                        consecutive_success = 0;
+                    } else {
+                        empty_backoff_s = (empty_backoff_s < 150) ? (empty_backoff_s * 2) : 300;
+                    }
+                    atomic_store_explicit(&rt->rescanning_lock, 0, memory_order_release);
+                }
+            } else if (rt->spec.use_baidu_proxy && atomic_load(&g_running)) {
+                /* 百度前置栈若直连 H3 缓存已恢复，直接复用 */
+                ResultList fb = load_candidate_cache_for_profile(
+                    candidate_cache_file_for_profile_udp("direct", rt->spec.prof.ips_type), &rt->spec.prof);
+                if (fb.len > 0 &&
+                    cache_quick_check_parallel(rt, fb.items, fb.len, 1, target_port, delay_ms) != (size_t)-1) {
+                    if (atomic_exchange_explicit(&rt->rescanning_lock, 1, memory_order_acq_rel) == 0) {
+                        pthread_mutex_lock(&rt->udp_candidates.mu);
+                        free(rt->udp_candidates.items);
+                        rt->udp_candidates.items = fb.items;
+                        rt->udp_candidates.len = fb.len;
+                        pthread_mutex_unlock(&rt->udp_candidates.mu);
+                        carrier_set_current_udp_candidate(rt, 0);
+                        atomic_store(&rt->udp_candidates.cache_valid, 1);
+                        log_msg("[UDP/H3] [%s] 空池自愈已复用直连 H3 缓存，共 %zu 个节点",
+                                carrier_display_name(rt->spec.mode), fb.len);
+                        empty_backoff_s = 30;
+                        fail = 0;
+                        consecutive_success = 0;
+                        atomic_store_explicit(&rt->rescanning_lock, 0, memory_order_release);
+                    } else {
+                        free(fb.items);
+                    }
+                } else {
+                    free(fb.items);
+                    debug_msg("[UDP/H3] [%s] 空池轻量试探仍无回包，%ds 后再次退避试探",
+                              carrier_display_name(rt->spec.mode),
+                              (empty_backoff_s < 150) ? (empty_backoff_s * 2) : 300);
+                    empty_backoff_s = (empty_backoff_s < 150) ? (empty_backoff_s * 2) : 300;
+                }
+            } else {
+                debug_msg("[UDP/H3] [%s] 空池轻量试探仍无回包，%ds 后再次退避试探",
+                          carrier_display_name(rt->spec.mode),
+                          (empty_backoff_s < 150) ? (empty_backoff_s * 2) : 300);
+                empty_backoff_s = (empty_backoff_s < 150) ? (empty_backoff_s * 2) : 300;
+            }
+            free(tcp_copy);
+            continue;
+        }
+        empty_backoff_s = 30;
 
         int latency = 0;
         int ok = quic_probe_ip(ip, target_port, delay_ms, &latency);
