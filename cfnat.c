@@ -616,6 +616,10 @@ struct CarrierRuntime {
     atomic_uint udp_switch_count;  /* H3 顺位切换累计次数（运行指标，仅统计） */
     atomic_uint udp_up_drop;       /* 上行（客户端→上游）UDP 发送失败计数，与 udp_down_drop 对称 */
     atomic_ullong udp_down_drop_stats; /* 下行丢包周期统计原子计数（与 5s 告警解耦，零数据竞争） */
+    atomic_int active_tcp_conns;       /* 本栈当前活跃 TCP 连接数（活跃态按需提速健康检查） */
+    atomic_int active_udp_conns;       /* 本栈当前活跃 UDP 会话数（无锁读取，供健康检查判断活跃态） */
+    atomic_llong last_tcp_active_ms;   /* 本栈最近一次 TCP 活跃时间戳 */
+    atomic_llong last_udp_active_ms;   /* 本栈最近一次 UDP 活跃时间戳 */
     int udp_dirty;                 /* 会话表变更标记：未变更时直接复用 pollfd 数组，免除每轮链表遍历 */
     pthread_mutex_t udp_mu;
     atomic_int rescanning_lock;    /* 实例独享的自愈扫描互斥锁 (防跨协议阻塞) */
@@ -5751,6 +5755,10 @@ out:
             carrier_note_connection_failed(cc->runtime, cc->ip);
         }
     }
+    if (cc->runtime) {
+        atomic_fetch_sub_explicit(&cc->runtime->active_tcp_conns, 1, memory_order_relaxed);
+        atomic_store_explicit(&cc->runtime->last_tcp_active_ms, (long long)now_ms(), memory_order_relaxed);
+    }
     int active = atomic_fetch_sub(&g_active_tcp_conns, 1) - 1;
     long lifetime_s = (now_ms() - conn_start_ms) / 1000;
     conn_msg("[TCP/H2] #%llu [%s] 客户端连接关闭 (存活 %lds, 当前活跃: %d)",
@@ -6623,7 +6631,10 @@ static void *carrier_health_thread(void *arg) {
     long last = 0;
     int consecutive_success = 0;
     while (atomic_load(&g_running)) {
-        int sleep_dur = (fail > 0) ? 10000 : ((consecutive_success >= 5) ? 60000 : 30000);
+        long long last_act = atomic_load_explicit(&rt->last_tcp_active_ms, memory_order_relaxed);
+        int is_active = (atomic_load_explicit(&rt->active_tcp_conns, memory_order_relaxed) > 0) ||
+                        (last_act > 0 && ((long long)now_ms() - last_act) < 30000LL);
+        int sleep_dur = (fail > 0) ? 10000 : (is_active ? 20000 : ((consecutive_success >= 5) ? 60000 : 30000));
         if (sleep_interruptible_ms(sleep_dur) != 0) break;
         char ip[MAX_IP_LEN];
         carrier_get_current_ip(rt, ip, sizeof(ip));
@@ -6691,9 +6702,12 @@ static void *carrier_udp_health_thread(void *arg) {
     while (atomic_load(&g_running)) {
         char cur_ip[MAX_IP_LEN] = {0};
         carrier_get_current_udp_ip(rt, cur_ip, sizeof(cur_ip));
+        long long last_u_act = atomic_load_explicit(&rt->last_udp_active_ms, memory_order_relaxed);
+        int udp_active = (atomic_load_explicit(&rt->active_udp_conns, memory_order_relaxed) > 0) ||
+                         (last_u_act > 0 && ((long long)now_ms() - last_u_act) < 30000LL);
         int sleep_dur = !cur_ip[0]
                             ? (empty_backoff_s * 1000)
-                            : ((fail > 0) ? 10000 : ((consecutive_success >= 5) ? 60000 : 30000));
+                            : ((fail > 0) ? 10000 : (udp_active ? 15000 : ((consecutive_success >= 5) ? 60000 : 30000)));
         if (sleep_interruptible_ms(sleep_dur) != 0) break;
 
         char ip[MAX_IP_LEN] = {0};
@@ -6804,8 +6818,28 @@ static void *carrier_udp_health_thread(void *arg) {
         }
         empty_backoff_s = 30;
 
-        int latency = 0;
-        int ok = quic_probe_ip(ip, target_port, delay_ms, &latency);
+        /* 活跃态：每轮 3 包（间隔 50ms）测丢包，丢包 >= 2/3 (67%) 判异常以抓出半死限速节点；闲置态：单包轻检 */
+        long long now_u = (long long)now_ms();
+        long long last_u2 = atomic_load_explicit(&rt->last_udp_active_ms, memory_order_relaxed);
+        int active_now = (atomic_load_explicit(&rt->active_udp_conns, memory_order_relaxed) > 0) ||
+                         (last_u2 > 0 && (now_u - last_u2) < 30000LL);
+        int probe_n = active_now ? 3 : 1;
+        int ok_cnt = 0;
+        int total_lat = 0;
+        for (int p = 0; p < probe_n && atomic_load(&g_running); p++) {
+            if (p > 0 && sleep_interruptible_ms(50) != 0) break;
+            int plat = 0;
+            if (quic_probe_ip(ip, target_port, delay_ms, &plat)) {
+                ok_cnt++;
+                total_lat += plat;
+            }
+        }
+        int latency = (ok_cnt > 0) ? (total_lat / ok_cnt) : 0;
+        int ok = active_now ? (ok_cnt >= 2) : (ok_cnt >= 1);
+        if (active_now && ok && ok_cnt < probe_n) {
+            debug_msg("[UDP/H3] [%s] 活跃态健康检查轻微抖动: 当前 IP %s 收到 %d/%d 包 (均值 %d ms)",
+                      carrier_display_name(rt->spec.mode), ip, ok_cnt, probe_n, latency);
+        }
         if (!ok) {
             fail++;
             consecutive_success = 0;
@@ -6819,8 +6853,13 @@ static void *carrier_udp_health_thread(void *arg) {
                 }
             }
             pthread_mutex_unlock(&rt->udp_candidates.mu);
-            warn_msg("[UDP/H3] [%s] 状态检查失败 (%d/2): 当前 IP %s QUIC 无响应",
-                     carrier_display_name(rt->spec.mode), fail, ip);
+            if (active_now) {
+                warn_msg("[UDP/H3] [%s] 活跃态状态检查失败 (%d/2): 当前 IP %s 高丢包/无响应 (%d/%d 包)",
+                         carrier_display_name(rt->spec.mode), fail, ip, ok_cnt, probe_n);
+            } else {
+                warn_msg("[UDP/H3] [%s] 状态检查失败 (%d/2): 当前 IP %s QUIC 无响应",
+                         carrier_display_name(rt->spec.mode), fail, ip);
+            }
         } else {
             fail = 0;
             consecutive_success++;
@@ -6882,11 +6921,14 @@ static void *carrier_accept_thread(void *arg) {
             continue;
         }
         int active = atomic_fetch_add(&g_active_tcp_conns, 1) + 1;
+        atomic_fetch_add_explicit(&rt->active_tcp_conns, 1, memory_order_relaxed);
+        atomic_store_explicit(&rt->last_tcp_active_ms, (long long)now_ms(), memory_order_relaxed);
         unsigned long long conn_id = atomic_fetch_add(&g_tcp_conn_seq, 1) + 1;
         conn_msg("[TCP/H2] #%llu [%s] 客户端连接建立 (当前活跃: %d)", conn_id, carrier_display_name(rt->spec.mode), active);
         ConnCtx *cc = calloc(1, sizeof(ConnCtx));
         if (!cc) {
             close(cfd);
+            atomic_fetch_sub_explicit(&rt->active_tcp_conns, 1, memory_order_relaxed);
             atomic_fetch_sub(&g_active_tcp_conns, 1);
             continue;
         }
@@ -6911,6 +6953,7 @@ static void *carrier_accept_thread(void *arg) {
             warn_msg("[TCP/H2] #%llu [%s] 创建连接处理线程失败", conn_id, carrier_display_name(rt->spec.mode));
             close(cfd);
             free(cc);
+            atomic_fetch_sub_explicit(&rt->active_tcp_conns, 1, memory_order_relaxed);
             atomic_fetch_sub(&g_active_tcp_conns, 1);
             continue;
         }
@@ -7258,6 +7301,7 @@ static UdpSession *find_or_create_udp_session_sa(CarrierRuntime *rt, const struc
             udp_hash_remove(rt, oldest);
             if (cfnat_socket_valid(oldest->upstream_fd)) close(oldest->upstream_fd);
             if (rt->udp_session_count > 0) rt->udp_session_count--;
+            atomic_store_explicit(&rt->active_udp_conns, (int)rt->udp_session_count, memory_order_relaxed);
             int active = atomic_fetch_sub(&g_active_udp_sessions, 1) - 1;
             long lifetime_s = (now_ms() - oldest->created_ms) / 1000;
             char up_s[32] = {0}, down_s[32] = {0};
@@ -7287,6 +7331,8 @@ static UdpSession *find_or_create_udp_session_sa(CarrierRuntime *rt, const struc
     new_sess->last_down_ms = new_sess->created_ms;
     new_sess->sess_id = atomic_fetch_add(&g_udp_sess_seq, 1) + 1;
     rt->udp_session_count++;
+    atomic_store_explicit(&rt->active_udp_conns, (int)rt->udp_session_count, memory_order_relaxed);
+    atomic_store_explicit(&rt->last_udp_active_ms, (long long)new_sess->created_ms, memory_order_relaxed);
     int active = atomic_fetch_add(&g_active_udp_sessions, 1) + 1;
     new_sess->next = rt->udp_sessions;
     rt->udp_sessions = new_sess;
@@ -7311,9 +7357,9 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
     UdpSession *prev = nullptr;
     UdpSession *s = rt->udp_sessions;
     while (s) {
-        /* 双条件黑洞检测：覆盖初始握手黑洞与传输中途黑洞 */
-        int is_blackhole = (s->bytes_down == 0 && cur_ms - s->created_ms >= 5000 && s->bytes_up >= 1200) ||
-                           (s->bytes_down > 0 && cur_ms - s->last_down_ms >= 5000 && (s->bytes_up - s->bytes_up_at_down) >= 1200);
+        /* 双条件黑洞检测：覆盖初始握手黑洞与传输中途黑洞 (4s 判定) */
+        int is_blackhole = (s->bytes_down == 0 && cur_ms - s->created_ms >= 4000 && s->bytes_up >= 1200) ||
+                           (s->bytes_down > 0 && cur_ms - s->last_down_ms >= 4000 && (s->bytes_up - s->bytes_up_at_down) >= 1200);
         if (is_blackhole) {
             pthread_mutex_lock(&rt->udp_candidates.mu);
             for (size_t i = 0; i < rt->udp_candidates.len; i++) {
@@ -7349,6 +7395,7 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
                 close(del->upstream_fd);
             }
             if (rt->udp_session_count > 0) rt->udp_session_count--;
+            atomic_store_explicit(&rt->active_udp_conns, (int)rt->udp_session_count, memory_order_relaxed);
             int active = atomic_fetch_sub(&g_active_udp_sessions, 1) - 1;
             long lifetime_s = (cur_ms - del->created_ms) / 1000;
             char up_s[32] = {0}, down_s[32] = {0};
@@ -7457,7 +7504,7 @@ static void *carrier_udp_thread(void *arg) {
         }
 
         long cur_ms = now_ms();
-        if (cur_ms - last_prune_ms >= 5000) {
+        if (cur_ms - last_prune_ms >= 3000) {
             last_prune_ms = cur_ms;
             int pruned = prune_udp_sessions(rt, cur_ms);
             /* P0-1: 若会话发生清理或会话表变更，原 pollfd 与 p_sess 表已悬垂，
@@ -7573,6 +7620,7 @@ static void *carrier_udp_thread(void *arg) {
 
         /* 2. 监听端口接收客户端 (如 Xray) 发来的 UDP / QUIC 报文 */
         if (pfds[0].revents & POLLIN) {
+            atomic_store_explicit(&rt->last_udp_active_ms, (long long)cur_ms, memory_order_relaxed);
             unsigned long long cur_epoch = atomic_load_explicit(&rt->udp_candidates.epoch, memory_order_acquire);
             if (cur_epoch != cached_udp_epoch || !cur_target_ip[0]) {
                 carrier_get_current_udp_ip_sa(rt, cur_target_ip, sizeof(cur_target_ip), &cur_target_sa, &cur_target_salen);
@@ -7957,6 +8005,10 @@ int main(int argc, char **argv) {
             atomic_init(&rt->udp_switch_count, 0);
             atomic_init(&rt->udp_up_drop, 0);
             atomic_init(&rt->udp_down_drop_stats, 0);
+            atomic_init(&rt->active_tcp_conns, 0);
+            atomic_init(&rt->active_udp_conns, 0);
+            atomic_init(&rt->last_tcp_active_ms, 0);
+            atomic_init(&rt->last_udp_active_ms, 0);
             atomic_init(&rt->maint_pending, 0);
             pthread_mutex_init(&rt->maint_mu, nullptr);
             pthread_cond_init(&rt->maint_cv, nullptr);
