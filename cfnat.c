@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.1.2"
+#define CFNAT_VERSION "0.0.18"
 
 /* =========================================================================
  * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
@@ -7215,9 +7215,10 @@ static socket_t listen_tcp(const char *addr) {
 /* ── HTTP/3 (QUIC / UDP) 转发与会话管理引擎 ────────────────────────── */
 
 #define UDP_SESSION_TIMEOUT_MS 60000L
-#define UDP_STALL_WINDOW_MS 6000L
-#define UDP_STALL_MIN_UP_BYTES 6144ULL
-#define UDP_STALL_MAX_DOWN_BYTES 4096ULL
+#define UDP_STALL_WINDOW_MS 5000L
+#define UDP_STALL_MIN_UP_BYTES 2560ULL
+#define UDP_STALL_MAX_DOWN_BYTES 8192ULL
+#define UDP_STALL_CLEAR_DOWN_BYTES 32768ULL
 #define UDP_STALL_MAX_STRIKES 2
 #define UDP_MAX_SESSIONS 1024
 #define UDP_BUF_SIZE 65536
@@ -7535,24 +7536,28 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
         /* 1. 双条件黑洞检测：覆盖初始握手黑洞与传输中途黑洞 (4s 零下行判定) */
         int is_blackhole = (s->bytes_down == 0 && cur_ms - s->created_ms >= 4000 && s->bytes_up >= 1200) ||
                            (s->bytes_down > 0 && cur_ms - s->last_down_ms >= 4000 && (s->bytes_up - s->bytes_up_at_down) >= 1200);
-        /* 2. 窒息低速检测 (Stall Detection)：应对“延迟极低但下载卡死/被 QoS 极低速限流”场景
-         * 每 6s 滑动快照：窗口内上行 >= 6KB (客户端持续发请求/重传) 且下行 < 4KB (有效下行 < 0.67 KB/s)，
-         * 记 1 次窒息告警；连续 2 个窗口 (12s) 未恢复则按窒息低速剔除并计入节点失败。 */
+        /* 2. 窒息低速检测 (Stall Detection)：应对“延迟极低但下载卡死/被 QoS 令牌桶极低速限流”场景
+         * 每 >=5s (配合 3s 巡检实际每 ~6s) 滑动快照：
+         * - 窗口内上行 >= 2.5KB (覆盖 QUIC PTO 退避期重传) 且下行 < 8KB 且上行 >= 2×下行 (收发倒挂)，记 1 次窒息告警；
+         * - 仅当下行真正恢复 (>= 32KB/窗口) 或完全静默 (上行=0) 时才清零计数，灰区 (退避小包/微量漏水) 保留计数防误重置；
+         * - 累计 2 次窒息告警即判定窒息低速剔除，直接触发顺位切换 (适配 Xray XMUX 单长连接复用)。 */
         int is_stalled = 0;
         if (!is_blackhole && cur_ms - s->stall_snap_ms >= UDP_STALL_WINDOW_MS) {
+            long win_s = (cur_ms - s->stall_snap_ms) / 1000;
             uint64_t d_up = (s->bytes_up >= s->stall_snap_up) ? (s->bytes_up - s->stall_snap_up) : 0;
             uint64_t d_down = (s->bytes_down >= s->stall_snap_down) ? (s->bytes_down - s->stall_snap_down) : 0;
-            if (d_up >= UDP_STALL_MIN_UP_BYTES && d_down < UDP_STALL_MAX_DOWN_BYTES) {
+            if (d_up >= UDP_STALL_MIN_UP_BYTES && d_down < UDP_STALL_MAX_DOWN_BYTES && d_up >= d_down * 2) {
                 s->stall_count++;
                 if (s->stall_count >= UDP_STALL_MAX_STRIKES) {
                     is_stalled = 1;
                 } else {
-                    debug_msg("[UDP/H3] #%llu [%s] 会话窒息低速预警 (%d/%d, 6s 上行 %llu B, 下行 %llu B, 目标 %s)",
+                    debug_msg("[UDP/H3] #%llu [%s] 会话窒息低速预警 (%d/%d, %lds 上行 %llu B, 下行 %llu B, 目标 %s)",
                               s->sess_id, carrier_display_name(rt->spec.mode),
                               s->stall_count, UDP_STALL_MAX_STRIKES,
+                              win_s > 0 ? win_s : 5L,
                               (unsigned long long)d_up, (unsigned long long)d_down, s->target_ip);
                 }
-            } else {
+            } else if (d_down >= UDP_STALL_CLEAR_DOWN_BYTES || d_up == 0) {
                 s->stall_count = 0;
             }
             s->stall_snap_ms = cur_ms;
@@ -7570,7 +7575,7 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
                 }
             }
             if (strcmp(rt->udp_candidates.current_ip, s->target_ip) == 0) {
-                if (atomic_fetch_add_explicit(&rt->udp_candidates.fast_fail_count, 1, memory_order_relaxed) + 1 >= 2) {
+                if (is_stalled || atomic_fetch_add_explicit(&rt->udp_candidates.fast_fail_count, 1, memory_order_relaxed) + 1 >= 2) {
                     atomic_store_explicit(&rt->udp_candidates.fast_fail_count, 0, memory_order_relaxed);
                     atomic_store(&rt->udp_candidates.cache_valid, 0);
                     should_switch_udp = 1;
