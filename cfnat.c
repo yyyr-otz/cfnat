@@ -1149,7 +1149,7 @@ static void usage(const char *p) {
     printf("  -code=value               期望响应 HTTP 状态码 (默认缺省 0: 仅测连通性; 显式指定如 200 则做二次状态检测)\n");
     printf("  -domain=value             状态码检查域名地址 (default cloudflaremirrors.com/debian)\n");
     printf("  -random=value             是否随机生成 IP (default true)\n");
-    printf("  -v6-split=value           IPv6 /48 细分抽样子网前缀 [48, 58]，例如 54 (产生 64 个样本, default 54)\n");
+    printf("  -v6-split=value           IPv6 细分抽样子网前缀 [1, 128] (单行上限 1024 样本，文件子网更小或完整IP按原粒度, default 54)\n");
     printf("  -task=value               并发扫描线程数 (default 200)\n");
     printf("  -cli, -scan-only          仅单次 CLI 测速并打印结果表格，不启动本地端口监听\n");
     printf("  -log=value                日志级别: silent,error,warn,info,debug (default info)\n");
@@ -1330,12 +1330,13 @@ static void parse_args(Config *c, int argc, char **argv) {
             else snprintf(v6_exclude_colo_buf, sizeof(v6_exclude_colo_buf), "%s", val);
         } else if (!strcmp(key, "v6-random")) v6_random = parse_bool(val);
         else if (!strcmp(key, "v6-split") && val) {
-            int v = atoi(val);
-            if (v >= 48 && v <= 58) {
+            const char *vp = (*val == '/') ? (val + 1) : val;
+            int v = atoi(vp);
+            if (v >= 1 && v <= 128) {
                 v6_split_val = v;
                 c->v6_split = v;
             } else {
-                warn_msg("参数 -v6-split=%s 超出安全范围 [48, 58] (每 /48 最多生成 1024 个采样防 OOM)，默认使用 54", val);
+                warn_msg("参数 -v6-split=%s 超出合法范围 [1, 128]，默认使用 54", val);
                 v6_split_val = 54;
                 c->v6_split = 54;
             }
@@ -1512,7 +1513,7 @@ static void parse_args(Config *c, int argc, char **argv) {
     c->prof_v6.num = v6_num > 0 ? v6_num : c->num;
     c->prof_v6.code = v6_code >= 0 ? v6_code : c->code;
     c->prof_v6.random_mode = v6_random >= 0 ? v6_random : c->random_mode;
-    c->prof_v6.v6_split = v6_split_val >= 48 && v6_split_val <= 58 ? v6_split_val : (c->v6_split >= 48 && c->v6_split <= 58 ? c->v6_split : 54);
+    c->prof_v6.v6_split = (v6_split_val >= 1 && v6_split_val <= 128) ? v6_split_val : ((c->v6_split >= 1 && c->v6_split <= 128) ? c->v6_split : 54);
     snprintf(c->prof_v6.domain, sizeof(c->prof_v6.domain), "%s", v6_domain[0] ? v6_domain : c->domain);
     snprintf(c->prof_v6.colo, sizeof(c->prof_v6.colo), "%s", v6_colo[0] ? v6_colo : c->colo);
     if (v6_exclude_colo_buf[0]) {
@@ -1579,7 +1580,7 @@ static void log_current_config(const Config *c) {
                 (c->prof_v6.enable_h2 && c->prof_v6.enable_h3) ? "H2+H3" : (c->prof_v6.enable_h2 ? "仅H2" : "仅H3"));
         log_msg("    TLS目标端口: %d | HTTP目标端口: %d", c->prof_v6.port, c->prof_v6.http_port);
         log_msg("    并发扫描线程: %d | 延迟上限: %d ms | 候选IP保留: %d", c->prof_v6.task, c->prof_v6.delay_ms, c->prof_v6.ipnum);
-        log_msg("    IPv6 子网切分 (-v6-split): /%d (每个/48抽样 %d 个样本)", c->prof_v6.v6_split, 1 << (c->prof_v6.v6_split - 48));
+        log_msg("    IPv6 子网切分 (-v6-split): /%d (单行上限 1024 样本，文件子网更小或完整 IP 按原粒度)", c->prof_v6.v6_split);
         log_msg("    状态码校验 (-code): %s", c->prof_v6.code > 0 ? "启用" : "未启用 (仅测连通性)");
         if (c->prof_v6.code > 0) log_msg("    期望状态码: %d (域名: %s)", c->prof_v6.code, c->prof_v6.domain);
         log_msg("    数据中心筛选: %s", c->prof_v6.colo[0] ? c->prof_v6.colo : "(不限)");
@@ -1603,7 +1604,7 @@ static void log_current_config(const Config *c) {
         log_msg("  [CLI 单次测速模式] IP 类型: IPv%d | 端口: %d | 并发线程: %d | 延迟上限: %d ms",
                 c->ips_type, c->port, c->task, c->delay_ms);
         if (c->ips_type == 6) {
-            log_msg("    IPv6 子网切分 (-v6-split): /%d (每个/48抽样 %d 个样本)", c->v6_split, (c->v6_split >= 48 && c->v6_split <= 64) ? (1 << (c->v6_split - 48)) : 1);
+            log_msg("    IPv6 子网切分 (-v6-split): /%d (单行上限 1024 样本，文件子网更小或完整 IP 按原粒度)", c->v6_split);
         }
         if (c->colo[0]) log_msg("    数据中心筛选: %s", c->colo);
     }
@@ -1853,50 +1854,73 @@ static void format_ipv6_full(const unsigned char bytes[16], char *out, size_t ou
              w[0], w[1], w[2], w[3], w[4], w[5], w[6], w[7]);
 }
 
-/* IPv6 CIDR 抽样与子网切分：支持 -v6-split (默认 54，即每个 /48 切分为 64 个 /54 子网各抽样 1 个) */
-static int ipv6_cidr_sample_split(const char *base_s, int prefix, int v6_split, StringList *out) {
+/* 单行 IPv6 CIDR 切分安全上限：2^10 = 1024 个分层样本（防止大网段配 /128 导致 OOM） */
+#define MAX_V6_SPLIT_BITS_PER_LINE 10
+
+/* 通用 IPv6 CIDR 抽样与子网切分：
+ * - 支持任意文件前缀 prefix ∈ [0, 128] 与任意参数 v6_split ∈ [1, 128]（每行前缀可互不相同）
+ * - prefix == 128：视为完整单 IP，零随机直接加入
+ * - prefix >= v6_split（文件子网小于或等于参数子网，如参数 /50、文件 /64）：按文件子网粒度展开（抽样 1 个）
+ * - prefix < v6_split（文件子网大于参数子网，如文件 /48、参数 /54，或文件 /124、参数 /128）：
+ *   切分为 2^(v6_split - prefix) 个子网各抽样 1 个（当 v6_split == 128 时精确枚举全部 /128 IP）；
+ *   若单行切分位数超过 10 位 (>1024 个子网)，按高 10 位分层抽样 1024 个并置位 *capped_out 防 OOM。 */
+static int ipv6_cidr_sample_split(const char *base_s, int prefix, int v6_split, StringList *out, int *capped_out) {
     if (!base_s || !out || prefix < 0 || prefix > 128) return -1;
-    unsigned char bytes[16];
-    if (inet_pton(AF_INET6, base_s, bytes) != 1) return -1;
+    if (v6_split < 1 || v6_split > 128) v6_split = 54;
+    unsigned char base[16];
+    if (inet_pton(AF_INET6, base_s, base) != 1) return -1;
 
+    /* 完整 /128 单 IP 直接加入，不改任何位 */
+    if (prefix == 128) {
+        char ip[MAX_IP_LEN];
+        format_ipv6_full(base, ip, sizeof(ip));
+        strlist_add(out, ip);
+        return 1;
+    }
+
+    /* 清零主机位 [prefix .. 127] 得到规范网络地址 */
     for (int bit = prefix; bit < 128; bit++) {
-        bytes[bit / 8] &= (unsigned char)~(1u << (7 - (bit % 8)));
+        base[bit / 8] &= (unsigned char)~(1u << (7 - (bit % 8)));
     }
 
-    uint16_t w[8];
-    for (int i = 0; i < 8; i++) {
-        w[i] = ((uint16_t)bytes[i * 2] << 8) | (uint16_t)bytes[i * 2 + 1];
-    }
-
-    /* 针对标准的 Cloudflare /48 CIDR 进行指定子网切分 (上限 58，防内存爆炸) */
-    if (prefix == 48 && v6_split >= 48 && v6_split <= 58) {
-        int split_bits = v6_split - 48;
-        int count = 1 << split_bits;
-        int step = (split_bits == 16) ? 1 : (65536 / count);
-        for (int i = 0; i < count; i++) {
-            uint16_t seg4 = (uint16_t)(i * step + (step > 1 ? (uint16_t)(rand_u64() % (uint64_t)step) : 0));
-            uint16_t seg5 = (uint16_t)(rand_u64() & 0xffff);
-            uint16_t seg6 = (uint16_t)(rand_u64() & 0xffff);
-            uint16_t seg7 = (uint16_t)(rand_u64() & 0xffff);
-            uint16_t seg8 = (uint16_t)(rand_u64() & 0xffff);
-            char ip[MAX_IP_LEN];
-            snprintf(ip, sizeof(ip), "%04x:%04x:%04x:%04x:%04x:%04x:%04x:%04x",
-                     w[0], w[1], w[2], seg4, seg5, seg6, seg7, seg8);
-            strlist_add(out, ip);
-        }
-        return 0;
-    }
-
-    /* 其他前缀情况（例如 /64 或 /32）：在 prefix 之后随机生成主机位，格式化为 8 段完整展开格式 */
-    for (int bit = prefix; bit < 128; bit++) {
-        if (rand_u64() & 1u) {
-            bytes[bit / 8] |= (unsigned char)(1u << (7 - (bit % 8)));
+    int eff_bits = 0;
+    if (v6_split > prefix) {
+        int split_bits = v6_split - prefix;
+        if (split_bits > MAX_V6_SPLIT_BITS_PER_LINE) {
+            eff_bits = MAX_V6_SPLIT_BITS_PER_LINE;
+            if (capped_out) *capped_out = 1;
+        } else {
+            eff_bits = split_bits;
         }
     }
-    char ip[MAX_IP_LEN];
-    format_ipv6_full(bytes, ip, sizeof(ip));
-    strlist_add(out, ip);
-    return 0;
+    /* eff_bits == 0 表示文件子网 <= 参数子网（prefix >= v6_split），按文件自身 /prefix 抽样 1 个 */
+    int count = 1 << eff_bits;
+    int rand_start = prefix + eff_bits;
+
+    for (int i = 0; i < count; i++) {
+        unsigned char cur[16];
+        memcpy(cur, base, 16);
+        /* 将分层序号 i 写入 [prefix .. prefix + eff_bits - 1] */
+        for (int k = 0; k < eff_bits; k++) {
+            if ((i >> (eff_bits - 1 - k)) & 1u) {
+                int pos = prefix + k;
+                cur[pos / 8] |= (unsigned char)(1u << (7 - (pos % 8)));
+            }
+        }
+        /* 随机填充剩余主机位 [rand_start .. 127]（当 rand_start == 128 时精确枚举，零随机位） */
+        uint64_t r = 0;
+        int rbits = 0;
+        for (int pos = rand_start; pos < 128; pos++) {
+            if (rbits == 0) { r = rand_u64(); rbits = 64; }
+            if (r & 1u) cur[pos / 8] |= (unsigned char)(1u << (7 - (pos % 8)));
+            r >>= 1;
+            rbits--;
+        }
+        char ip[MAX_IP_LEN];
+        format_ipv6_full(cur, ip, sizeof(ip));
+        strlist_add(out, ip);
+    }
+    return count;
 }
 
 static int is_ip_literal(const char *s) {
@@ -1911,8 +1935,39 @@ static void format_addr_port(const char *ip, int port, char *out, size_t outsz) 
     else snprintf(out, outsz, "%s:%d", ip ? ip : "", port);
 }
 
+/* 清洗单行 IP/CIDR 输入：去注释 (#/;//)、取首字段、剥离方括号与可选端口 ([v6]:443 -> v6) */
+static void sanitize_ip_line(char *line) {
+    if (!line) return;
+    trim_line(line);
+    if (!line[0]) return;
+    for (char *p = line; *p; p++) {
+        if (*p == '#' || *p == ';' || (*p == '/' && p[1] == '/')) {
+            *p = '\0';
+            break;
+        }
+    }
+    trim_line(line);
+    if (!line[0]) return;
+    /* 仅保留首段 token（忽略行尾附加备注列如机房名/延迟等） */
+    for (char *p = line; *p; p++) {
+        if (*p == ' ' || *p == '	' || *p == ',') {
+            *p = '\0';
+            break;
+        }
+    }
+    /* 处理 [2606:4700::1] 或 [2606:4700::1]:443 */
+    if (line[0] == '[') {
+        char *rb = strchr(line + 1, ']');
+        if (rb) {
+            size_t len = (size_t)(rb - (line + 1));
+            memmove(line, line + 1, len);
+            line[len] = '\0';
+        }
+    }
+}
+
 static StringList load_ip_list(const char *filename, int random_mode, int v6_split) {
-    if (v6_split < 48 || v6_split > 58) v6_split = 54;
+    if (v6_split < 1 || v6_split > 128) v6_split = 54;
     StringList out = {0};
     FILE *f = fopen(filename, "r");
     if (!f) return out;
@@ -1926,14 +1981,17 @@ static StringList load_ip_list(const char *filename, int random_mode, int v6_spl
     char line[MAX_LINE];
     long start_ms = now_ms();
     size_t cidr_count = 0;
+    size_t exact_ip_count = 0;
     int warned_ipv6_expand = 0;
+    int warned_ipv6_cap = 0;
     srand((unsigned)time(nullptr));
     while (fgets(line, sizeof(line), f)) {
-        trim_line(line);
+        sanitize_ip_line(line);
         if (!line[0]) continue;
         char *slash = strchr(line, '/');
         if (!slash) {
             if (is_ip_literal(line)) {
+                exact_ip_count++;
                 if (strchr(line, ':')) {
                     unsigned char b[16];
                     if (inet_pton(AF_INET6, line, b) == 1) {
@@ -1949,18 +2007,37 @@ static StringList load_ip_list(const char *filename, int random_mode, int v6_spl
             }
             continue;
         }
-        cidr_count++;
         *slash = 0;
-        int prefix = atoi(slash + 1);
+        const char *pfx_s = slash + 1;
+        if (!pfx_s[0]) continue;
+        int pfx_ok = 1;
+        for (const char *p = pfx_s; *p; p++) {
+            if (!isdigit((unsigned char)*p)) { pfx_ok = 0; break; }
+        }
+        if (!pfx_ok) continue;
+        int prefix = atoi(pfx_s);
         if (strchr(line, ':')) {
-            if (!random_mode && !warned_ipv6_expand) {
-                warn_msg("IPv6 空间过大不支持全量展开，已按 -v6-split=/%d 为每个 /48 子网抽样 %d 个候选",
-                         v6_split, 1 << (v6_split - 48));
-                warned_ipv6_expand = 1;
+            if (prefix < 0 || prefix > 128) continue;
+            if (prefix == 128) {
+                exact_ip_count++;
+            } else {
+                cidr_count++;
+                if (!random_mode && !warned_ipv6_expand) {
+                    warn_msg("IPv6 空间过大不支持全量展开，已按 -v6-split=/%d 分层抽样（单行上限 1024，文件子网更小时按文件子网展开）",
+                             v6_split);
+                    warned_ipv6_expand = 1;
+                }
             }
-            ipv6_cidr_sample_split(line, prefix, v6_split, &out);
+            int capped = 0;
+            ipv6_cidr_sample_split(line, prefix, v6_split, &out, &capped);
+            if (capped && !warned_ipv6_cap) {
+                warn_msg("部分 IPv6 子网按 -v6-split=/%d 切分超过单行 1024 上限，已自动按高 10 位分层抽样 1024 个防 OOM",
+                         v6_split);
+                warned_ipv6_cap = 1;
+            }
             continue;
         }
+        cidr_count++;
         uint32_t base = ipv4_to_u32(line);
         if (base == 0 || prefix < 8 || prefix > 32) continue;
         uint32_t mask = (0xffffffffu << (32 - prefix));
@@ -1992,7 +2069,7 @@ static StringList load_ip_list(const char *filename, int random_mode, int v6_spl
             out.items[j] = tmp;
         }
     }
-    log_msg("IP 列表加载完成: %zu 个候选，CIDR 行数: %zu，耗时 %ld 秒", out.len, cidr_count, (now_ms() - start_ms) / 1000);
+    log_msg("IP 列表加载完成: %zu 个候选（完整 IP 行: %zu，CIDR 行: %zu），耗时 %ld 秒", out.len, exact_ip_count, cidr_count, (now_ms() - start_ms) / 1000);
     if (!random_mode && out.len > 100000) {
         warn_msg("当前使用 -random=false，已完整展开大量 IP，扫描会明显变慢；需要快速启动时建议使用 -random=true");
     }
