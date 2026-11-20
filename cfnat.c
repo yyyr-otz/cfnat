@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.1.1"
+#define CFNAT_VERSION "0.1.2"
 
 /* =========================================================================
  * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
@@ -7215,6 +7215,10 @@ static socket_t listen_tcp(const char *addr) {
 /* ── HTTP/3 (QUIC / UDP) 转发与会话管理引擎 ────────────────────────── */
 
 #define UDP_SESSION_TIMEOUT_MS 60000L
+#define UDP_STALL_WINDOW_MS 6000L
+#define UDP_STALL_MIN_UP_BYTES 6144ULL
+#define UDP_STALL_MAX_DOWN_BYTES 4096ULL
+#define UDP_STALL_MAX_STRIKES 2
 #define UDP_MAX_SESSIONS 1024
 #define UDP_BUF_SIZE 65536
 
@@ -7232,6 +7236,10 @@ struct UdpSession {
     uint64_t bytes_up;
     uint64_t bytes_down;
     uint64_t bytes_up_at_down;
+    long stall_snap_ms;
+    uint64_t stall_snap_up;
+    uint64_t stall_snap_down;
+    int stall_count;
     struct UdpSession *next;
     struct UdpSession *hash_next;
 };
@@ -7426,8 +7434,13 @@ static UdpSession *find_or_create_udp_session_sa(CarrierRuntime *rt, const struc
             s->upstream_fd = udp_connect_upstream_sa(target_ip, target_sa, target_salen, target_port, rt->udp_session_count);
             snprintf(s->target_ip, sizeof(s->target_ip), "%s", target_ip);
             s->target_port = target_port;
-            s->last_down_ms = now_ms();
+            long migrate_ms = now_ms();
+            s->last_down_ms = migrate_ms;
             s->bytes_up_at_down = s->bytes_up;
+            s->stall_snap_ms = migrate_ms;
+            s->stall_snap_up = s->bytes_up;
+            s->stall_snap_down = s->bytes_down;
+            s->stall_count = 0;
             rt->udp_dirty = 1;
         }
         rt->last_udp_sess = s;
@@ -7485,6 +7498,10 @@ static UdpSession *find_or_create_udp_session_sa(CarrierRuntime *rt, const struc
     new_sess->created_ms = now_ms();
     new_sess->last_active_ms = new_sess->created_ms;
     new_sess->last_down_ms = new_sess->created_ms;
+    new_sess->stall_snap_ms = new_sess->created_ms;
+    new_sess->stall_snap_up = 0;
+    new_sess->stall_snap_down = 0;
+    new_sess->stall_count = 0;
     new_sess->sess_id = atomic_fetch_add(&g_udp_sess_seq, 1) + 1;
     rt->udp_session_count++;
     atomic_store_explicit(&rt->active_udp_conns, (int)rt->udp_session_count, memory_order_relaxed);
@@ -7508,15 +7525,42 @@ static UdpSession *find_or_create_udp_session_sa(CarrierRuntime *rt, const struc
 static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
     if (!rt) return 0;
     int should_switch_udp = 0;
+    int switch_by_blackhole = 0;
+    int switch_by_stall = 0;
     int pruned_count = 0;
     pthread_mutex_lock(&rt->udp_mu);
     UdpSession *prev = nullptr;
     UdpSession *s = rt->udp_sessions;
     while (s) {
-        /* 双条件黑洞检测：覆盖初始握手黑洞与传输中途黑洞 (4s 判定) */
+        /* 1. 双条件黑洞检测：覆盖初始握手黑洞与传输中途黑洞 (4s 零下行判定) */
         int is_blackhole = (s->bytes_down == 0 && cur_ms - s->created_ms >= 4000 && s->bytes_up >= 1200) ||
                            (s->bytes_down > 0 && cur_ms - s->last_down_ms >= 4000 && (s->bytes_up - s->bytes_up_at_down) >= 1200);
-        if (is_blackhole) {
+        /* 2. 窒息低速检测 (Stall Detection)：应对“延迟极低但下载卡死/被 QoS 极低速限流”场景
+         * 每 6s 滑动快照：窗口内上行 >= 6KB (客户端持续发请求/重传) 且下行 < 4KB (有效下行 < 0.67 KB/s)，
+         * 记 1 次窒息告警；连续 2 个窗口 (12s) 未恢复则按窒息低速剔除并计入节点失败。 */
+        int is_stalled = 0;
+        if (!is_blackhole && cur_ms - s->stall_snap_ms >= UDP_STALL_WINDOW_MS) {
+            uint64_t d_up = (s->bytes_up >= s->stall_snap_up) ? (s->bytes_up - s->stall_snap_up) : 0;
+            uint64_t d_down = (s->bytes_down >= s->stall_snap_down) ? (s->bytes_down - s->stall_snap_down) : 0;
+            if (d_up >= UDP_STALL_MIN_UP_BYTES && d_down < UDP_STALL_MAX_DOWN_BYTES) {
+                s->stall_count++;
+                if (s->stall_count >= UDP_STALL_MAX_STRIKES) {
+                    is_stalled = 1;
+                } else {
+                    debug_msg("[UDP/H3] #%llu [%s] 会话窒息低速预警 (%d/%d, 6s 上行 %llu B, 下行 %llu B, 目标 %s)",
+                              s->sess_id, carrier_display_name(rt->spec.mode),
+                              s->stall_count, UDP_STALL_MAX_STRIKES,
+                              (unsigned long long)d_up, (unsigned long long)d_down, s->target_ip);
+                }
+            } else {
+                s->stall_count = 0;
+            }
+            s->stall_snap_ms = cur_ms;
+            s->stall_snap_up = s->bytes_up;
+            s->stall_snap_down = s->bytes_down;
+        }
+
+        if (is_blackhole || is_stalled) {
             pthread_mutex_lock(&rt->udp_candidates.mu);
             for (size_t i = 0; i < rt->udp_candidates.len; i++) {
                 if (strcmp(rt->udp_candidates.items[i].ip, s->target_ip) == 0) {
@@ -7530,12 +7574,14 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
                     atomic_store_explicit(&rt->udp_candidates.fast_fail_count, 0, memory_order_relaxed);
                     atomic_store(&rt->udp_candidates.cache_valid, 0);
                     should_switch_udp = 1;
+                    if (is_blackhole) switch_by_blackhole = 1;
+                    if (is_stalled) switch_by_stall = 1;
                 }
             }
             pthread_mutex_unlock(&rt->udp_candidates.mu);
         }
 
-        if (is_blackhole || cur_ms - s->last_active_ms > UDP_SESSION_TIMEOUT_MS) {
+        if (is_blackhole || is_stalled || cur_ms - s->last_active_ms > UDP_SESSION_TIMEOUT_MS) {
             UdpSession *del = s;
             rt->udp_dirty = 1;
             pruned_count++;
@@ -7557,9 +7603,10 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
             char up_s[32] = {0}, down_s[32] = {0};
             format_bytes(del->bytes_up, up_s, sizeof(up_s));
             format_bytes(del->bytes_down, down_s, sizeof(down_s));
+            const char *close_reason = is_blackhole ? "黑洞剔除" : (is_stalled ? "窒息低速剔除" : "空闲超时");
             conn_msg("[UDP/H3] #%llu [%s] 客户端会话关闭 (%s, 存活 %lds, 上行 %s, 下行 %s, 当前活跃: %d)",
                      del->sess_id, carrier_display_name(rt->spec.mode),
-                     is_blackhole ? "黑洞剔除" : "空闲超时",
+                     close_reason,
                      lifetime_s > 0 ? lifetime_s : 0, up_s, down_s, active);
             free(del);
         } else {
@@ -7575,13 +7622,18 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
             warn_msg("[UDP/H3] [%s] 检测到下行非阻塞写队列溢出丢包: %llu（后续统计将在 debug 级别输出）",
                      carrier_display_name(rt->spec.mode), (unsigned long long)rt->udp_down_drop);
         } else {
-            debug_msg("[UDP/H3] [%s] 近 5s 下行非阻塞写队列溢出丢包: %llu",
+            debug_msg("[UDP/H3] [%s] 近 3s 下行非阻塞写队列溢出丢包: %llu",
                       carrier_display_name(rt->spec.mode), (unsigned long long)rt->udp_down_drop);
         }
         rt->udp_down_drop = 0;
     }
     if (should_switch_udp && atomic_load(&g_running)) {
-        log_msg("[UDP/H3] [%s] 检测到上游连续无回包响应 (可能受 UDP QoS 阻断)，触发顺位切换", carrier_display_name(rt->spec.mode));
+        const char *switch_reason = (switch_by_stall && !switch_by_blackhole)
+                                        ? "检测到上游连续窒息低速 (可能受 UDP QoS 极低速限流)"
+                                        : (switch_by_stall && switch_by_blackhole)
+                                              ? "检测到上游连续无回包或窒息低速 (可能受 UDP QoS 限流/阻断)"
+                                              : "检测到上游连续无回包响应 (可能受 UDP QoS 阻断)";
+        log_msg("[UDP/H3] [%s] %s，触发顺位切换", carrier_display_name(rt->spec.mode), switch_reason);
         carrier_trigger_maintenance(rt, MAINT_SWITCH_UDP);
     }
     return pruned_count;
