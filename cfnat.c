@@ -198,6 +198,12 @@ CFNAT_NODISCARD static int cfnat_poll_single(socket_t fd, int poll_type, int tim
 #define MAX_PATH_LEN 256
 #define MAX_RESOLVER_LEN 64
 #define MAX_RESOLVER_SPEC_LEN 256
+
+/* 疑似 QoS 窗口：探测侧（扫描/健康检查）与转发侧（下行猝死）共享的状态时长。
+ * 必须定义在这里——扫描器（filter_udp_candidates_from_tcp）在会话管理章节之前就会用到，
+ * 之前放在 UDP 章节导致 6 个目标全部编译失败（use of undeclared identifier）。 */
+#define QOS_WINDOW_DEFAULT_MS 30000L   /* 转发侧（下行猝死）登记的窗口时长 */
+#define QOS_WINDOW_SCAN_MS 8000L       /* 探测侧（金丝雀连挂 / 整批 0 回包）登记的窗口时长 */
 static const char *DEFAULT_BAIDU_DOMAIN = "cloudnproxy.baidu.com";
 CFNAT_CONSTEXPR int DEFAULT_BAIDU_PORT = 443;
 CFNAT_CONSTEXPR int DEFAULT_BAIDU_IPNUM = 12;
@@ -7399,17 +7405,15 @@ static socket_t listen_tcp(const char *addr) {
  * 只能用「会话真实字节」作为传感器：以会话自身的历史峰值为基准判断「猝死」。
  *
  * 判据（窗口 5s，一次性强证据，不必等两轮）：
- *   d_down < max(FLOOR, peak / RATIO)  且  peak >= PEAK_MIN  且  peak 距今 <= PEAK_AGE_MS
- * 三个约束分别排除：正常低速会话 / 从没跑起来过的会话 / 用户主动停止下载（空闲）。 */
+ *   d_up > 0  且  d_down < max(FLOOR, peak / RATIO)  且  peak >= PEAK_MIN  且  peak 距今 <= PEAK_AGE_MS
+ * 四个约束分别排除：完全静默的空闲隧道 / 正常低速会话 / 从没跑起来过的会话 / 用户主动暂停。 */
 #define UDP_STALL_PEAK_MIN 98304ULL        /* 5s 窗口下行峰值 >= 96KB（≈19KB/s）才算"跑过速度" */
 #define UDP_STALL_PEAK_RATIO 8ULL          /* 当前窗口低于峰值的 1/8 视为猝死 */
 #define UDP_STALL_PEAK_FLOOR 4096ULL       /* 低于 4KB/5s 才可能是猝死，避免低码率场景误判 */
 #define UDP_STALL_PEAK_AGE_MS 20000L       /* 峰值必须发生在 20s 内，否则视为"已正常空闲" */
 #define UDP_STALL_CONFIRM_MS 8000L         /* 第一段降级后 8s 仍无下行 → 第二段剔除会话 */
 
-/* 疑似 QoS 窗口：探测侧与转发侧共享的状态，避免双方各自把「窗口内的失败」当节点故障 */
-#define QOS_WINDOW_DEFAULT_MS 30000L
-#define QOS_WINDOW_SCAN_MS 8000L
+/* 疑似 QoS 窗口的时长常量见文件顶部 QOS_WINDOW_* 定义（扫描器先用、会话管理后用，必须前置） */
 
 #define UDP_MAX_SESSIONS 1024
 #define UDP_BUF_SIZE 65536
