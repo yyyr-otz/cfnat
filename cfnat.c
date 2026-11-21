@@ -204,6 +204,16 @@ CFNAT_NODISCARD static int cfnat_poll_single(socket_t fd, int poll_type, int tim
  * 之前放在 UDP 章节导致 6 个目标全部编译失败（use of undeclared identifier）。 */
 #define QOS_WINDOW_DEFAULT_MS 30000L   /* 转发侧（下行猝死）登记的窗口时长 */
 #define QOS_WINDOW_SCAN_MS 8000L       /* 探测侧（金丝雀连挂 / 整批 0 回包）登记的窗口时长 */
+
+/* 线路级 UDP 限速的「降级保持」：
+ * 若连续换到不同 IP 仍在很短时间内下行归零，说明限速作用在接入线路/订阅侧，而不是某个节点。
+ * 此时继续「杀会话 + 换 IP」只会制造重连风暴——每次重连都要重新握手，而握手本身也得用被限速的带宽，
+ * 用户感受就是网页反复打不开。所以判定成立后暂停主动剔除与顺位切换，等限速窗口自行解除。 */
+#define H3_BH_STREAK_WINDOW_MS 20000L  /* 两次黑洞/窒息之间在此窗口内才算「连续」 */
+#define H3_BH_STREAK_LIMIT 3           /* 连续 3 次换到不同 IP 仍黑洞 → 判定线路级限速 */
+#define H3_DEGRADED_HOLD_MS 180000L    /* 降级保持时长（限速窗口通常几十秒到几分钟） */
+#define H3_RECOVER_DOWN_BYTES 65536ULL /* 任一会话累计下行 >= 64KB 视为线路已恢复 */
+#define H3_DEGRADED_BH_MS 20000L       /* 降级保持期间的黑洞阈值放宽到 20s，只保留兜底回收 */
 static const char *DEFAULT_BAIDU_DOMAIN = "cloudnproxy.baidu.com";
 CFNAT_CONSTEXPR int DEFAULT_BAIDU_PORT = 443;
 CFNAT_CONSTEXPR int DEFAULT_BAIDU_IPNUM = 12;
@@ -635,6 +645,11 @@ struct CarrierRuntime {
      * 到期前，扫描不把 IP 判死、健康检查不计失败、切换最多放行一次，避免双方同时误判造成空池与抖动。 */
     atomic_llong qos_suspect_until_ms;
     atomic_int qos_switch_used;        /* 本窗口内是否已执行过顺位切换（防连续切换抖动） */
+    /* 线路级限速降级保持：换 IP 已证明无效时，停止「杀会话 + 换 IP」的重连风暴 */
+    atomic_llong h3_degraded_until_ms; /* 降级保持到期时间，0 = 未降级 */
+    atomic_llong h3_last_bh_ms;        /* 上一次黑洞/窒息剔除的时间戳 */
+    atomic_int h3_bh_streak;           /* 连续「换到不同 IP 仍黑洞」的次数 */
+    char h3_last_bh_ip[MAX_IP_LEN];    /* 上一次黑洞命中的目标 IP（仅 prune 线程读写） */
     int udp_dirty;                 /* 会话表变更标记：未变更时直接复用 pollfd 数组，免除每轮链表遍历 */
     pthread_mutex_t udp_mu;
     atomic_int rescanning_lock;    /* 实例独享的自愈扫描互斥锁 (防跨协议阻塞) */
@@ -6375,6 +6390,16 @@ static int carrier_set_current_udp_candidate(CarrierRuntime *rt, size_t idx) {
 
 CFNAT_NODISCARD static int carrier_switch_next_udp_ip(CarrierRuntime *rt) {
     if (!rt || !atomic_load(&g_running)) return 0;
+    /* 线路级限速降级保持期间拒绝一切 H3 顺位切换：换 IP 已证明无效，
+     * 每次切换都要拆掉现有会话逼客户端重连，反而延长了不可用时间。 */
+    {
+        long long hold_until = atomic_load_explicit(&rt->h3_degraded_until_ms, memory_order_relaxed);
+        if ((long long)now_ms() < hold_until) {
+            debug_msg("[UDP/H3] [%s] 线路级限速降级保持中，跳过顺位切换 (剩余 %llds)",
+                      carrier_display_name(rt->spec.mode), (hold_until - (long long)now_ms()) / 1000);
+            return 0;
+        }
+    }
     if (atomic_exchange_explicit(&rt->udp_candidates.switch_lock, 1, memory_order_acq_rel) != 0) {
         return 0; /* P1-3: 已有其他线程正在执行切换，避免并发竞争 */
     }
@@ -7747,7 +7772,9 @@ static UdpSession *find_or_create_udp_session_sa(CarrierRuntime *rt, const struc
     rt->last_udp_sess = new_sess;
     rt->udp_dirty = 1;
 
-    int is_quic = ((first_byte & 0x80) != 0 && (first_byte & 0x40) != 0);
+    /* QUIC v1 的 FIXED BIT 是 0x40，长包头(Initial/Handshake) 与短包头(1-RTT 数据) 都置位。
+     * 原判据同时要求 0x80，只能识别长包头，于是握手之后的数据包几乎全被标成 "UDP"（日志误导）。 */
+    int is_quic = ((first_byte & 0x40) != 0);
     conn_msg("[UDP/H3] #%llu [%s] 客户端连接建立 (当前活跃: %d)",
              new_sess->sess_id, carrier_display_name(rt->spec.mode), active);
     conn_msg("[UDP/H3] #%llu [%s] 识别客户端协议: %s，转发到 IP: %s 端口: %d",
@@ -7767,6 +7794,11 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
     UdpSession *prev = nullptr;
     UdpSession *s = rt->udp_sessions;
     while (s) {
+        /* 降级保持状态（线路级 UDP 限速）：整个会话处理周期共用同一份判断，
+         * 避免后面各分支重复读取原子变量、也保证「保持期间不打日志/不动作」的口径一致。 */
+        int degraded_mode = ((long long)cur_ms <
+                             atomic_load_explicit(&rt->h3_degraded_until_ms, memory_order_relaxed));
+
         /* 1. 双条件黑洞检测：覆盖初始握手黑洞与传输中途黑洞 (4s 零下行判定) */
         int is_blackhole = (s->bytes_down == 0 && cur_ms - s->created_ms >= 4000 && s->bytes_up >= 1200) ||
                            (s->bytes_down > 0 && cur_ms - s->last_down_ms >= 4000 && (s->bytes_up - s->bytes_up_at_down) >= 1200);
@@ -7827,7 +7859,7 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
                 s->stall_count = 0;
             }
 
-            if (collapse_first_stage) {
+            if (collapse_first_stage && !degraded_mode) {
                 long long now_v = (long long)now_ms();
                 if (atomic_load_explicit(&rt->qos_suspect_until_ms, memory_order_relaxed) <= now_v) {
                     atomic_store_explicit(&rt->qos_switch_used, 0, memory_order_relaxed); /* 新窗口：归还一次切换额度 */
@@ -7847,7 +7879,57 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
             s->stall_snap_down = s->bytes_down;
         }
 
-        if (is_blackhole || is_stalled || collapse_first_stage) {
+        /* ── 线路恢复检测 ──────────────────────────────────────────────
+         * 任一会话累计下行够量，说明限速窗口已经过去：解除降级保持并清零连续计数。
+         * 这是唯一可靠的恢复信号——探针小包在限速期间本来就能通，不能用它判恢复。 */
+        if (s->bytes_down >= H3_RECOVER_DOWN_BYTES &&
+            atomic_load_explicit(&rt->h3_degraded_until_ms, memory_order_relaxed) != 0) {
+            atomic_store_explicit(&rt->h3_degraded_until_ms, 0, memory_order_relaxed);
+            atomic_store_explicit(&rt->h3_bh_streak, 0, memory_order_relaxed);
+            atomic_store_explicit(&rt->qos_suspect_until_ms, 0, memory_order_relaxed);
+            log_msg("[UDP/H3] [%s] 检测到会话恢复下行 (累计 %llu KB)，解除线路级限速降级保持，恢复正常切换",
+                    carrier_display_name(rt->spec.mode), (unsigned long long)(s->bytes_down / 1024));
+        }
+
+        /* ── 降级保持 ──────────────────────────────────────────────────
+         * 已证明「换 IP 也没用」时，4s 一次的黑洞剔除会变成重连风暴：
+         * 每次重连都要重做握手，而握手本身也要走这条被限速的线路，用户感受就是网页反复打不开。
+         * 因此保持期间：不切换、不计节点失败、不放宽窒息/猝死剔除，只把黑洞阈值放宽到 20s 做兜底回收。 */
+        if (degraded_mode) {
+            is_stalled = 0;
+            collapse_first_stage = 0;
+            is_blackhole = (s->bytes_down == 0 && cur_ms - s->created_ms >= H3_DEGRADED_BH_MS && s->bytes_up >= 1200) ||
+                           (s->bytes_down > 0 && cur_ms - s->last_down_ms >= H3_DEGRADED_BH_MS &&
+                            (s->bytes_up - s->bytes_up_at_down) >= 1200);
+        } else if (is_blackhole || is_stalled) {
+            /* 连续「换到不同 IP 仍在 20s 内归零」→ 升级为线路级限速降级保持。
+             * 同一 IP 反复黑洞不计数：那是节点自身问题，换 IP 是正确的。 */
+            long long now_v = (long long)now_ms();
+            long long last_bh = atomic_load_explicit(&rt->h3_last_bh_ms, memory_order_relaxed);
+            int streak = atomic_load_explicit(&rt->h3_bh_streak, memory_order_relaxed);
+            if (last_bh > 0 && (now_v - last_bh) <= H3_BH_STREAK_WINDOW_MS &&
+                strcmp(rt->h3_last_bh_ip, s->target_ip) != 0) {
+                streak++;
+            } else if (last_bh == 0 || (now_v - last_bh) > H3_BH_STREAK_WINDOW_MS) {
+                streak = 1;
+            }
+            snprintf(rt->h3_last_bh_ip, sizeof(rt->h3_last_bh_ip), "%s", s->target_ip);
+            atomic_store_explicit(&rt->h3_last_bh_ms, now_v, memory_order_relaxed);
+            atomic_store_explicit(&rt->h3_bh_streak, streak, memory_order_relaxed);
+            if (streak >= H3_BH_STREAK_LIMIT) {
+                long long hold_until = now_v + H3_DEGRADED_HOLD_MS;
+                atomic_store_explicit(&rt->h3_degraded_until_ms, hold_until, memory_order_relaxed);
+                atomic_store_explicit(&rt->h3_bh_streak, 0, memory_order_relaxed);
+                /* 同步登记 QoS 窗口：健康检查在窗口内不会把节点判死，扫描也不会误判空池 */
+                atomic_store_explicit(&rt->qos_suspect_until_ms, hold_until, memory_order_relaxed);
+                warn_msg("[UDP/H3] [%s] 连续 %d 次换到不同 IP 仍在 %lds 内下行归零 → 判定为线路级 UDP 限速（换 IP 无效），"
+                         "进入降级保持 %lds：暂停主动剔除与顺位切换，等待限速窗口自行解除",
+                         carrier_display_name(rt->spec.mode), H3_BH_STREAK_LIMIT,
+                         H3_BH_STREAK_WINDOW_MS / 1000, H3_DEGRADED_HOLD_MS / 1000);
+            }
+        }
+
+        if (!degraded_mode && (is_blackhole || is_stalled || collapse_first_stage)) {
             pthread_mutex_lock(&rt->udp_candidates.mu);
             for (size_t i = 0; i < rt->udp_candidates.len; i++) {
                 if (strcmp(rt->udp_candidates.items[i].ip, s->target_ip) == 0) {
@@ -7902,7 +7984,7 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
             char up_s[32] = {0}, down_s[32] = {0};
             format_bytes(del->bytes_up, up_s, sizeof(up_s));
             format_bytes(del->bytes_down, down_s, sizeof(down_s));
-            const char *close_reason = is_blackhole ? "黑洞剔除"
+            const char *close_reason = is_blackhole ? (degraded_mode ? "限速期兜底回收" : "黑洞剔除")
                                      : del->down_collapsed ? "下行猝死剔除"
                                      : (is_stalled ? "窒息低速剔除" : "空闲超时");
             conn_msg("[UDP/H3] #%llu [%s] 客户端会话关闭 (%s, 存活 %lds, 上行 %s, 下行 %s, 当前活跃: %d)",
@@ -8543,6 +8625,9 @@ int main(int argc, char **argv) {
             atomic_init(&rt->last_udp_loss_pct, -1);
             atomic_init(&rt->qos_suspect_until_ms, 0);
             atomic_init(&rt->qos_switch_used, 0);
+            atomic_init(&rt->h3_degraded_until_ms, 0);
+            atomic_init(&rt->h3_last_bh_ms, 0);
+            atomic_init(&rt->h3_bh_streak, 0);
             atomic_init(&rt->maint_pending, 0);
             pthread_mutex_init(&rt->maint_mu, nullptr);
             pthread_cond_init(&rt->maint_cv, nullptr);
