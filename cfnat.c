@@ -6242,10 +6242,11 @@ static void sort_switch_candidates(const char *cur_ip, char ips[][MAX_IP_LEN], s
     }
 }
 
+/* 返回值：1 = 已切换；0 = 确实没有可用候选（池子消耗殆尽）；-1 = 策略拒绝/并发占用（不代表池子耗尽） */
 static int carrier_switch_next_ip(CarrierRuntime *rt) {
-    if (!rt || !atomic_load(&g_running)) return 0;
+    if (!rt || !atomic_load(&g_running)) return -1;
     if (atomic_exchange_explicit(&rt->candidates.switch_lock, 1, memory_order_acq_rel) != 0) {
-        return 0; /* P1-3: 已有其他线程正在执行切换，避免并发竞争 */
+        return -1; /* P1-3: 已有其他线程正在执行切换，避免并发竞争（不是池子耗尽） */
     }
     char check_ips[64][MAX_IP_LEN];
     size_t check_indices[64];
@@ -6388,8 +6389,9 @@ static int carrier_set_current_udp_candidate(CarrierRuntime *rt, size_t idx) {
     return 0;
 }
 
+/* 返回值：1 = 已切换；0 = 确实没有可用候选（池子消耗殆尽）；-1 = 策略拒绝/并发占用（不代表池子耗尽） */
 CFNAT_NODISCARD static int carrier_switch_next_udp_ip(CarrierRuntime *rt) {
-    if (!rt || !atomic_load(&g_running)) return 0;
+    if (!rt || !atomic_load(&g_running)) return -1;
     /* 线路级限速降级保持期间拒绝一切 H3 顺位切换：换 IP 已证明无效，
      * 每次切换都要拆掉现有会话逼客户端重连，反而延长了不可用时间。 */
     {
@@ -6397,11 +6399,11 @@ CFNAT_NODISCARD static int carrier_switch_next_udp_ip(CarrierRuntime *rt) {
         if ((long long)now_ms() < hold_until) {
             debug_msg("[UDP/H3] [%s] 线路级限速降级保持中，跳过顺位切换 (剩余 %llds)",
                       carrier_display_name(rt->spec.mode), (hold_until - (long long)now_ms()) / 1000);
-            return 0;
+            return -1;   /* 策略拒绝：池子并没有耗尽，绝不应触发全量重扫 */
         }
     }
     if (atomic_exchange_explicit(&rt->udp_candidates.switch_lock, 1, memory_order_acq_rel) != 0) {
-        return 0; /* P1-3: 已有其他线程正在执行切换，避免并发竞争 */
+        return -1; /* P1-3: 并发占用，不是池子耗尽 */
     }
     int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
     if (target_port <= 0) target_port = 443;
@@ -6461,7 +6463,7 @@ CFNAT_NODISCARD static int carrier_switch_next_udp_ip(CarrierRuntime *rt) {
             debug_msg("[UDP/H3] [%s] 疑似 QoS 窗口内已切换过一次，暂不再切换（窗口剩余 %llds）",
                       carrier_display_name(rt->spec.mode), (win_until - (long long)now_ms()) / 1000);
             atomic_store_explicit(&rt->udp_candidates.switch_lock, 0, memory_order_release);
-            return 0;
+            return -1;   /* 策略拒绝，同样不能当作池子耗尽 */
         }
     }
 
@@ -6944,17 +6946,25 @@ static void *carrier_maintenance_thread(void *arg) {
 
         if (pending & MAINT_SWITCH_TCP) {
             log_msg("[TCP/H2] [%s] 后台维护线程触发顺位切换", carrier_display_name(rt->spec.mode));
-            if (!carrier_switch_next_ip(rt)) {
+            int src = carrier_switch_next_ip(rt);
+            if (src == 0) {
                 log_msg("[TCP/H2] [%s] 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护双轨候选池", carrier_display_name(rt->spec.mode));
                 rescan_needed = 1;
+            } else if (src < 0) {
+                debug_msg("[TCP/H2] [%s] 顺位切换被策略跳过（并发占用/窗口保护），不触发重扫", carrier_display_name(rt->spec.mode));
             }
         }
 
         if (pending & MAINT_SWITCH_UDP) {
             log_msg("[UDP/H3] [%s] 后台维护线程触发顺位切换", carrier_display_name(rt->spec.mode));
-            if (!carrier_switch_next_udp_ip(rt)) {
+            int src = carrier_switch_next_udp_ip(rt);
+            if (src == 0) {
                 log_msg("[UDP/H3] [%s] 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护双轨候选池", carrier_display_name(rt->spec.mode));
                 rescan_needed = 1;
+            } else if (src < 0) {
+                /* 关键：降级保持 / QoS 窗口 / 并发占用都会走到这里，
+                 * 「切换被策略拦下」绝不等于「池子耗尽」，否则会在限速期间反复触发全量重扫。 */
+                debug_msg("[UDP/H3] [%s] 顺位切换被策略跳过（限速保持/窗口保护/并发占用），不触发重扫", carrier_display_name(rt->spec.mode));
             }
         }
 
@@ -7464,7 +7474,8 @@ static socket_t listen_tcp(const char *addr) {
 #define UDP_STALL_PEAK_MIN 98304ULL        /* 5s 窗口下行峰值 >= 96KB（≈19KB/s）才算"跑过速度" */
 #define UDP_STALL_PEAK_RATIO 8ULL          /* 当前窗口低于峰值的 1/8 视为猝死 */
 #define UDP_STALL_PEAK_FLOOR 4096ULL       /* 低于 4KB/5s 才可能是猝死，避免低码率场景误判 */
-#define UDP_STALL_PEAK_AGE_MS 20000L       /* 峰值必须发生在 20s 内，否则视为"已正常空闲" */
+#define UDP_STALL_PEAK_AGE_MS 10000L       /* 峰值必须发生在 10s 内：再长就分不清"刚下完"与"被限速" */
+#define UDP_STALL_MIN_UP_FOR_COLLAPSE 512ULL /* 窗口内上行须 >= 512B：排除"下载结束后只剩保活包"的假猝死 */
 #define UDP_STALL_CONFIRM_MS 8000L         /* 第一段降级后 8s 仍无下行 → 第二段剔除会话 */
 
 /* 疑似 QoS 窗口的时长常量见文件顶部 QOS_WINDOW_* 定义（扫描器先用、会话管理后用，必须前置） */
@@ -7809,6 +7820,7 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
          * - 累计 2 次窒息告警即判定窒息低速剔除，直接触发顺位切换 (适配 Xray XMUX 单长连接复用)。 */
         int is_stalled = 0;
         int collapse_first_stage = 0;   /* 下行猝死第一段：只降级 IP / 影响新会话，不杀现有会话 */
+        int window_down_ok = 0;         /* 本 5s 窗口内下行是否达到「线路已恢复」门槛 */
         if (!is_blackhole && cur_ms - s->stall_snap_ms >= UDP_STALL_WINDOW_MS) {
             long win_s = (cur_ms - s->stall_snap_ms) / 1000;
             uint64_t d_up = (s->bytes_up >= s->stall_snap_up) ? (s->bytes_up - s->stall_snap_up) : 0;
@@ -7821,9 +7833,11 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
                 s->down_peak = d_down;
                 s->down_peak_ms = cur_ms;
             }
-            /* d_up > 0 是必要条件：完全静默（用户暂停/下载已结束）不能算猝死，
-             * 只有「客户端还在发包、却收不到数据」才是被限速的特征。 */
-            if (d_up > 0 && s->down_peak >= UDP_STALL_PEAK_MIN &&
+            /* 必要条件：客户端仍在「实打实地上行」（不是只剩保活包），却收不到数据。
+             * 只用 d_up > 0 太松——下载刚结束/暂停时客户端每隔几秒一个几十字节的保活包，
+             * 配合 20s 的峰值时效会把一条刚下完 68MB 的健康会话误判猝死并剔除。
+             * PTO 探测包单包 1200B，真卡死时 5s 窗口内一般仍有 1~3 个，>= 512B 是安全分界。 */
+            if (d_up >= UDP_STALL_MIN_UP_FOR_COLLAPSE && s->down_peak >= UDP_STALL_PEAK_MIN &&
                 (cur_ms - s->down_peak_ms) <= UDP_STALL_PEAK_AGE_MS) {
                 uint64_t thr = s->down_peak / UDP_STALL_PEAK_RATIO;
                 if (thr < UDP_STALL_PEAK_FLOOR) thr = UDP_STALL_PEAK_FLOOR;
@@ -7842,6 +7856,7 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
                 s->down_collapsed = 0;      /* 下行恢复（含用户重新开始下载）→ 撤销降级标记 */
                 s->down_collapse_ms = 0;
             }
+            if (d_down >= H3_RECOVER_DOWN_BYTES) window_down_ok = 1;
 
             /* 2. 上行型窒息检测：覆盖握手黑洞与上行重传型卡死 */
             if (d_up >= UDP_STALL_MIN_UP_BYTES && d_down < UDP_STALL_MAX_DOWN_BYTES && d_up >= d_down * 2) {
@@ -7880,15 +7895,17 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
         }
 
         /* ── 线路恢复检测 ──────────────────────────────────────────────
-         * 任一会话累计下行够量，说明限速窗口已经过去：解除降级保持并清零连续计数。
-         * 这是唯一可靠的恢复信号——探针小包在限速期间本来就能通，不能用它判恢复。 */
-        if (s->bytes_down >= H3_RECOVER_DOWN_BYTES &&
+         * 只用「本 5s 窗口内新增下行」判断，绝不能用会话累计值：
+         * 一条跑了很久的会话累计下行可能已经几十 MB，用累计值会导致刚进入降级就被立刻解除
+         * （旧实现就是这样，日志里出现「进入保持」和「解除保持」在同一秒）。
+         * 探针小包在限速期间本来就能通，也不能用探针判恢复。 */
+        if (window_down_ok &&
             atomic_load_explicit(&rt->h3_degraded_until_ms, memory_order_relaxed) != 0) {
             atomic_store_explicit(&rt->h3_degraded_until_ms, 0, memory_order_relaxed);
             atomic_store_explicit(&rt->h3_bh_streak, 0, memory_order_relaxed);
             atomic_store_explicit(&rt->qos_suspect_until_ms, 0, memory_order_relaxed);
-            log_msg("[UDP/H3] [%s] 检测到会话恢复下行 (累计 %llu KB)，解除线路级限速降级保持，恢复正常切换",
-                    carrier_display_name(rt->spec.mode), (unsigned long long)(s->bytes_down / 1024));
+            log_msg("[UDP/H3] [%s] 检测到线路恢复（5s 内新增下行达标），解除线路级限速降级保持，恢复正常切换",
+                    carrier_display_name(rt->spec.mode));
         }
 
         /* ── 降级保持 ──────────────────────────────────────────────────
