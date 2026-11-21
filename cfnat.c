@@ -823,7 +823,17 @@ static int terminal_has_color(FILE *stream) {
     return isatty(fd);
 }
 
-static void print_results_table_stream(FILE *stream, const Result *items, size_t count, long duration_sec) {
+/* 协议 tag 染色：与 vlog_line 里 [TCP/H2] / [UDP/H3] 的配色保持一致，方便一眼区分双协议列表 */
+static const char *proto_tag_color(const char *proto) {
+    if (!proto) return "";
+    if (strcmp(proto, "UDP/H3") == 0) return ANSI_MAGENTA ANSI_BOLD;
+    return ANSI_CYAN ANSI_BOLD;
+}
+
+/* 输出候选列表表格。
+ * proto: "TCP/H2" / "UDP/H3"（NULL 表示不打印协议 tag）；label: 栈名（可为 NULL）。 */
+static void print_results_table_ex(FILE *stream, const char *proto, const char *label,
+                                  const Result *items, size_t count, long duration_sec) {
     if (!items || count == 0 || !stream) return;
     pthread_mutex_lock(&g_log_mu);
     int use_color = terminal_has_color(stream);
@@ -838,7 +848,14 @@ static void print_results_table_stream(FILE *stream, const Result *items, size_t
     const char *c_bold = use_color ? ANSI_BOLD : "";
     const char *reset = use_color ? ANSI_RESET : "";
 
-    fprintf(stream, "\n%sIP 地址%s          | %s数据中心%s | %s地区%s          | %s城市%s        | %s延迟%s\n",
+    fprintf(stream, "\n");
+    if (proto) {
+        const char *pc = use_color ? proto_tag_color(proto) : "";
+        fprintf(stream, "%s[%s]%s%s", pc, proto, reset, c_bold);
+        if (label && label[0]) fprintf(stream, " [%s]", label);
+        fprintf(stream, " 候选列表 (共 %zu 个)%s\n", count, reset);
+    }
+    fprintf(stream, "%sIP 地址%s          | %s数据中心%s | %s地区%s          | %s城市%s        | %s延迟%s\n",
             c_ip, reset, c_colo, reset, c_reg, reset, c_city, reset, c_lat, reset);
     fprintf(stream, "-----------------+----------+---------------+---------------+---------\n");
     for (size_t i = 0; i < count; i++) {
@@ -854,15 +871,17 @@ static void print_results_table_stream(FILE *stream, const Result *items, size_t
                 r->city[0] ? r->city : "-",
                 lat_color, r->latency_ms, reset);
     }
-    fprintf(stream, "\n%s%s成功提取 %zu 个有效IP，耗时 %ld秒%s\n\n",
-            c_bold, c_val_green, count, duration_sec, reset);
+    if (proto && strcmp(proto, "UDP/H3") == 0) {
+        fprintf(stream, "\n%s%sH3 候选池共 %zu 个可用节点，耗时 %ld秒%s\n\n",
+                c_bold, c_val_green, count, duration_sec, reset);
+    } else {
+        fprintf(stream, "\n%s%s成功提取 %zu 个有效IP，耗时 %ld秒%s\n\n",
+                c_bold, c_val_green, count, duration_sec, reset);
+    }
     fflush(stream);
     pthread_mutex_unlock(&g_log_mu);
 }
 
-static void print_results_table(const Result *items, size_t count, long duration_sec) {
-    print_results_table_stream(stderr, items, count, duration_sec);
-}
 
 static long now_ms(void) {
 #ifdef _WIN32
@@ -5202,6 +5221,11 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
                 carrier_display_name(rt->spec.mode), udp_res.len, desired_count, probe_rounds,
                 udp_res.items[0].latency_ms, udp_res.items[0].ip,
                 now_ms() - total_start);
+        /* 与 TCP 扫描一致：精筛结束后输出格式化列表（带 [UDP/H3] 染色 tag），便于直接核对 H3 池子质量 */
+        if (g_cfg.log_level >= LOG_INFO) {
+            print_results_table_ex(stderr, "UDP/H3", carrier_display_name(rt->spec.mode),
+                                   udp_res.items, udp_res.len, (now_ms() - total_start) / 1000);
+        }
     } else {
         warn_msg("[%s] 遍历全部 %zu 个 TCP 候选 IP 均无合格 UDP/QUIC 节点（当前运营商可能阻断境外 UDP 443 或超时），绝不使用假节点降级，保持真实 UDP 状态等待自愈重扫",
                  carrier_display_name(rt->spec.mode), count);
@@ -5283,7 +5307,8 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
                     rt->udp_candidates.current_ip, udp_lat, rt->udp_candidates.len);
             if (g_cfg.log_level >= LOG_DEBUG) {
                 debug_msg("[UDP/H3] [%s] 已载入缓存的候选 IP 列表 (共 %zu 个):", carrier_display_name(rt->spec.mode), rt->udp_candidates.len);
-                print_results_table(rt->udp_candidates.items, rt->udp_candidates.len, 0);
+                print_results_table_ex(stderr, "UDP/H3", carrier_display_name(rt->spec.mode),
+                                       rt->udp_candidates.items, rt->udp_candidates.len, 0);
             }
             return 1;
         }
@@ -5388,10 +5413,12 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
     }
     if (g_cfg.log_level >= LOG_DEBUG) {
         debug_msg("[TCP/H2] [%s] 已载入缓存的候选 IP 列表 (共 %zu 个):", carrier_display_name(rt->spec.mode), rt->candidates.len);
-        print_results_table(rt->candidates.items, rt->candidates.len, 0);
+        print_results_table_ex(stderr, "TCP/H2", carrier_display_name(rt->spec.mode),
+                               rt->candidates.items, rt->candidates.len, 0);
         if (use_h3 && rt->udp_candidates.len > 0) {
             debug_msg("[UDP/H3] [%s] 已载入缓存的候选 IP 列表 (共 %zu 个):", carrier_display_name(rt->spec.mode), rt->udp_candidates.len);
-            print_results_table(rt->udp_candidates.items, rt->udp_candidates.len, 0);
+            print_results_table_ex(stderr, "UDP/H3", carrier_display_name(rt->spec.mode),
+                                   rt->udp_candidates.items, rt->udp_candidates.len, 0);
         }
     }
     return 1;
@@ -5504,8 +5531,10 @@ static ResultList scan_ips(StringList *ips, CidrList *cidrs, Config *cfg, BaiduP
     }
     if (rl.len > (size_t)cfg->ipnum) rl.len = (size_t)cfg->ipnum;
     log_msg("扫描完成: 有效候选 %zu 个，耗时 %ld 秒", rl.len, (now_ms() - ctx.scan_start_ms) / 1000);
-    if (cfg->log_level >= LOG_DEBUG) {
-        print_results_table(rl.items, rl.len, (now_ms() - ctx.scan_start_ms) / 1000);
+    /* CLI 模式自己在末尾打印结果表（还要附评分摘要），此处跳过避免同一张表打印两遍 */
+    if (cfg->log_level >= LOG_INFO && !cfg->cli_mode) {
+        print_results_table_ex(stderr, "TCP/H2", nullptr, rl.items, rl.len,
+                               (now_ms() - ctx.scan_start_ms) / 1000);
     }
     if (rl.len == 0 || cfg->log_level >= LOG_DEBUG) {
         log_msg("扫描统计: 连接失败 %zu，读取响应失败 %zu，缺少 CF-RAY %zu，数据中心过滤 %zu，状态码不匹配 %zu",
@@ -8953,7 +8982,8 @@ int main(int argc, char **argv) {
         }
     }
     if (!cache_hit || g_cfg.log_level >= LOG_DEBUG) {
-        print_results_table_stream(stdout, results.items, results.len, (now_ms() - start) / 1000);
+        print_results_table_ex(stdout, "TCP/H2", nullptr, results.items, results.len,
+                               (now_ms() - start) / 1000);
     }
     if (results.len > 0) {
         int use_color = terminal_has_color(stdout);
