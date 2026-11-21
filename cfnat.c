@@ -625,6 +625,10 @@ struct CarrierRuntime {
     atomic_llong last_tcp_active_ms;   /* 本栈最近一次 TCP 活跃时间戳 */
     atomic_llong last_udp_active_ms;   /* 本栈最近一次 UDP 活跃时间戳 */
     atomic_int last_udp_loss_pct;      /* 最近一轮 UDP 健康检查链路丢包率 (0..100, -1=未测) */
+    /* 疑似 QoS 窗口（探测侧与转发侧共享）：
+     * 到期前，扫描不把 IP 判死、健康检查不计失败、切换最多放行一次，避免双方同时误判造成空池与抖动。 */
+    atomic_llong qos_suspect_until_ms;
+    atomic_int qos_switch_used;        /* 本窗口内是否已执行过顺位切换（防连续切换抖动） */
     int udp_dirty;                 /* 会话表变更标记：未变更时直接复用 pollfd 数组，免除每轮链表遍历 */
     pthread_mutex_t udp_mu;
     atomic_int rescanning_lock;    /* 实例独享的自愈扫描互斥锁 (防跨协议阻塞) */
@@ -4843,14 +4847,16 @@ static size_t quic_probe_batch_multi_round(CarrierRuntime *rt,
     int *total_lat = calloc(cur_len, sizeof(int));
     int *min_lat = calloc(cur_len, sizeof(int));
     int *max_lat = calloc(cur_len, sizeof(int));
+    int *miss_cnt = calloc(cur_len, sizeof(int));   /* 连续无回包轮数：QoS 抖动常只丢一轮，不能首轮即熔断 */
     uint8_t *active = calloc(cur_len, sizeof(uint8_t));
-    if (!round_items || !idx_map || !ok_cnt || !total_lat || !min_lat || !max_lat || !active) {
+    if (!round_items || !idx_map || !ok_cnt || !total_lat || !min_lat || !max_lat || !miss_cnt || !active) {
         free(round_items);
         free(idx_map);
         free(ok_cnt);
         free(total_lat);
         free(min_lat);
         free(max_lat);
+        free(miss_cnt);
         free(active);
         if (cfnat_socket_valid(fd4)) close(fd4);
         if (cfnat_socket_valid(fd6)) close(fd6);
@@ -4888,9 +4894,11 @@ static size_t quic_probe_batch_multi_round(CarrierRuntime *rt,
                 total_lat[orig] += lat;
                 if (lat < min_lat[orig]) min_lat[orig] = lat;
                 if (lat > max_lat[orig]) max_lat[orig] = lat;
-            } else if (r == 0) {
-                /* 首轮无回包立即熔断，不再浪费后续 num-1 轮超时等待 */
-                active[orig] = 0;
+            } else {
+                /* 连续 2 轮无回包才熔断：QoS 窗口内首轮丢包极常见，原来「首轮即熔断」会把
+                 * 大量健康节点永久跳过，导致要测很多轮才能凑够 num 个（且误判率极高）。 */
+                miss_cnt[orig]++;
+                if (miss_cnt[orig] >= 2) active[orig] = 0;
             }
         }
     }
@@ -4901,12 +4909,15 @@ static size_t quic_probe_batch_multi_round(CarrierRuntime *rt,
         if (ok_cnt[i] <= 0) continue;
         any_resp++;
         int avg_lat = total_lat[i] / ok_cnt[i];
-        if (avg_lat <= 0 || (max_delay > 0 && avg_lat > max_delay)) continue;
+        /* 用「成功样本中的最小 RTT」判合格：单次被 QoS 排队（如 400ms）不应该淘汰一条本身很健康的链路；
+         * 延迟也取 min（best-case path RTT），比均值稳定，直接对症「某一轮延迟不好就被淘汰」。 */
+        int judge_lat = (min_lat[i] < 1000000) ? min_lat[i] : avg_lat;
+        if (judge_lat <= 0 || (max_delay > 0 && judge_lat > max_delay)) continue;
         if (ip_in_resultlist(udp_res, batch[i].res.ip)) continue;
 
         Result res = batch[i].res;
-        res.latency_ms = avg_lat;
-        res.ewma_latency = avg_lat;
+        res.latency_ms = judge_lat;
+        res.ewma_latency = judge_lat;
         res.jitter_ms = (ok_cnt[i] > 1 && max_lat[i] >= min_lat[i]) ? (max_lat[i] - min_lat[i]) : 0;
         res.probe_count = probe_rounds;
         res.success_count = ok_cnt[i];
@@ -4923,6 +4934,7 @@ static size_t quic_probe_batch_multi_round(CarrierRuntime *rt,
     free(total_lat);
     free(min_lat);
     free(max_lat);
+    free(miss_cnt);
     free(active);
     if (cfnat_socket_valid(fd4)) close(fd4);
     if (cfnat_socket_valid(fd6)) close(fd6);
@@ -4955,7 +4967,11 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
     if (sleep_interruptible_ms(500) != 0) return udp_res;
 
     /* 2. 金丝雀单点探路：批量开测前先单发验证头部节点，确认未触发 UDP QoS / 阻断 */
-    size_t canary_tries = count < 3 ? count : 3;
+    /* 金丝雀重试跨度必须覆盖典型 QoS 窗口（实测 5~30s）：
+     * 原来 3 次 × 800ms 只能覆盖 2.4s，窗口内必然放弃 → 空池 → 走 30s 起步的退避，一次窗口代价就是几分钟。
+     * 现改为 4 次探测、间隔 0.5/2/5.5s（共 ~8s，仅 4 个包），足以骑过短窗口。 */
+    static const int k_canary_gap_ms[4] = { 500, 2000, 5500, 0 };
+    size_t canary_tries = count < 4 ? count : 4;
     int canary_ok = 0;
     size_t canary_idx = 0;
     int canary_lat = 0;
@@ -4969,11 +4985,17 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
                       carrier_display_name(rt->spec.mode), tcp_results[c].ip, c_lat);
             break;
         }
-        if (c + 1 < canary_tries && sleep_interruptible_ms(800) != 0) return udp_res;
+        if (c + 1 < canary_tries) {
+            int gap = k_canary_gap_ms[c < 3 ? c : 3];
+            if (gap > 0 && sleep_interruptible_ms(gap) != 0) return udp_res;
+        }
     }
     if (!canary_ok) {
-        warn_msg("[UDP/H3] [%s] [金丝雀探路] 连续 %zu 个头部节点均无 UDP 回包（当前链路可能阻断 UDP 443 或处于 QoS 惩罚窗），提前止损等待自愈重扫",
-                 carrier_display_name(rt->spec.mode), canary_tries);
+        /* 整段链路都无回包 ≠ 没有可用节点，而是「疑似 QoS 窗口」：登记窗口，让健康检查/切换侧
+         * 在到期前不要把节点判死，也让上层知道这次空池是窗口造成的而非池子质量下降。 */
+        atomic_store_explicit(&rt->qos_suspect_until_ms, (long long)(now_ms() + QOS_WINDOW_SCAN_MS), memory_order_relaxed);
+        warn_msg("[UDP/H3] [%s] [金丝雀探路] 连续 %zu 个头部节点均无 UDP 回包（疑似 QoS 惩罚窗/链路阻断），登记 %lds 窗口后等待自愈重扫",
+                 carrier_display_name(rt->spec.mode), canary_tries, (long)(QOS_WINDOW_SCAN_MS / 1000));
         return udp_res;
     }
 
@@ -5035,27 +5057,29 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
             size_t scan_limit = count < desired_count ? count : desired_count;
             for (size_t i = 0; i < scan_limit && udp_res.len < desired_count && atomic_load(&g_running); i++) {
                 if (i > 0 && sleep_interruptible_ms(150) != 0) break;
-                int ok_cnt = 0, total_lat = 0, min_lat = 1000000, max_lat = 0;
+                int ok_cnt = 0, total_lat = 0, min_lat = 1000000, max_lat = 0, miss = 0;
                 for (int r = 0; r < probe_rounds && atomic_load(&g_running); r++) {
                     if (r > 0 && sleep_interruptible_ms(120) != 0) break;
                     int lat = 0;
                     if (quic_probe_ip(tcp_results[i].ip, target_port, timeout_ms, &lat)) {
                         ok_cnt++;
                         total_lat += lat;
-                        if (lat < min_lat) min_lat = lat;
-                        if (lat > max_lat) max_lat = lat;
-                    } else if (r == 0) {
-                        break;
+                        min_lat = (lat < min_lat) ? lat : min_lat;
+                        max_lat = (lat > max_lat) ? lat : max_lat;
+                        miss = 0;
+                    } else if (++miss >= 2) {
+                        break;   /* 与批次模式一致：连续 2 轮无回包才放弃，单轮抖动不算死 */
                     }
                 }
                 if (ok_cnt > 0) {
                     consec_miss = 0;
                     stage1_any_resp++;
                     int avg_lat = total_lat / ok_cnt;
-                    if (avg_lat > 0 && (max_delay <= 0 || avg_lat <= max_delay) && !ip_in_resultlist(&udp_res, tcp_results[i].ip)) {
+                    int judge_lat = (min_lat < 1000000) ? min_lat : avg_lat;
+                    if (judge_lat > 0 && (max_delay <= 0 || judge_lat <= max_delay) && !ip_in_resultlist(&udp_res, tcp_results[i].ip)) {
                         Result res = tcp_results[i];
-                        res.latency_ms = avg_lat;
-                        res.ewma_latency = avg_lat;
+                        res.latency_ms = judge_lat;
+                        res.ewma_latency = judge_lat;
                         res.jitter_ms = (ok_cnt > 1 && max_lat >= min_lat) ? (max_lat - min_lat) : 0;
                         res.probe_count = probe_rounds;
                         res.success_count = ok_cnt;
@@ -5083,6 +5107,15 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
             break;
         }
         if (added == 0 && batch_resp == 0) {
+            /* 一整批（>=4 个）同时 0 回包，几乎不可能是这些 IP 一起坏掉，判为「疑似 QoS 窗口」：
+             * 登记窗口，让健康检查在到期前不把节点判死（窗口内整段链路都不通，探针失败没有归因价值）。 */
+            if (cur_len >= 4) {
+                long long now_v = (long long)now_ms();
+                long long want = now_v + QOS_WINDOW_SCAN_MS;
+                if (atomic_load_explicit(&rt->qos_suspect_until_ms, memory_order_relaxed) < want) {
+                    atomic_store_explicit(&rt->qos_suspect_until_ms, want, memory_order_relaxed);
+                }
+            }
             debug_msg("[%s] 第 %zu~%zu 个 TCP 候选 IP 全无 UDP 回包，向后滑动选取下一批...",
                       carrier_display_name(rt->spec.mode), offset + 1, offset + cur_len);
         }
@@ -6112,21 +6145,49 @@ static void *switch_probe_worker(void *arg) {
     return nullptr;
 }
 
-static void sort_switch_candidates(char ips[][MAX_IP_LEN], size_t *indices, int *scores, size_t count) {
+/* 判断两个 IP 是否属于同一子网（IPv6 按 /64，IPv4 按 /24）。
+ * 同一 /64 内的 Cloudflare 候选往往落在同一台边缘/同一条上游路径上，QoS、拥塞与限速
+ * 通常同时作用于整个前缀——切换时若还留在同一前缀，等于没换路径。 */
+static int ip_same_subnet(const char *a, const char *b) {
+    if (!a || !b || !a[0] || !b[0]) return 0;
+    if (strchr(a, ':') || strchr(b, ':')) {
+        struct in6_addr x, y;
+        if (inet_pton(AF_INET6, a, &x) != 1 || inet_pton(AF_INET6, b, &y) != 1) return 0;
+        return memcmp(&x, &y, 8) == 0;   /* 前 64 位 */
+    }
+    struct in_addr x, y;
+    if (inet_pton(AF_INET, a, &x) != 1 || inet_pton(AF_INET, b, &y) != 1) return 0;
+    /* 按内存字节序比较前 3 字节，避免大小端差异导致 /24 判断错误 */
+    const unsigned char *pa = (const unsigned char *)&x.s_addr;
+    const unsigned char *pb = (const unsigned char *)&y.s_addr;
+    return pa[0] == pb[0] && pa[1] == pb[1] && pa[2] == pb[2];
+}
+
+/* 切换候选排序：先按「是否与当前 IP 同子网」分组（不同子网优先），组内再按综合分升序。
+ * 这样在池里存在跨子网候选时，切换会真正换一条路径；只有全都同子网才退化为纯按分排序。 */
+static void sort_switch_candidates(const char *cur_ip, char ips[][MAX_IP_LEN], size_t *indices, int *scores, size_t count) {
+    if (count > 64) count = 64;
+    uint8_t same[64];
+    for (size_t i = 0; i < count; i++) same[i] = ip_same_subnet(ips[i], cur_ip) ? 1 : 0;
     for (size_t i = 1; i < count; i++) {
         int key_sc = scores[i];
         size_t key_idx = indices[i];
+        uint8_t key_same = same[i];
         char key_ip[MAX_IP_LEN];
         memcpy(key_ip, ips[i], MAX_IP_LEN);
         size_t j = i;
-        while (j > 0 && scores[j - 1] > key_sc) {
+        while (j > 0) {
+            if (same[j - 1] < key_same) break;                                   /* 不同子网优先：前驱更"同族"则停 */
+            if (same[j - 1] == key_same && scores[j - 1] <= key_sc) break;       /* 同组内按分数升序 */
             scores[j] = scores[j - 1];
             indices[j] = indices[j - 1];
+            same[j] = same[j - 1];
             memcpy(ips[j], ips[j - 1], MAX_IP_LEN);
             j--;
         }
         scores[j] = key_sc;
         indices[j] = key_idx;
+        same[j] = key_same;
         memcpy(ips[j], key_ip, MAX_IP_LEN);
     }
 }
@@ -6181,7 +6242,11 @@ static int carrier_switch_next_ip(CarrierRuntime *rt) {
         return 0;
     }
 
-    sort_switch_candidates(check_ips, check_indices, check_scores, count);
+    char cur_ip[MAX_IP_LEN] = {0};
+    pthread_mutex_lock(&rt->candidates.mu);
+    snprintf(cur_ip, sizeof(cur_ip), "%s", rt->candidates.current_ip);
+    pthread_mutex_unlock(&rt->candidates.mu);
+    sort_switch_candidates(cur_ip, check_ips, check_indices, check_scores, count);
 
     /* 首波 2 路快探（降低等待长尾），后续每波 4 路并发探测，择最低延迟胜出 */
     for (size_t base = 0, step_w = 2; base < count && atomic_load(&g_running); base += step_w, step_w = 4) {
@@ -6327,7 +6392,24 @@ CFNAT_NODISCARD static int carrier_switch_next_udp_ip(CarrierRuntime *rt) {
         return 0;
     }
 
-    sort_switch_candidates(check_ips, check_indices, check_scores, count);
+    /* QoS 窗口内最多放行一次切换：同一个窗口里连续切换只会把健康的会话反复拆掉。
+     * 窗口登记时会把额度归还（qos_switch_used=0），所以恢复后不受影响。 */
+    {
+        long long win_until = atomic_load_explicit(&rt->qos_suspect_until_ms, memory_order_relaxed);
+        if ((long long)now_ms() < win_until &&
+            atomic_load_explicit(&rt->qos_switch_used, memory_order_relaxed) != 0) {
+            debug_msg("[UDP/H3] [%s] 疑似 QoS 窗口内已切换过一次，暂不再切换（窗口剩余 %llds）",
+                      carrier_display_name(rt->spec.mode), (win_until - (long long)now_ms()) / 1000);
+            atomic_store_explicit(&rt->udp_candidates.switch_lock, 0, memory_order_release);
+            return 0;
+        }
+    }
+
+    char cur_ip[MAX_IP_LEN] = {0};
+    pthread_mutex_lock(&rt->udp_candidates.mu);
+    snprintf(cur_ip, sizeof(cur_ip), "%s", rt->udp_candidates.current_ip);
+    pthread_mutex_unlock(&rt->udp_candidates.mu);
+    sort_switch_candidates(cur_ip, check_ips, check_indices, check_scores, count);
 
     /* 首波 2 路快探，后续每波 4 路并发 QUIC 探测，择最低延迟胜出 */
     for (size_t base = 0, step_w = 2; base < count && atomic_load(&g_running); base += step_w, step_w = 4) {
@@ -6896,7 +6978,8 @@ static void *carrier_udp_health_thread(void *arg) {
     CarrierRuntime *rt = (CarrierRuntime *)arg;
     int fail = 0;
     int consecutive_success = 0;
-    int empty_backoff_s = 30; /* H3 空池轻量自愈退避: 30s -> 60s -> 120s -> 240s -> 300s */
+    int empty_backoff_s = 5; /* H3 空池轻量自愈退避: 5s -> 10s -> 20s -> 40s -> 60s -> 120s
+                              * 起点必须短于常见 QoS 窗口（5~30s），否则一次 10s 的窗口要等 30s+ 才复测。 */
     long last_log = 0;
     while (atomic_load(&g_running)) {
         char cur_ip[MAX_IP_LEN] = {0};
@@ -6938,7 +7021,7 @@ static void *carrier_udp_health_thread(void *arg) {
                 } else {
                     free(cached_tcp.items);
                     carrier_trigger_maintenance(rt, MAINT_RESCAN);
-                    empty_backoff_s = (empty_backoff_s < 150) ? (empty_backoff_s * 2) : 300;
+                    empty_backoff_s = (empty_backoff_s < 60) ? (empty_backoff_s * 2) : 120;
                     continue;
                 }
             }
@@ -6978,11 +7061,11 @@ static void *carrier_udp_health_thread(void *arg) {
                         log_msg("[UDP/H3] [%s] 空池自愈恢复成功: 捕获 %zu 个 H3 候选，最优 IP: %s (延迟 %d ms)",
                                 carrier_display_name(rt->spec.mode), udp_res.len,
                                 udp_res.items[0].ip, udp_res.items[0].latency_ms);
-                        empty_backoff_s = 30;
+                        empty_backoff_s = 5;
                         fail = 0;
                         consecutive_success = 0;
                     } else {
-                        empty_backoff_s = (empty_backoff_s < 150) ? (empty_backoff_s * 2) : 300;
+                        empty_backoff_s = (empty_backoff_s < 60) ? (empty_backoff_s * 2) : 120;
                     }
                     atomic_store_explicit(&rt->rescanning_lock, 0, memory_order_release);
                 }
@@ -7002,7 +7085,7 @@ static void *carrier_udp_health_thread(void *arg) {
                         atomic_store(&rt->udp_candidates.cache_valid, 1);
                         log_msg("[UDP/H3] [%s] 空池自愈已复用直连 H3 缓存，共 %zu 个节点",
                                 carrier_display_name(rt->spec.mode), fb.len);
-                        empty_backoff_s = 30;
+                        empty_backoff_s = 5;
                         fail = 0;
                         consecutive_success = 0;
                         atomic_store_explicit(&rt->rescanning_lock, 0, memory_order_release);
@@ -7013,19 +7096,19 @@ static void *carrier_udp_health_thread(void *arg) {
                     free(fb.items);
                     debug_msg("[UDP/H3] [%s] 空池轻量试探仍无回包，%ds 后再次退避试探",
                               carrier_display_name(rt->spec.mode),
-                              (empty_backoff_s < 150) ? (empty_backoff_s * 2) : 300);
-                    empty_backoff_s = (empty_backoff_s < 150) ? (empty_backoff_s * 2) : 300;
+                              (empty_backoff_s < 60) ? (empty_backoff_s * 2) : 120);
+                    empty_backoff_s = (empty_backoff_s < 60) ? (empty_backoff_s * 2) : 120;
                 }
             } else {
                 debug_msg("[UDP/H3] [%s] 空池轻量试探仍无回包，%ds 后再次退避试探",
                           carrier_display_name(rt->spec.mode),
-                          (empty_backoff_s < 150) ? (empty_backoff_s * 2) : 300);
-                empty_backoff_s = (empty_backoff_s < 150) ? (empty_backoff_s * 2) : 300;
+                          (empty_backoff_s < 60) ? (empty_backoff_s * 2) : 120);
+                empty_backoff_s = (empty_backoff_s < 60) ? (empty_backoff_s * 2) : 120;
             }
             free(tcp_copy);
             continue;
         }
-        empty_backoff_s = 30;
+        empty_backoff_s = 5;
 
         /* 活跃态：每轮 3 包（间隔 50ms）测丢包，丢包 >= 2/3 (67%) 判异常以抓出半死限速节点；闲置态：单包轻检 */
         long long now_u = (long long)now_ms();
@@ -7060,6 +7143,15 @@ static void *carrier_udp_health_thread(void *arg) {
 
         int ok = active_now ? (ok_cnt >= 2) : (ok_cnt >= 1);
         if (!ok) {
+            long long win_until = atomic_load_explicit(&rt->qos_suspect_until_ms, memory_order_relaxed);
+            long long now_v = (long long)now_ms();
+            if (now_v < win_until) {
+                /* 疑似 QoS 窗口内：此刻整段链路都不通，探针失败不能作为「这个 IP 坏了」的证据。
+                 * 只记录、不改状态，避免健康检查把节点判死、与转发侧的下行猝死判定互相加剧。 */
+                debug_msg("[UDP/H3] [%s] 疑似 QoS 窗口内检查失败，暂不计入节点失败: %s (窗口剩余 %llds)",
+                          carrier_display_name(rt->spec.mode), ip, (win_until - now_v) / 1000);
+                continue;
+            }
             fail++;
             consecutive_success = 0;
             atomic_store(&rt->udp_candidates.cache_valid, 0);
@@ -7085,6 +7177,9 @@ static void *carrier_udp_health_thread(void *arg) {
                          carrier_display_name(rt->spec.mode), fail, ip);
             }
         } else {
+            /* 探针恢复成功 = QoS 窗口结束：清除窗口并归还「本窗口切换额度」 */
+            atomic_store_explicit(&rt->qos_suspect_until_ms, 0, memory_order_relaxed);
+            atomic_store_explicit(&rt->qos_switch_used, 0, memory_order_relaxed);
             fail = 0;
             consecutive_success++;
             atomic_store(&rt->udp_candidates.cache_valid, 1);
@@ -7297,6 +7392,25 @@ static socket_t listen_tcp(const char *addr) {
 #define UDP_STALL_MAX_DOWN_BYTES 8192ULL
 #define UDP_STALL_CLEAR_DOWN_BYTES 32768ULL
 #define UDP_STALL_MAX_STRIKES 2
+
+/* ── 下行猝死检测（QoS 定向限速下行大流量）────────────────────────────────
+ * 背景：QUIC VN 探针是「1200B 上行 + 27B 回包」，令牌桶对孤立小包几乎不设限，
+ * 因此探针永远显示 80ms，而实际下行被压到几百 kbps。下行容量无法用探针测量，
+ * 只能用「会话真实字节」作为传感器：以会话自身的历史峰值为基准判断「猝死」。
+ *
+ * 判据（窗口 5s，一次性强证据，不必等两轮）：
+ *   d_down < max(FLOOR, peak / RATIO)  且  peak >= PEAK_MIN  且  peak 距今 <= PEAK_AGE_MS
+ * 三个约束分别排除：正常低速会话 / 从没跑起来过的会话 / 用户主动停止下载（空闲）。 */
+#define UDP_STALL_PEAK_MIN 98304ULL        /* 5s 窗口下行峰值 >= 96KB（≈19KB/s）才算"跑过速度" */
+#define UDP_STALL_PEAK_RATIO 8ULL          /* 当前窗口低于峰值的 1/8 视为猝死 */
+#define UDP_STALL_PEAK_FLOOR 4096ULL       /* 低于 4KB/5s 才可能是猝死，避免低码率场景误判 */
+#define UDP_STALL_PEAK_AGE_MS 20000L       /* 峰值必须发生在 20s 内，否则视为"已正常空闲" */
+#define UDP_STALL_CONFIRM_MS 8000L         /* 第一段降级后 8s 仍无下行 → 第二段剔除会话 */
+
+/* 疑似 QoS 窗口：探测侧与转发侧共享的状态，避免双方各自把「窗口内的失败」当节点故障 */
+#define QOS_WINDOW_DEFAULT_MS 30000L
+#define QOS_WINDOW_SCAN_MS 8000L
+
 #define UDP_MAX_SESSIONS 1024
 #define UDP_BUF_SIZE 65536
 
@@ -7318,6 +7432,11 @@ struct UdpSession {
     uint64_t stall_snap_up;
     uint64_t stall_snap_down;
     int stall_count;
+    /* 下行猝死：历史峰值 + 第一段降级时刻（用于 8s 后二次确认） */
+    uint64_t down_peak;
+    long down_peak_ms;
+    long down_collapse_ms;
+    int down_collapsed;
     struct UdpSession *next;
     struct UdpSession *hash_next;
 };
@@ -7580,6 +7699,10 @@ static UdpSession *find_or_create_udp_session_sa(CarrierRuntime *rt, const struc
     new_sess->stall_snap_up = 0;
     new_sess->stall_snap_down = 0;
     new_sess->stall_count = 0;
+    new_sess->down_peak = 0;
+    new_sess->down_peak_ms = new_sess->created_ms;
+    new_sess->down_collapse_ms = 0;
+    new_sess->down_collapsed = 0;
     new_sess->sess_id = atomic_fetch_add(&g_udp_sess_seq, 1) + 1;
     rt->udp_session_count++;
     atomic_store_explicit(&rt->active_udp_conns, (int)rt->udp_session_count, memory_order_relaxed);
@@ -7605,6 +7728,7 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
     int should_switch_udp = 0;
     int switch_by_blackhole = 0;
     int switch_by_stall = 0;
+    int switch_by_collapse = 0;      /* 下行猝死第一段触发的切换（速率崩塌，非完全无响应） */
     int pruned_count = 0;
     pthread_mutex_lock(&rt->udp_mu);
     UdpSession *prev = nullptr;
@@ -7619,10 +7743,42 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
          * - 仅当下行真正恢复 (>= 32KB/窗口) 或完全静默 (上行=0) 时才清零计数，灰区 (退避小包/微量漏水) 保留计数防误重置；
          * - 累计 2 次窒息告警即判定窒息低速剔除，直接触发顺位切换 (适配 Xray XMUX 单长连接复用)。 */
         int is_stalled = 0;
+        int collapse_first_stage = 0;   /* 下行猝死第一段：只降级 IP / 影响新会话，不杀现有会话 */
         if (!is_blackhole && cur_ms - s->stall_snap_ms >= UDP_STALL_WINDOW_MS) {
             long win_s = (cur_ms - s->stall_snap_ms) / 1000;
             uint64_t d_up = (s->bytes_up >= s->stall_snap_up) ? (s->bytes_up - s->stall_snap_up) : 0;
             uint64_t d_down = (s->bytes_down >= s->stall_snap_down) ? (s->bytes_down - s->stall_snap_down) : 0;
+
+            /* 3. 下行猝死检测：以会话自身历史峰值为基准，与上行字节无关。
+             * 这是唯一能抓住「探针 80ms、实际下载 0」的判据——探针只有 1200B 上行 + 27B 回包，
+             * 令牌桶对孤立小包不设限，而下行 bulk 会被直接压死。 */
+            if (d_down > s->down_peak) {
+                s->down_peak = d_down;
+                s->down_peak_ms = cur_ms;
+            }
+            /* d_up > 0 是必要条件：完全静默（用户暂停/下载已结束）不能算猝死，
+             * 只有「客户端还在发包、却收不到数据」才是被限速的特征。 */
+            if (d_up > 0 && s->down_peak >= UDP_STALL_PEAK_MIN &&
+                (cur_ms - s->down_peak_ms) <= UDP_STALL_PEAK_AGE_MS) {
+                uint64_t thr = s->down_peak / UDP_STALL_PEAK_RATIO;
+                if (thr < UDP_STALL_PEAK_FLOOR) thr = UDP_STALL_PEAK_FLOOR;
+                if (d_down < thr) {
+                    if (!s->down_collapsed) {
+                        s->down_collapsed = 1;
+                        s->down_collapse_ms = cur_ms;
+                        collapse_first_stage = 1;
+                    } else if (cur_ms - s->down_collapse_ms >= UDP_STALL_CONFIRM_MS) {
+                        /* 第二段：降级后 8s 仍无下行，说明客户端自身 PTO/idle 也没能恢复 → 剔除会话 */
+                        is_stalled = 1;
+                    }
+                }
+            }
+            if (d_down >= UDP_STALL_CLEAR_DOWN_BYTES) {
+                s->down_collapsed = 0;      /* 下行恢复（含用户重新开始下载）→ 撤销降级标记 */
+                s->down_collapse_ms = 0;
+            }
+
+            /* 2. 上行型窒息检测：覆盖握手黑洞与上行重传型卡死 */
             if (d_up >= UDP_STALL_MIN_UP_BYTES && d_down < UDP_STALL_MAX_DOWN_BYTES && d_up >= d_down * 2) {
                 s->stall_count++;
                 if (s->stall_count >= UDP_STALL_MAX_STRIKES) {
@@ -7637,12 +7793,28 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
             } else if (d_down >= UDP_STALL_CLEAR_DOWN_BYTES || d_up == 0) {
                 s->stall_count = 0;
             }
+
+            if (collapse_first_stage) {
+                long long now_v = (long long)now_ms();
+                if (atomic_load_explicit(&rt->qos_suspect_until_ms, memory_order_relaxed) <= now_v) {
+                    atomic_store_explicit(&rt->qos_switch_used, 0, memory_order_relaxed); /* 新窗口：归还一次切换额度 */
+                }
+                atomic_store_explicit(&rt->qos_suspect_until_ms, now_v + QOS_WINDOW_DEFAULT_MS, memory_order_relaxed);
+                /* 单位统一为 KB/s，便于直接对照实际下载速度 */
+                double cur_kbps = (win_s > 0) ? ((double)d_down / 1024.0 / (double)win_s) : 0.0;
+                double peak_kbps = (double)s->down_peak / 1024.0 / (double)(UDP_STALL_WINDOW_MS / 1000);
+                long peak_age_s = (cur_ms - s->down_peak_ms) / 1000;
+                log_msg("[UDP/H3] #%llu [%s] [下行猝死] 目标 %s: %.1f KB/s (峰值 %.1f KB/s, %lds 前) → 标记降级，新会话优先切走（现有会话保留 8s 观察）",
+                        s->sess_id, carrier_display_name(rt->spec.mode), s->target_ip,
+                        cur_kbps, peak_kbps, peak_age_s > 0 ? peak_age_s : 0);
+            }
+
             s->stall_snap_ms = cur_ms;
             s->stall_snap_up = s->bytes_up;
             s->stall_snap_down = s->bytes_down;
         }
 
-        if (is_blackhole || is_stalled) {
+        if (is_blackhole || is_stalled || collapse_first_stage) {
             pthread_mutex_lock(&rt->udp_candidates.mu);
             for (size_t i = 0; i < rt->udp_candidates.len; i++) {
                 if (strcmp(rt->udp_candidates.items[i].ip, s->target_ip) == 0) {
@@ -7652,12 +7824,24 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
                 }
             }
             if (strcmp(rt->udp_candidates.current_ip, s->target_ip) == 0) {
-                if (is_stalled || atomic_fetch_add_explicit(&rt->udp_candidates.fast_fail_count, 1, memory_order_relaxed) + 1 >= 2) {
+                if (is_stalled) {
                     atomic_store_explicit(&rt->udp_candidates.fast_fail_count, 0, memory_order_relaxed);
                     atomic_store(&rt->udp_candidates.cache_valid, 0);
                     should_switch_udp = 1;
                     if (is_blackhole) switch_by_blackhole = 1;
-                    if (is_stalled) switch_by_stall = 1;
+                    if (s->down_collapsed) switch_by_collapse = 1;  /* 二段确认的下行猝死，日志按猝死归因 */
+                    switch_by_stall = 1;
+                } else if (collapse_first_stage) {
+                    /* 第一段：同一 QoS 窗口内最多切换一次，避免「切过去—再切回来」的抖动 */
+                    if (atomic_exchange_explicit(&rt->qos_switch_used, 1, memory_order_relaxed) == 0) {
+                        atomic_store(&rt->udp_candidates.cache_valid, 0);
+                        should_switch_udp = 1;
+                        switch_by_collapse = 1;
+                    }
+                } else if (atomic_fetch_add_explicit(&rt->udp_candidates.fast_fail_count, 1, memory_order_relaxed) + 1 >= 2) {
+                    atomic_store_explicit(&rt->udp_candidates.fast_fail_count, 0, memory_order_relaxed);
+                    atomic_store(&rt->udp_candidates.cache_valid, 0);
+                    should_switch_udp = 1;
                 }
             }
             pthread_mutex_unlock(&rt->udp_candidates.mu);
@@ -7685,7 +7869,9 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
             char up_s[32] = {0}, down_s[32] = {0};
             format_bytes(del->bytes_up, up_s, sizeof(up_s));
             format_bytes(del->bytes_down, down_s, sizeof(down_s));
-            const char *close_reason = is_blackhole ? "黑洞剔除" : (is_stalled ? "窒息低速剔除" : "空闲超时");
+            const char *close_reason = is_blackhole ? "黑洞剔除"
+                                     : del->down_collapsed ? "下行猝死剔除"
+                                     : (is_stalled ? "窒息低速剔除" : "空闲超时");
             conn_msg("[UDP/H3] #%llu [%s] 客户端会话关闭 (%s, 存活 %lds, 上行 %s, 下行 %s, 当前活跃: %d)",
                      del->sess_id, carrier_display_name(rt->spec.mode),
                      close_reason,
@@ -7710,11 +7896,13 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
         rt->udp_down_drop = 0;
     }
     if (should_switch_udp && atomic_load(&g_running)) {
-        const char *switch_reason = (switch_by_stall && !switch_by_blackhole)
-                                        ? "检测到上游连续窒息低速 (可能受 UDP QoS 极低速限流)"
-                                        : (switch_by_stall && switch_by_blackhole)
-                                              ? "检测到上游连续无回包或窒息低速 (可能受 UDP QoS 限流/阻断)"
-                                              : "检测到上游连续无回包响应 (可能受 UDP QoS 阻断)";
+        const char *switch_reason = switch_by_collapse
+                                        ? "检测到下行速率崩塌 (探针正常但下载被限速，疑似 QoS 定向压制下行)"
+                                        : (switch_by_stall && !switch_by_blackhole)
+                                              ? "检测到上游连续窒息低速 (可能受 UDP QoS 极低速限流)"
+                                              : (switch_by_stall && switch_by_blackhole)
+                                                    ? "检测到上游连续无回包或窒息低速 (可能受 UDP QoS 限流/阻断)"
+                                                    : "检测到上游连续无回包响应 (可能受 UDP QoS 阻断)";
         log_msg("[UDP/H3] [%s] %s，触发顺位切换", carrier_display_name(rt->spec.mode), switch_reason);
         carrier_trigger_maintenance(rt, MAINT_SWITCH_UDP);
     }
@@ -8320,6 +8508,8 @@ int main(int argc, char **argv) {
             atomic_init(&rt->last_tcp_active_ms, 0);
             atomic_init(&rt->last_udp_active_ms, 0);
             atomic_init(&rt->last_udp_loss_pct, -1);
+            atomic_init(&rt->qos_suspect_until_ms, 0);
+            atomic_init(&rt->qos_switch_used, 0);
             atomic_init(&rt->maint_pending, 0);
             pthread_mutex_init(&rt->maint_mu, nullptr);
             pthread_cond_init(&rt->maint_cv, nullptr);
