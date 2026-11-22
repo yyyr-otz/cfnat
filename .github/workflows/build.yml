@@ -1,0 +1,315 @@
+name: Build cfnat C (All Platforms & Architectures)
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release 标签版本（例如 v0.2.0，留空则自动从 cfnat.c 提取版本）'
+        required: false
+        default: ''
+      prerelease:
+        description: '是否标记为 Pre-release 预发布'
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_FILE: cfnat.c
+  ZIG_VERSION: 0.15.1
+  FREEBSD_VER: 14.2-RELEASE
+
+jobs:
+  build-ubuntu:
+    name: Build Ubuntu Pool (Android, FreeBSD & RISC/MIPS/PPC/s390x)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ github.token }}
+
+      - name: Setup Android NDK
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: true
+
+      - name: Setup Zig & FreeBSD Sysroots
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64)        zig_arch="x86_64" ;;
+            aarch64|arm64) zig_arch="aarch64" ;;
+            *) echo "Unsupported runner arch: $(uname -m)" >&2; exit 1 ;;
+          esac
+
+          zig_dir="zig-${zig_arch}-linux-${ZIG_VERSION}"
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/${zig_dir}.tar.xz" -o zig.tar.xz
+          tar -xf zig.tar.xz
+          echo "$PWD/$zig_dir" >> "$GITHUB_PATH"
+
+          # 仅解压 FreeBSD 头文件与系统库，用于 zig cc 交叉编译
+          for arch in amd64 arm64; do
+            mkdir -p "/tmp/freebsd-sysroot/${arch}"
+            curl -fsSL "https://download.freebsd.org/releases/${arch}/${FREEBSD_VER}/base.txz" -o "/tmp/fbsd-${arch}.txz"
+            tar -xJf "/tmp/fbsd-${arch}.txz" -C "/tmp/freebsd-sysroot/${arch}" ./usr/include ./usr/lib ./lib
+            rm -f "/tmp/fbsd-${arch}.txz"
+          done
+
+      - name: Build 12 targets concurrently
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig version
+          mkdir -p release /tmp/build-logs /tmp/zig-cache
+
+          NDK_BIN="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
+          STRIP="${NDK_BIN}/llvm-strip"
+
+          names=()
+          pids=()
+
+          launch() {
+            local name="$1"
+            shift
+            while [ "$(jobs -rp | wc -l)" -ge 4 ]; do sleep 0.2; done
+            names+=("$name")
+            (
+              set -euo pipefail
+              "$@"
+            ) >"/tmp/build-logs/${name}.log" 2>&1 &
+            pids+=("$!")
+          }
+
+          build_zig_linux() {
+            local name="$1" target="$2" out="$3"
+            ZIG_LOCAL_CACHE_DIR="/tmp/zig-cache/${name}/local" \
+            ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/${name}/global" \
+            zig cc -target "$target" -O2 -pipe -std=c23 \
+              -Wall -Wextra -Wno-unused-parameter \
+              "$SOURCE_FILE" -o "release/${out}" \
+              -pthread -static -s
+          }
+
+          build_zig_freebsd() {
+            local name="$1" target="$2" sysarch="$3" out="$4"
+            local sr="/tmp/freebsd-sysroot/${sysarch}"
+            ZIG_LOCAL_CACHE_DIR="/tmp/zig-cache/${name}/local" \
+            ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/${name}/global" \
+            zig cc -target "$target" --sysroot "$sr" -O2 -pipe -std=c23 \
+              -Wall -Wextra -Wno-unused-parameter \
+              -I"${sr}/usr/include" -L"${sr}/usr/lib" -L"${sr}/lib" \
+              "$SOURCE_FILE" -o "release/${out}" \
+              -pthread -s
+          }
+
+          build_android() {
+            local target="$1" api="$2" out="$3"
+            "${NDK_BIN}/${target}${api}-clang" \
+              -O2 -pipe -std=c23 -Wall -Wextra -Wno-unused-parameter \
+              -D__ANDROID__ \
+              "$SOURCE_FILE" -o "release/${out}" \
+              -pthread
+            "$STRIP" "release/${out}"
+          }
+
+          launch android-arm64  build_android     aarch64-linux-android 24       cfnat-android-arm64
+          launch android-amd64  build_android     x86_64-linux-android  24       cfnat-android-amd64
+          launch freebsd-amd64  build_zig_freebsd freebsd-amd64 x86_64-freebsd.14  amd64 cfnat-freebsd-amd64
+          launch freebsd-arm64  build_zig_freebsd freebsd-arm64 aarch64-freebsd.14 arm64 cfnat-freebsd-arm64
+          launch linux-mips     build_zig_linux   linux-mips     mips-linux-musleabi     cfnat-linux-mips
+          launch linux-mipsel   build_zig_linux   linux-mipsel   mipsel-linux-musleabi   cfnat-linux-mipsel
+          launch linux-mips64   build_zig_linux   linux-mips64   mips64-linux-muslabi64  cfnat-linux-mips64
+          launch linux-mips64el build_zig_linux   linux-mips64el mips64el-linux-muslabi64 cfnat-linux-mips64el
+          launch linux-ppc64    build_zig_linux   linux-ppc64    powerpc64-linux-musl    cfnat-linux-ppc64
+          launch linux-ppc64le  build_zig_linux   linux-ppc64le  powerpc64le-linux-musl  cfnat-linux-ppc64le
+          launch linux-riscv64  build_zig_linux   linux-riscv64  riscv64-linux-musl      cfnat-linux-riscv64
+          launch linux-s390x    build_zig_linux   linux-s390x    s390x-linux-musl        cfnat-linux-s390x
+
+          failed=0
+          for i in "${!pids[@]}"; do
+            name="${names[$i]}"
+            if wait "${pids[$i]}"; then
+              echo "✅ [${name}] build succeeded"
+            else
+              echo "❌ [${name}] build failed" >&2
+              cat "/tmp/build-logs/${name}.log" >&2
+              failed=1
+            fi
+          done
+          [ "$failed" -eq 0 ]
+          ls -lh release/
+
+      - name: Upload Ubuntu artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-ubuntu
+          path: release/cfnat-*
+          retention-days: 1
+
+  build-macos:
+    name: Build macOS Pool (Darwin, Windows & x86/ARM Linux)
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ github.token }}
+
+      - name: Setup Zig
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$(uname -m)" in
+            x86_64)        zig_arch="x86_64" ;;
+            arm64|aarch64) zig_arch="aarch64" ;;
+            *) echo "Unsupported runner arch: $(uname -m)" >&2; exit 1 ;;
+          esac
+
+          zig_dir="zig-${zig_arch}-macos-${ZIG_VERSION}"
+          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/${zig_dir}.tar.xz" -o zig.tar.xz
+          tar -xf zig.tar.xz
+          echo "$PWD/$zig_dir" >> "$GITHUB_PATH"
+
+      - name: Build 10 targets concurrently
+        shell: bash
+        run: |
+          set -euo pipefail
+          zig version
+          mkdir -p release /tmp/build-logs /tmp/zig-cache
+
+          names=()
+          pids=()
+
+          launch() {
+            local name="$1"
+            shift
+            while [ "$(jobs -rp | wc -l)" -ge 4 ]; do sleep 0.2; done
+            names+=("$name")
+            (
+              set -euo pipefail
+              "$@"
+            ) >"/tmp/build-logs/${name}.log" 2>&1 &
+            pids+=("$!")
+          }
+
+          build_darwin() {
+            local arch="$1" out="$2"
+            clang -arch "$arch" -O2 -pipe -std=c23 \
+              -Wall -Wextra -Wno-unused-parameter \
+              "$SOURCE_FILE" -o "release/${out}" \
+              -pthread
+            strip -x "release/${out}"
+          }
+
+          build_zig_linux() {
+            local name="$1" target="$2" out="$3" extra="${4:-}"
+            ZIG_LOCAL_CACHE_DIR="/tmp/zig-cache/${name}/local" \
+            ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/${name}/global" \
+            zig cc -target "$target" $extra -O2 -pipe -std=c23 \
+              -Wall -Wextra -Wno-unused-parameter \
+              "$SOURCE_FILE" -o "release/${out}" \
+              -pthread -static -s
+          }
+
+          build_zig_windows() {
+            local name="$1" target="$2" out="$3"
+            ZIG_LOCAL_CACHE_DIR="/tmp/zig-cache/${name}/local" \
+            ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/${name}/global" \
+            zig cc -target "$target" -O2 -pipe -std=c23 \
+              -finput-charset=UTF-8 -fexec-charset=UTF-8 \
+              -Wall -Wextra -Wno-unused-parameter \
+              "$SOURCE_FILE" -o "release/${out}" \
+              -lws2_32 -ldnsapi -lwininet -static -s
+          }
+
+          launch darwin-amd64  build_darwin      x86_64 cfnat-darwin-amd64
+          launch darwin-arm64  build_darwin      arm64  cfnat-darwin-arm64
+          launch windows-amd64 build_zig_windows windows-amd64 x86_64-windows-gnu  cfnat-windows-amd64.exe
+          launch windows-arm64 build_zig_windows windows-arm64 aarch64-windows-gnu cfnat-windows-arm64.exe
+          launch linux-amd64   build_zig_linux   linux-amd64 x86_64-linux-musl     cfnat-linux-amd64
+          launch linux-arm64   build_zig_linux   linux-arm64 aarch64-linux-musl    cfnat-linux-arm64
+          launch linux-386     build_zig_linux   linux-386   x86-linux-musl        cfnat-linux-386
+          launch linux-armv5   build_zig_linux   linux-armv5 arm-linux-musleabi    cfnat-linux-armv5 -mcpu=arm926ej_s
+          launch linux-armv6   build_zig_linux   linux-armv6 arm-linux-musleabihf  cfnat-linux-armv6 -mcpu=arm1176jzf_s
+          launch linux-armv7   build_zig_linux   linux-armv7 arm-linux-musleabihf  cfnat-linux-armv7 -mcpu=cortex_a7
+
+          failed=0
+          for i in "${!pids[@]}"; do
+            name="${names[$i]}"
+            if wait "${pids[$i]}"; then
+              echo "✅ [${name}] build succeeded"
+            else
+              echo "❌ [${name}] build failed" >&2
+              cat "/tmp/build-logs/${name}.log" >&2
+              failed=1
+            fi
+          done
+          [ "$failed" -eq 0 ]
+          ls -lh release/
+
+      - name: Upload macOS pool artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-macos
+          path: release/cfnat-*
+          retention-days: 1
+
+  release:
+    name: Merge & Publish GitHub Release
+    needs: [build-ubuntu, build-macos]
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ github.token }}
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Determine tag name
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            tag="${GITHUB_REF#refs/tags/}"
+          elif [ -n "${{ inputs.tag_name }}" ]; then
+            tag="${{ inputs.tag_name }}"
+          else
+            ver=$(grep -E '^#define[[:space:]]+CFNAT_VERSION[[:space:]]+"' "$SOURCE_FILE" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+            if [ -n "$ver" ]; then
+              tag="v${ver}"
+            else
+              tag="continuous"
+            fi
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "Using release tag: $tag"
+          ls -lh release/
+
+      - name: Upload GitHub Release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: Release ${{ steps.vars.outputs.tag }}
+          prerelease: ${{ inputs.prerelease || false }}
+          make_latest: true
+          files: release/cfnat-*
