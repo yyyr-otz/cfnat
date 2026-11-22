@@ -406,6 +406,46 @@ typedef struct {
     StringChunk *chunks;
 } StringList;
 
+#if defined(__arm__) && defined(__ARM_ARCH) && (__ARM_ARCH < 6)
+/* ARMv5 (如 arm926ej-s) 无硬件 ldrex/strex 原子指令，Zig compiler-rt 亦未提供 __sync_*_4 符号 */
+static pthread_mutex_t g_armv5_sync_mu = PTHREAD_MUTEX_INITIALIZER;
+uint32_t __sync_fetch_and_add_4(volatile void *ptr, uint32_t val) {
+    pthread_mutex_lock(&g_armv5_sync_mu);
+    uint32_t old = *(volatile uint32_t *)ptr;
+    *(volatile uint32_t *)ptr = old + val;
+    pthread_mutex_unlock(&g_armv5_sync_mu);
+    return old;
+}
+uint32_t __sync_fetch_and_sub_4(volatile void *ptr, uint32_t val) {
+    pthread_mutex_lock(&g_armv5_sync_mu);
+    uint32_t old = *(volatile uint32_t *)ptr;
+    *(volatile uint32_t *)ptr = old - val;
+    pthread_mutex_unlock(&g_armv5_sync_mu);
+    return old;
+}
+uint32_t __sync_fetch_and_or_4(volatile void *ptr, uint32_t val) {
+    pthread_mutex_lock(&g_armv5_sync_mu);
+    uint32_t old = *(volatile uint32_t *)ptr;
+    *(volatile uint32_t *)ptr = old | val;
+    pthread_mutex_unlock(&g_armv5_sync_mu);
+    return old;
+}
+uint32_t __sync_val_compare_and_swap_4(volatile void *ptr, uint32_t oldval, uint32_t newval) {
+    pthread_mutex_lock(&g_armv5_sync_mu);
+    uint32_t cur = *(volatile uint32_t *)ptr;
+    if (cur == oldval) *(volatile uint32_t *)ptr = newval;
+    pthread_mutex_unlock(&g_armv5_sync_mu);
+    return cur;
+}
+uint32_t __sync_lock_test_and_set_4(volatile void *ptr, uint32_t val) {
+    pthread_mutex_lock(&g_armv5_sync_mu);
+    uint32_t old = *(volatile uint32_t *)ptr;
+    *(volatile uint32_t *)ptr = val;
+    pthread_mutex_unlock(&g_armv5_sync_mu);
+    return old;
+}
+#endif
+
 /* 跨平台 64 位原子兼容层：64 位平台与支持 8 字节 CAS 的 32 位平台走无锁原生原子，
  * 缺乏原生 64 位原子指令的老旧 32 位 CPU (如 armv5 / mips / mipsel) 自动退化为全局自旋锁保护，
  * 避免静态链接 musl 时出现 __atomic_load_8 / __atomic_fetch_add_8 未定义符号。 */
