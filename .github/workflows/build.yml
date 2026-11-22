@@ -145,8 +145,8 @@ jobs:
             if wait "${pids[$i]}"; then
               echo "✅ [${name}] build succeeded"
             else
-              echo "❌ [${name}] build failed" >&2
-              cat "/tmp/build-logs/${name}.log" >&2
+              echo "❌ [${name}] build failed"
+              cat "/tmp/build-logs/${name}.log"
               failed=1
             fi
           done
@@ -218,10 +218,11 @@ jobs:
           }
 
           build_zig_linux() {
-            local name="$1" target="$2" out="$3" extra="${4:-}"
+            local name="$1" target="$2" out="$3"
+            shift 3
             ZIG_LOCAL_CACHE_DIR="/tmp/zig-cache/${name}/local" \
             ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/${name}/global" \
-            zig cc -target "$target" $extra -O2 -pipe -std=c23 \
+            zig cc -target "$target" "$@" -O2 -pipe -std=c23 \
               -Wall -Wextra -Wno-unused-parameter \
               "$SOURCE_FILE" -o "release/${out}" \
               -pthread -static -s
@@ -255,8 +256,8 @@ jobs:
             if wait "${pids[$i]}"; then
               echo "✅ [${name}] build succeeded"
             else
-              echo "❌ [${name}] build failed" >&2
-              cat "/tmp/build-logs/${name}.log" >&2
+              echo "❌ [${name}] build failed"
+              cat "/tmp/build-logs/${name}.log"
               failed=1
             fi
           done
