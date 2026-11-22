@@ -25,7 +25,7 @@ env:
 
 jobs:
   build-ubuntu:
-    name: Build Ubuntu Pool (20 targets: Linux, Windows, Android & FreeBSD)
+    name: "Build Ubuntu Pool (20 targets: Linux, Windows, Android & FreeBSD)"
     runs-on: ubuntu-latest
 
     steps:
@@ -181,7 +181,7 @@ jobs:
           retention-days: 1
 
   build-macos:
-    name: Build macOS Pool (2 targets: Darwin amd64 & arm64)
+    name: "Build macOS Pool (2 targets: Darwin amd64 & arm64)"
     runs-on: macos-latest
 
     steps:
