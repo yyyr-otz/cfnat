@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.1.3"
+#define CFNAT_VERSION "0.1.4"
 
 /* =========================================================================
  * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
@@ -335,6 +335,16 @@ typedef struct {
     int h3_client;            /* 1=使用真实加密 RFC 9001 QUIC v1 Initial (TLS 1.3 ClientHello) 探测 H3; 0=默认轻量 VN 探针 */
     int enable_h2;            /* 全局默认启用 TCP/H2 (默认 1) */
     int enable_h3;            /* 全局默认启用 UDP/H3 (默认 1) */
+    char ips_v4_file[MAX_PATH_LEN]; /* 自定义 IPv4 列表文件路径 (默认 ips-v4.txt) */
+    char ips_v6_file[MAX_PATH_LEN]; /* 自定义 IPv6 列表文件路径 (默认 ips-v6.txt) */
+    char ips_v4_url[512];           /* 自定义 IPv4 列表下载 URL */
+    char ips_v6_url[512];           /* 自定义 IPv6 列表下载 URL */
+    int ips_v4_update_mode;         /* 0=仅缺失下载, 1=每次启动更新, 2=按 mtime 间隔更新 */
+    int ips_v6_update_mode;
+    long ips_v4_update_sec;         /* mode==2 时的更新间隔（秒） */
+    long ips_v6_update_sec;
+    int ips_v4_to_cidr;             /* 0=关闭, 8..31=将单 IPv4 转为该前缀 CIDR (默认开启=24) */
+    int ips_v6_to_cidr;             /* 0=关闭, 1..127=将单 IPv6 转为该前缀 CIDR (默认开启=64) */
     LogLevel log_level;
     ProfileConfig prof_v4;
     ProfileConfig prof_v6;
@@ -445,9 +455,15 @@ typedef struct {
 
 static long now_ms(void);
 static void log_msg(const char *fmt, ...);
+static void warn_msg(const char *fmt, ...);
+static void debug_msg(const char *fmt, ...);
 static void trim_line(char *s);
+static void sanitize_ip_line(char *line);
 static uint32_t ipv4_to_u32(const char *s);
 static void u32_to_ipv4(uint32_t v, char *out, size_t sz);
+static uint64_t rand_u64(void);
+static int ensure_ips_file_for_type(int ips_type, int is_startup);
+static const char *cfg_ips_file_for_type(int ips_type);
 /* ── CidrList 函数实现 ──────────────────────────────────────── */
 
 /* 添加 CIDR 条目 */
@@ -504,42 +520,113 @@ static void cidrlist_destroy(CidrList *cl) {
     memset(cl, 0, sizeof(*cl));
 }
 
-/* 从文件加载 CIDR 列表（惰性遍历） */
-static CidrList load_cidr_list(const char *filename, int random_mode) {
+/* 轻量 O(1) 开放寻址去重哈希表（FNV-1a 64-bit，0 保留为空槽） */
+typedef struct {
+    uint64_t *slots;
+    size_t cap;
+    size_t len;
+} DedupSet64;
+
+static inline uint64_t fnv1a_64_bytes(const void *data, size_t n) {
+    const unsigned char *p = (const unsigned char *)data;
+    uint64_t h = 14695981039346656037ULL;
+    for (size_t i = 0; i < n; i++) {
+        h ^= (uint64_t)p[i];
+        h *= 1099511628211ULL;
+    }
+    return h ? h : 1ULL;
+}
+
+static void dedup_free(DedupSet64 *s) {
+    if (!s) return;
+    free(s->slots);
+    memset(s, 0, sizeof(*s));
+}
+
+/* 返回 1 表示首次插入（非重复），0 表示已存在（重复） */
+static int dedup_insert(DedupSet64 *s, uint64_t key) {
+    if (!s) return 1;
+    if (key == 0) key = 1ULL;
+    if (s->cap == 0 || (s->len + 1) * 10 >= s->cap * 7) {
+        size_t ncap = s->cap ? (s->cap * 2) : 1024;
+        uint64_t *ns = calloc(ncap, sizeof(uint64_t));
+        if (!ns) return 1;
+        for (size_t i = 0; i < s->cap; i++) {
+            uint64_t k = s->slots[i];
+            if (!k) continue;
+            size_t idx = (size_t)(k & (ncap - 1));
+            while (ns[idx]) idx = (idx + 1) & (ncap - 1);
+            ns[idx] = k;
+        }
+        free(s->slots);
+        s->slots = ns;
+        s->cap = ncap;
+    }
+    size_t mask = s->cap - 1;
+    size_t idx = (size_t)(key & mask);
+    while (s->slots[idx]) {
+        if (s->slots[idx] == key) return 0;
+        idx = (idx + 1) & mask;
+    }
+    s->slots[idx] = key;
+    s->len++;
+    return 1;
+}
+
+/* 从文件加载 CIDR 列表（惰性遍历，支持脏行清洗、单 IP 转 CIDR 与去重） */
+static CidrList load_cidr_list(const char *filename, int random_mode, int to_cidr) {
     CidrList cl = {0};
     cl.random_mode = random_mode;
     FILE *f = fopen(filename, "r");
     if (!f) return cl;
-    log_msg("正在读取 %s，模式：%s", filename, random_mode ? "CIDR随机抽样" : "惰性展开CIDR");
+    log_msg("正在读取 %s，模式：%s%s", filename,
+            random_mode ? "CIDR随机抽样" : "惰性展开CIDR",
+            (to_cidr >= 8 && to_cidr <= 31) ? "（单IP转CIDR已启用）" : "");
     char line[MAX_LINE];
     long start_ms = now_ms();
-    size_t cidr_count = 0;
-    (void)cidr_count;
+    size_t skipped_lines = 0;
+    size_t dup_lines = 0;
+    DedupSet64 seen = {0};
     while (fgets(line, sizeof(line), f)) {
-        trim_line(line);
+        sanitize_ip_line(line);
         if (!line[0]) continue;
         char *slash = strchr(line, '/');
+        uint32_t base = 0;
+        int prefix = 32;
         if (!slash) {
-            /* 单个 IP，当作 /32 处理 */
-            uint32_t ip = ipv4_to_u32(line);
-            if (ip == 0) continue;
-            cidrlist_add(&cl, ip, 1, 32);
-            cidr_count++;
+            base = ipv4_to_u32(line);
+            if (base == 0) { skipped_lines++; continue; }
+            prefix = (to_cidr >= 8 && to_cidr <= 31) ? to_cidr : 32;
+        } else {
+            *slash = 0;
+            const char *pfx_s = slash + 1;
+            int pfx_ok = (pfx_s[0] != '\0');
+            for (const char *p = pfx_s; *p && pfx_ok; p++) {
+                if (!isdigit((unsigned char)*p)) pfx_ok = 0;
+            }
+            if (!pfx_ok) { skipped_lines++; continue; }
+            prefix = atoi(pfx_s);
+            base = ipv4_to_u32(line);
+            if (base == 0 || prefix < 8 || prefix > 32) { skipped_lines++; continue; }
+            if (prefix == 32 && to_cidr >= 8 && to_cidr <= 31) prefix = to_cidr;
+        }
+        uint32_t mask = (prefix == 32) ? 0xffffffffu : (0xffffffffu << (32 - prefix));
+        uint32_t start = base & mask;
+        uint64_t key = ((uint64_t)start << 8) | (uint64_t)(unsigned int)prefix;
+        if (!dedup_insert(&seen, fnv1a_64_bytes(&key, sizeof(key)))) {
+            dup_lines++;
             continue;
         }
-        *slash = 0;
-        int prefix = atoi(slash + 1);
-        uint32_t base = ipv4_to_u32(line);
-        if (base == 0 || prefix < 8 || prefix > 32) continue;
-        uint32_t mask = (0xffffffffu << (32 - prefix));
-        uint32_t start = base & mask;
         uint32_t count = prefix == 32 ? 1u : (1u << (32 - prefix));
         cidrlist_add(&cl, start, count, prefix);
-        cidr_count++;
     }
     fclose(f);
+    dedup_free(&seen);
     log_msg("CIDR 列表加载完成: %zu 个 CIDR 条目，共 %llu 个候选 IP，耗时 %ld 秒",
             cl.len, (unsigned long long)cl.total_ips, (now_ms() - start_ms) / 1000);
+    if (skipped_lines > 0 || dup_lines > 0) {
+        debug_msg("IPv4 列表清洗统计 (%s): 跳过非 IP 行 %zu，去重 %zu", filename, skipped_lines, dup_lines);
+    }
     return cl;
 }
 
@@ -667,6 +754,10 @@ static atomic_ullong g_udp_sess_seq = 0;
 static CarrierRuntime *g_carrier_runtimes = nullptr;
 static size_t g_carrier_runtime_count = 0;
 static pthread_mutex_t g_log_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_ips_v4_mu = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t g_ips_v6_mu = PTHREAD_MUTEX_INITIALIZER;
+static atomic_llong g_ips_v4_last_check_s = 0;
+static atomic_llong g_ips_v6_last_check_s = 0;
 
 static int parse_addr(const char *addr, char *host, size_t hostsz, int *port);
 static socket_t accept_interruptible(socket_t listen_fd, struct sockaddr *addr,
@@ -1201,11 +1292,58 @@ static void usage(const char *p) {
     printf("  -health-log=value         健康状态行(debug 级明细)输出间隔秒数，0=关闭 (default 60)\n");
     printf("  -h3-client[=bool]         H3 探测启用真实 QUIC v1 Initial (TLS 1.3 ClientHello) 模拟 (default false)\n");
     printf("  -h2[=bool] / -h3[=bool]   启用或关闭 H2(TCP) / H3(UDP) 协议，支持 -v4-/-v6-/-baidu- 前缀 (default true)\n");
+    printf("  -ips-v4-file / -ips-v6-file    自定义 IPv4/IPv6 列表文件路径 (default ips-v4.txt / ips-v6.txt)\n");
+    printf("  -ips-v4-url  / -ips-v6-url     自定义 IPv4/IPv6 列表下载 URL (默认使用内置源)\n");
+    printf("  -ips-v4-update / -ips-v6-update  IP 列表更新策略: 0/false | 1/true(每次启动) | *m/*h/*d(按文件修改时间)\n");
+    printf("  -ips-v4-to-cidr / -ips-v6-to-cidr 将单 IP 转为 CIDR 网段并去重: 0/false | 1/true(/24或/64) | 自定义前缀\n");
     printf("  注: 以上参数均支持 -v4- 或 -v6- 前缀实现精细化覆盖，如 -v6-code=200 -v4-delay=150\n");
 }
 
 static int parse_bool(const char *v) {
     return !v || strcmp(v, "1") == 0 || strcasecmp(v, "true") == 0 || strcasecmp(v, "yes") == 0 || strcasecmp(v, "on") == 0;
+}
+
+/* 解析 -ips-v*-update: 0/false -> 0; 1/true/裸参数 -> mode=1(每次启动); Ns/Nm/Nh/Nd -> mode=2(按mtime间隔) */
+static void parse_ips_update_spec(const char *val, int *out_mode, long *out_sec) {
+    if (!out_mode || !out_sec) return;
+    if (!val || !*val) { *out_mode = 1; *out_sec = 0; return; }
+    if (!strcmp(val, "0") || !strcasecmp(val, "false") || !strcasecmp(val, "off") || !strcasecmp(val, "no")) {
+        *out_mode = 0; *out_sec = 0; return;
+    }
+    if (!strcmp(val, "1") || !strcasecmp(val, "true") || !strcasecmp(val, "yes") || !strcasecmp(val, "on")) {
+        *out_mode = 1; *out_sec = 0; return;
+    }
+    char *end = nullptr;
+    long num = strtol(val, &end, 10);
+    if (end && end != val && num > 0) {
+        long mult = 60; /* 无后缀整数默认按分钟处理 */
+        if (*end == 's' || *end == 'S') mult = 1;
+        else if (*end == 'm' || *end == 'M' || *end == '\0') mult = 60;
+        else if (*end == 'h' || *end == 'H') mult = 3600;
+        else if (*end == 'd' || *end == 'D') mult = 86400;
+        else {
+            warn_msg("无法识别的 -ips-*-update=%s，期望 0/1/true 或如 30m/6h/1d，已按默认关闭处理", val);
+            *out_mode = 0; *out_sec = 0; return;
+        }
+        if (num > 365L * 86400L / mult) num = 365L * 86400L / mult;
+        *out_mode = 2;
+        *out_sec = num * mult;
+        return;
+    }
+    warn_msg("无法识别的 -ips-*-update=%s，期望 0/1/true 或如 30m/6h/1d，已按默认关闭处理", val);
+    *out_mode = 0; *out_sec = 0;
+}
+
+/* 解析 -ips-v*-to-cidr: 0/false -> 0; 1/true/裸参数 -> default_pfx; 数字或 /数字 -> 自定义前缀 */
+static int parse_to_cidr_spec(const char *val, int default_pfx, int min_pfx, int max_pfx) {
+    if (!val || !*val) return default_pfx;
+    if (!strcmp(val, "0") || !strcasecmp(val, "false") || !strcasecmp(val, "off") || !strcasecmp(val, "no")) return 0;
+    if (!strcmp(val, "1") || !strcasecmp(val, "true") || !strcasecmp(val, "yes") || !strcasecmp(val, "on")) return default_pfx;
+    const char *p = (*val == '/') ? (val + 1) : val;
+    int v = atoi(p);
+    if (v >= min_pfx && v <= max_pfx) return v;
+    warn_msg("参数 -ips-*-to-cidr=%s 超出合法范围 [%d, %d]，已回退默认 /%d", val, min_pfx, max_pfx, default_pfx);
+    return default_pfx;
 }
 
 static void format_listen_endpoint(const char *in, int default_port, const char *default_host, char *out, size_t outsz) {
@@ -1258,6 +1396,14 @@ static void cfg_defaults(Config *c) {
     c->h3_client = 0;          /* 默认关闭真实 QUIC ClientHello 模拟，使用轻量 VN 探针 */
     c->enable_h2 = 1;          /* 默认双协议启用 */
     c->enable_h3 = 1;
+    strcpy(c->ips_v4_file, "ips-v4.txt");
+    strcpy(c->ips_v6_file, "ips-v6.txt");
+    c->ips_v4_update_mode = 0;
+    c->ips_v6_update_mode = 0;
+    c->ips_v4_update_sec = 0;
+    c->ips_v6_update_sec = 0;
+    c->ips_v4_to_cidr = 0;
+    c->ips_v6_to_cidr = 0;
     c->use_baidu_proxy = 0;
     c->baidu_port = DEFAULT_BAIDU_PORT;
     c->baidu_ipnum = DEFAULT_BAIDU_IPNUM;
@@ -1288,6 +1434,7 @@ static void parse_args(Config *c, int argc, char **argv) {
     int v4_random = -1, v6_random = -1;
     int v4_h2 = -1, v4_h3 = -1, v6_h2 = -1, v6_h3 = -1, baidu_h2 = -1, baidu_h3 = -1;
     int v6_split_val = -1;
+    int explicit_v4_update = 0, explicit_v6_update = 0;
     char v4_colo[256] = {0}, v6_colo[256] = {0};
     char v4_domain[MAX_DOMAIN_LEN] = {0}, v6_domain[MAX_DOMAIN_LEN] = {0};
 
@@ -1426,11 +1573,30 @@ static void parse_args(Config *c, int argc, char **argv) {
         else if (!strcmp(key, "baidu-h3")) baidu_h3 = parse_bool(val);
         /* 运行指标汇报间隔：与健康检查解耦（-stats-interval 为主名，-log-interval 作兼容别名）。
          * 显式传负数一律按 0（关闭）处理，避免出现「间隔 -5 秒」这种无意义配置。 */
+        else if (!strcmp(key, "ips-v4-file") && val) snprintf(c->ips_v4_file, sizeof(c->ips_v4_file), "%s", val);
+        else if (!strcmp(key, "ips-v6-file") && val) snprintf(c->ips_v6_file, sizeof(c->ips_v6_file), "%s", val);
+        else if (!strcmp(key, "ips-v4-url") && val) snprintf(c->ips_v4_url, sizeof(c->ips_v4_url), "%s", val);
+        else if (!strcmp(key, "ips-v6-url") && val) snprintf(c->ips_v6_url, sizeof(c->ips_v6_url), "%s", val);
+        else if (!strcmp(key, "ips-v4-update")) {
+            explicit_v4_update = 1;
+            parse_ips_update_spec(val, &c->ips_v4_update_mode, &c->ips_v4_update_sec);
+        } else if (!strcmp(key, "ips-v6-update")) {
+            explicit_v6_update = 1;
+            parse_ips_update_spec(val, &c->ips_v6_update_mode, &c->ips_v6_update_sec);
+        } else if (!strcmp(key, "ips-v4-to-cidr")) {
+            c->ips_v4_to_cidr = parse_to_cidr_spec(val, 24, 8, 31);
+        } else if (!strcmp(key, "ips-v6-to-cidr")) {
+            c->ips_v6_to_cidr = parse_to_cidr_spec(val, 64, 1, 127);
+        }
         else if ((!strcmp(key, "stats-interval") || !strcmp(key, "log-interval")) && val) {
             int v = atoi(val);
             c->stats_interval = v > 0 ? v : 0;
         }
     }
+
+    /* 显式指定自定义 URL 且未手动关闭 update 时，默认每次启动拉取一次以确保新源立即生效 */
+    if (c->ips_v4_url[0] && !explicit_v4_update) c->ips_v4_update_mode = 1;
+    if (c->ips_v6_url[0] && !explicit_v6_update) c->ips_v6_update_mode = 1;
 
     /* 统一合并全局 exclude-colo 到 c->colo */
     if (exclude_colo_buf[0]) {
@@ -1653,6 +1819,26 @@ static void log_current_config(const Config *c) {
         if (c->colo[0]) log_msg("    数据中心筛选: %s", c->colo);
     }
 
+    if (strcmp(c->ips_v4_file, "ips-v4.txt") != 0 || c->ips_v4_url[0] || c->ips_v4_update_mode || c->ips_v4_to_cidr) {
+        char upd[32] = "仅缺失下载";
+        if (c->ips_v4_update_mode == 1) snprintf(upd, sizeof(upd), "每次启动更新");
+        else if (c->ips_v4_update_mode == 2) snprintf(upd, sizeof(upd), "每 %ld 秒(mtime)", c->ips_v4_update_sec);
+        char cidr_s[16];
+        if (c->ips_v4_to_cidr) snprintf(cidr_s, sizeof(cidr_s), "/%d", c->ips_v4_to_cidr);
+        else snprintf(cidr_s, sizeof(cidr_s), "关");
+        log_msg("  [IPv4 源配置] 文件: %s | URL: %s | 更新: %s | 单IP转CIDR: %s",
+                c->ips_v4_file, c->ips_v4_url[0] ? c->ips_v4_url : "(内置默认源)", upd, cidr_s);
+    }
+    if (strcmp(c->ips_v6_file, "ips-v6.txt") != 0 || c->ips_v6_url[0] || c->ips_v6_update_mode || c->ips_v6_to_cidr) {
+        char upd[32] = "仅缺失下载";
+        if (c->ips_v6_update_mode == 1) snprintf(upd, sizeof(upd), "每次启动更新");
+        else if (c->ips_v6_update_mode == 2) snprintf(upd, sizeof(upd), "每 %ld 秒(mtime)", c->ips_v6_update_sec);
+        char cidr_s[16];
+        if (c->ips_v6_to_cidr) snprintf(cidr_s, sizeof(cidr_s), "/%d", c->ips_v6_to_cidr);
+        else snprintf(cidr_s, sizeof(cidr_s), "关");
+        log_msg("  [IPv6 源配置] 文件: %s | URL: %s | 更新: %s | 单IP转CIDR: %s",
+                c->ips_v6_file, c->ips_v6_url[0] ? c->ips_v6_url : "(内置默认源)", upd, cidr_s);
+    }
     log_msg("  全局设置: 出站网卡: %s | 运行指标间隔: %d 秒 (0=关闭) | H3探针: %s | 日志级别: %s",
             c->bind_if[0] ? c->bind_if : "(系统默认路由)", c->stats_interval,
             c->h3_client ? "QUIC-v1-ClientHello" : "轻量VN", c->log_name);
@@ -1665,6 +1851,87 @@ static void log_current_config(const Config *c) {
 static int file_exists(const char *path) {
     struct stat st;
     return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static int file_mtime_and_size(const char *path, time_t *out_mtime, int64_t *out_size) {
+    struct stat st;
+    if (!path || !*path || stat(path, &st) != 0 || !S_ISREG(st.st_mode)) return -1;
+    if (out_mtime) *out_mtime = st.st_mtime;
+    if (out_size) *out_size = (int64_t)st.st_size;
+    return 0;
+}
+
+/* 计算文件 FNV-1a 64 位摘要，用于内容无变化时免除无意义的缓存失效与重扫 */
+static int file_content_hash64(const char *path, uint64_t *out_hash, uint64_t *out_size) {
+    FILE *fp = fopen(path, "rb");
+    if (!fp) return -1;
+    uint64_t h = 14695981039346656037ULL;
+    uint64_t total = 0;
+    unsigned char buf[16384];
+    size_t n;
+    while ((n = fread(buf, 1, sizeof(buf), fp)) > 0) {
+        total += (uint64_t)n;
+        for (size_t i = 0; i < n; i++) {
+            h ^= (uint64_t)buf[i];
+            h *= 1099511628211ULL;
+        }
+    }
+    int ferr = ferror(fp);
+    fclose(fp);
+    if (ferr) return -1;
+    if (out_hash) *out_hash = h;
+    if (out_size) *out_size = total;
+    return 0;
+}
+
+static int atomic_replace_file(const char *tmp_path, const char *dst_path) {
+#ifdef _WIN32
+    if (!MoveFileExA(tmp_path, dst_path, MOVEFILE_REPLACE_EXISTING)) {
+        remove(dst_path);
+        if (!MoveFileExA(tmp_path, dst_path, 0)) return -1;
+    }
+    return 0;
+#else
+    return rename(tmp_path, dst_path);
+#endif
+}
+
+/* 预校验下载的 IP 临时文件：非空、<= 50MB，且至少包含 1 条目标协议族的合法 IP/CIDR */
+static int validate_ips_temp_file(const char *tmp_path, int ips_type) {
+    int64_t sz = 0;
+    if (file_mtime_and_size(tmp_path, nullptr, &sz) != 0) return -1;
+    if (sz <= 0 || sz > 50LL * 1024LL * 1024LL) return -1;
+    FILE *fp = fopen(tmp_path, "r");
+    if (!fp) return -1;
+    char line[MAX_LINE];
+    int valid_found = 0;
+    while (fgets(line, sizeof(line), fp)) {
+        sanitize_ip_line(line);
+        if (!line[0]) continue;
+        char *slash = strchr(line, '/');
+        if (slash) {
+            *slash = '\0';
+            const char *pfx_s = slash + 1;
+            if (!pfx_s[0]) continue;
+            int ok = 1;
+            for (const char *p = pfx_s; *p; p++) {
+                if (!isdigit((unsigned char)*p)) { ok = 0; break; }
+            }
+            if (!ok) continue;
+            int pfx = atoi(pfx_s);
+            if (ips_type == 6 && (pfx < 0 || pfx > 128)) continue;
+            if (ips_type == 4 && (pfx < 8 || pfx > 32)) continue;
+        }
+        if (ips_type == 6) {
+            struct in6_addr a6;
+            if (inet_pton(AF_INET6, line, &a6) == 1) { valid_found = 1; break; }
+        } else {
+            struct in_addr a4;
+            if (inet_pton(AF_INET, line, &a4) == 1) { valid_found = 1; break; }
+        }
+    }
+    fclose(fp);
+    return valid_found ? 0 : -1;
 }
 
 #ifdef _WIN32
@@ -1681,20 +1948,21 @@ static wchar_t *utf8_to_wide_alloc(const char *s) {
     return w;
 }
 
-static int download_file_wininet(const char *url, const char *filename) {
+static int download_url_to_tmp(const char *url, const char *tmp_path) {
     wchar_t *wurl = utf8_to_wide_alloc(url);
     if (!wurl) return -1;
 
-    HINTERNET hnet = InternetOpenW(L"cfnat/1.0", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
+    HINTERNET hnet = InternetOpenW(L"cfnat", INTERNET_OPEN_TYPE_PRECONFIG, nullptr, nullptr, 0);
     if (!hnet) {
         free(wurl);
         return -1;
     }
+    DWORD conn_to = 10000, rw_to = 30000;
+    InternetSetOptionW(hnet, INTERNET_OPTION_CONNECT_TIMEOUT, &conn_to, sizeof(conn_to));
+    InternetSetOptionW(hnet, INTERNET_OPTION_RECEIVE_TIMEOUT, &rw_to, sizeof(rw_to));
 
     DWORD flags = INTERNET_FLAG_RELOAD | INTERNET_FLAG_NO_CACHE_WRITE | INTERNET_FLAG_PRAGMA_NOCACHE;
-    if (strncmp(url, "https://", 8) == 0) {
-        flags |= INTERNET_FLAG_SECURE;
-    }
+    if (strncmp(url, "https://", 8) == 0) flags |= INTERNET_FLAG_SECURE;
 
     HINTERNET hurl = InternetOpenUrlW(hnet, wurl, nullptr, 0, flags, 0);
     free(wurl);
@@ -1703,9 +1971,15 @@ static int download_file_wininet(const char *url, const char *filename) {
         return -1;
     }
 
-    char tmp[256];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", filename);
-    FILE *out = fopen(tmp, "wb");
+    DWORD status_code = 0, status_sz = sizeof(status_code);
+    if (!HttpQueryInfoW(hurl, HTTP_QUERY_STATUS_CODE | HTTP_QUERY_FLAG_NUMBER, &status_code, &status_sz, nullptr) ||
+        status_code < 200 || status_code >= 300) {
+        InternetCloseHandle(hurl);
+        InternetCloseHandle(hnet);
+        return -1;
+    }
+
+    FILE *out = fopen(tmp_path, "wb");
     if (!out) {
         InternetCloseHandle(hurl);
         InternetCloseHandle(hnet);
@@ -1715,60 +1989,126 @@ static int download_file_wininet(const char *url, const char *filename) {
     char buf[16384];
     DWORD got = 0;
     int rc = 0;
+    size_t total = 0;
     for (;;) {
-        if (!InternetReadFile(hurl, buf, sizeof(buf), &got)) {
-            rc = -1;
-            break;
-        }
+        if (!InternetReadFile(hurl, buf, sizeof(buf), &got)) { rc = -1; break; }
         if (got == 0) break;
-        if (fwrite(buf, 1, got, out) != got) {
-            rc = -1;
-            break;
-        }
+        total += (size_t)got;
+        if (total > 50ULL * 1024ULL * 1024ULL) { rc = -1; break; }
+        if (fwrite(buf, 1, got, out) != got) { rc = -1; break; }
     }
-
+    fflush(out);
+    int fd = _fileno(out);
+    if (rc == 0 && fd >= 0) _commit(fd);
     fclose(out);
     InternetCloseHandle(hurl);
     InternetCloseHandle(hnet);
 
-    if (rc != 0 || !file_exists(tmp)) {
-        remove(tmp);
+    if (rc != 0 || total == 0) {
+        remove(tmp_path);
         return -1;
     }
+    return 0;
+}
+#else
+/* POSIX 单引号安全转义：避免自定义 URL 中的 & / ? / ' 破坏命令或引发注入 */
+static int shell_quote_single(const char *in, char *out, size_t outsz) {
+    if (!in || !out || outsz < 4) return -1;
+    size_t pos = 0;
+    out[pos++] = '\'';
+    for (const char *p = in; *p; p++) {
+        if (*p == '\r' || *p == '\n') return -1;
+        if (*p == '\'') {
+            if (pos + 4 >= outsz) return -1;
+            memcpy(out + pos, "'\\''", 4);
+            pos += 4;
+        } else {
+            if (pos + 2 >= outsz) return -1;
+            out[pos++] = *p;
+        }
+    }
+    if (pos + 2 > outsz) return -1;
+    out[pos++] = '\'';
+    out[pos] = '\0';
+    return 0;
+}
 
-    remove(filename);
-    if (rename(tmp, filename) != 0) {
-        remove(tmp);
+static int download_url_to_tmp(const char *url, const char *tmp_path) {
+    char qurl[1024], qtmp[1024];
+    if (shell_quote_single(url, qurl, sizeof(qurl)) != 0) return -1;
+    if (shell_quote_single(tmp_path, qtmp, sizeof(qtmp)) != 0) return -1;
+    char cmd[4608];
+    snprintf(cmd, sizeof(cmd),
+             "curl -fsSL --connect-timeout 10 --max-time 30 %s -o %s 2>/dev/null || "
+             "wget -q --timeout=30 -O %s %s 2>/dev/null",
+             qurl, qtmp, qtmp, qurl);
+    int rc = system(cmd);
+    if (rc != 0 || !file_exists(tmp_path)) {
+        unlink(tmp_path);
         return -1;
+    }
+    int fd = open(tmp_path, O_RDONLY);
+    if (fd >= 0) {
+        fsync(fd);
+        close(fd);
     }
     return 0;
 }
 #endif
 
-static int download_file_from_urls(const char **urls, const char *filename) {
-#ifdef _WIN32
+/* validate_ips_type: 0=不校验IP格式(如 locations.json), 4=IPv4, 6=IPv6 */
+static int download_file_from_urls_ex(const char **urls, const char *filename, int validate_ips_type, int *out_changed) {
+    if (out_changed) *out_changed = 0;
+    if (!urls || !filename || !*filename) return -1;
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%u", filename, (unsigned int)((rand_u64() ^ (uint64_t)now_ms()) & 0xffffu));
+
+    uint64_t old_hash = 0, old_sz = 0;
+    int had_old = (file_content_hash64(filename, &old_hash, &old_sz) == 0);
+
     for (int i = 0; urls[i]; i++) {
-        if (download_file_wininet(urls[i], filename) == 0) return 0;
-        log_msg("从 %s 下载失败，尝试下一个源", urls[i]);
-    }
-    return -1;
-#else
-    char tmp[256];
-    snprintf(tmp, sizeof(tmp), "%s.tmp", filename);
-    for (int i = 0; urls[i]; i++) {
-        char cmd[1024];
-        snprintf(cmd, sizeof(cmd), "curl -fsSL '%s' -o '%s' 2>/dev/null || wget -qO '%s' '%s' 2>/dev/null", urls[i], tmp, tmp, urls[i]);
-        int rc = system(cmd);
-        if (rc == 0 && file_exists(tmp)) {
-            rename(tmp, filename);
+        if (download_url_to_tmp(urls[i], tmp) != 0) {
+            log_msg("从 %s 下载失败，尝试下一个源", urls[i]);
+            continue;
+        }
+        if (validate_ips_type == 4 || validate_ips_type == 6) {
+            if (validate_ips_temp_file(tmp, validate_ips_type) != 0) {
+                warn_msg("从 %s 下载的内容校验未通过（为空/超限/不含合法 IPv%d），已丢弃临时文件", urls[i], validate_ips_type);
+                remove(tmp);
+                continue;
+            }
+        } else {
+            int64_t sz = 0;
+            if (file_mtime_and_size(tmp, nullptr, &sz) != 0 || sz <= 0) {
+                remove(tmp);
+                continue;
+            }
+        }
+
+        uint64_t new_hash = 0, new_sz = 0;
+        if (had_old && file_content_hash64(tmp, &new_hash, &new_sz) == 0 && new_hash == old_hash && new_sz == old_sz) {
+            remove(tmp);
+            debug_msg("文件 %s 远端内容未变化，保留本地文件与时间戳", filename);
             return 0;
         }
-        unlink(tmp);
-        log_msg("从 %s 下载失败，尝试下一个源", urls[i]);
+        if (atomic_replace_file(tmp, filename) != 0) {
+            remove(tmp);
+            warn_msg("原子替换目标文件 %s 失败（请检查目录权限或路径是否存在）", filename);
+            continue;
+        }
+        if (out_changed) *out_changed = 1;
+        return 0;
     }
-    log_msg("下载 %s 失败：所有镜像源均不可达，或系统缺少 curl / wget 工具。请手动下载文件放置于当前目录，或安装 curl/wget 后重试", filename);
-    return -1;
+#ifndef _WIN32
+    warn_msg("下载 %s 失败：所有源均不可达/校验未通过，或系统缺少 curl / wget", filename);
+#else
+    warn_msg("下载 %s 失败：所有源均不可达或 HTTP/内容校验未通过", filename);
 #endif
+    return -1;
+}
+
+static int download_file_from_urls(const char **urls, const char *filename) {
+    return download_file_from_urls_ex(urls, filename, 0, nullptr);
 }
 
 static int ensure_data_file(const char *expected, const char **urls) {
@@ -1776,6 +2116,73 @@ static int ensure_data_file(const char *expected, const char **urls) {
 
     printf("文件 %s 不存在，正在下载数据\n", expected);
     return download_file_from_urls(urls, expected);
+}
+
+static const char *cfg_ips_file_for_type(int ips_type) {
+    if (ips_type == 6) return g_cfg.ips_v6_file[0] ? g_cfg.ips_v6_file : "ips-v6.txt";
+    return g_cfg.ips_v4_file[0] ? g_cfg.ips_v4_file : "ips-v4.txt";
+}
+
+/* 统一管理自定义 IPv4/IPv6 列表文件的下载、启动强制更新、运行期 mtime 间隔更新与失败保底 */
+static int ensure_ips_file_for_type(int ips_type, int is_startup) {
+    int is_v6 = (ips_type == 6);
+    pthread_mutex_t *mu = is_v6 ? &g_ips_v6_mu : &g_ips_v4_mu;
+    atomic_llong *last_check_s = is_v6 ? &g_ips_v6_last_check_s : &g_ips_v4_last_check_s;
+    const char *target = cfg_ips_file_for_type(ips_type);
+    const char *custom_url = is_v6 ? g_cfg.ips_v6_url : g_cfg.ips_v4_url;
+    int update_mode = is_v6 ? g_cfg.ips_v6_update_mode : g_cfg.ips_v4_update_mode;
+    long update_sec = is_v6 ? g_cfg.ips_v6_update_sec : g_cfg.ips_v4_update_sec;
+
+    const char *custom_urls[2] = { custom_url, nullptr };
+    const char **urls = (custom_url && custom_url[0]) ? custom_urls : (is_v6 ? IPS_V6_URLS : IPS_V4_URLS);
+
+    pthread_mutex_lock(mu);
+    time_t mtime = 0;
+    int64_t fsize = 0;
+    int exists = (file_mtime_and_size(target, &mtime, &fsize) == 0 && fsize > 0);
+    time_t now_s = time(nullptr);
+    long long prev_chk = atomic_load_explicit(last_check_s, memory_order_relaxed);
+
+    int need_dl = 0;
+    const char *reason = "";
+    if (!exists) {
+        need_dl = 1;
+        reason = "本地文件不存在";
+    } else if (update_mode == 1 && is_startup) {
+        need_dl = 1;
+        reason = "启动强制更新";
+    } else if (update_mode == 2 && update_sec > 0) {
+        long age = (long)(now_s - mtime);
+        long since_chk = (prev_chk > 0) ? (long)((long long)now_s - prev_chk) : age;
+        if (age >= update_sec && since_chk >= update_sec) {
+            need_dl = 1;
+            reason = "已达定时更新间隔";
+        }
+    }
+
+    if (!need_dl) {
+        pthread_mutex_unlock(mu);
+        return 0;
+    }
+
+    log_msg("正在更新 IPv%d 列表 %s（原因: %s，来源: %s）",
+            is_v6 ? 6 : 4, target, reason,
+            (custom_url && custom_url[0]) ? custom_url : "内置默认源");
+    int changed = 0;
+    int rc = download_file_from_urls_ex(urls, target, is_v6 ? 6 : 4, &changed);
+    atomic_store_explicit(last_check_s, (long long)time(nullptr), memory_order_relaxed);
+    pthread_mutex_unlock(mu);
+
+    if (rc == 0) {
+        if (changed) log_msg("IPv%d 列表 %s 已更新并校验通过", is_v6 ? 6 : 4, target);
+        else log_msg("IPv%d 列表 %s 远端无变更，继续沿用本地文件", is_v6 ? 6 : 4, target);
+        return 0;
+    }
+    if (exists) {
+        warn_msg("更新 IPv%d 列表 %s 失败，保底继续使用现有本地文件", is_v6 ? 6 : 4, target);
+        return 0;
+    }
+    return -1;
 }
 
 static char *read_file_all(const char *path, size_t *out_len) {
@@ -1967,21 +2374,18 @@ static int ipv6_cidr_sample_split(const char *base_s, int prefix, int v6_split, 
     return count;
 }
 
-static int is_ip_literal(const char *s) {
-    struct in_addr a4;
-    struct in6_addr a6;
-    return inet_pton(AF_INET, s, &a4) == 1 || inet_pton(AF_INET6, s, &a6) == 1;
-}
-
 static void format_addr_port(const char *ip, int port, char *out, size_t outsz) {
     if (!out || outsz == 0) return;
     if (ip && strchr(ip, ':')) snprintf(out, outsz, "[%s]:%d", ip, port);
     else snprintf(out, outsz, "%s:%d", ip ? ip : "", port);
 }
 
-/* 清洗单行 IP/CIDR 输入：去注释 (#/;//)、取首字段、剥离方括号与可选端口 ([v6]:443 -> v6) */
+/* 清洗单行 IP/CIDR 输入：去 UTF-8 BOM、去注释 (#/;//)、取首字段、剥离 [v6]:port 与 v4:port */
 static void sanitize_ip_line(char *line) {
     if (!line) return;
+    if ((unsigned char)line[0] == 0xEF && (unsigned char)line[1] == 0xBB && (unsigned char)line[2] == 0xBF) {
+        memmove(line, line + 3, strlen(line + 3) + 1);
+    }
     trim_line(line);
     if (!line[0]) return;
     for (char *p = line; *p; p++) {
@@ -1992,9 +2396,9 @@ static void sanitize_ip_line(char *line) {
     }
     trim_line(line);
     if (!line[0]) return;
-    /* 仅保留首段 token（忽略行尾附加备注列如机房名/延迟等） */
+    /* 仅保留首段 token（兼容空格/Tab/CSV逗号分隔的附加列，如机房、延迟、测速结果） */
     for (char *p = line; *p; p++) {
-        if (*p == ' ' || *p == '	' || *p == ',') {
+        if (*p == ' ' || *p == '\t' || *p == ',') {
             *p = '\0';
             break;
         }
@@ -2007,10 +2411,16 @@ static void sanitize_ip_line(char *line) {
             memmove(line, line + 1, len);
             line[len] = '\0';
         }
+        return;
+    }
+    /* 处理 104.18.47.55:443（恰好只有 1 个冒号，绝不误伤至少含 2 个冒号的 IPv6） */
+    char *first_colon = strchr(line, ':');
+    if (first_colon && !strchr(first_colon + 1, ':')) {
+        *first_colon = '\0';
     }
 }
 
-static StringList load_ip_list(const char *filename, int random_mode, int v6_split) {
+static StringList load_ip_list(const char *filename, int random_mode, int v6_split, int v4_to_cidr, int v6_to_cidr) {
     if (v6_split < 1 || v6_split > 128) v6_split = 54;
     StringList out = {0};
     FILE *f = fopen(filename, "r");
@@ -2026,44 +2436,52 @@ static StringList load_ip_list(const char *filename, int random_mode, int v6_spl
     long start_ms = now_ms();
     size_t cidr_count = 0;
     size_t exact_ip_count = 0;
+    size_t skipped_lines = 0;
+    size_t dup_lines = 0;
     int warned_ipv6_expand = 0;
     int warned_ipv6_cap = 0;
+    DedupSet64 seen = {0};
     srand((unsigned)time(nullptr));
     while (fgets(line, sizeof(line), f)) {
         sanitize_ip_line(line);
         if (!line[0]) continue;
         char *slash = strchr(line, '/');
-        if (!slash) {
-            if (is_ip_literal(line)) {
-                exact_ip_count++;
-                if (strchr(line, ':')) {
-                    unsigned char b[16];
-                    if (inet_pton(AF_INET6, line, b) == 1) {
-                        char full_ip[MAX_IP_LEN];
-                        format_ipv6_full(b, full_ip, sizeof(full_ip));
-                        strlist_add(&out, full_ip);
-                    } else {
-                        strlist_add(&out, line);
-                    }
-                } else {
-                    strlist_add(&out, line);
-                }
+        int prefix = -1;
+        if (slash) {
+            *slash = 0;
+            const char *pfx_s = slash + 1;
+            int pfx_ok = (pfx_s[0] != '\0');
+            for (const char *p = pfx_s; *p && pfx_ok; p++) {
+                if (!isdigit((unsigned char)*p)) pfx_ok = 0;
             }
-            continue;
+            if (!pfx_ok) { skipped_lines++; continue; }
+            prefix = atoi(pfx_s);
         }
-        *slash = 0;
-        const char *pfx_s = slash + 1;
-        if (!pfx_s[0]) continue;
-        int pfx_ok = 1;
-        for (const char *p = pfx_s; *p; p++) {
-            if (!isdigit((unsigned char)*p)) { pfx_ok = 0; break; }
-        }
-        if (!pfx_ok) continue;
-        int prefix = atoi(pfx_s);
+
         if (strchr(line, ':')) {
-            if (prefix < 0 || prefix > 128) continue;
+            unsigned char b[16];
+            if (inet_pton(AF_INET6, line, b) != 1) { skipped_lines++; continue; }
+            if (prefix < 0) prefix = 128;
+            if (prefix > 128) { skipped_lines++; continue; }
+            if (prefix == 128 && v6_to_cidr >= 1 && v6_to_cidr <= 127) {
+                prefix = v6_to_cidr;
+            }
+            /* 按规范网络位 + prefix 去重（单 IP 去重同地址不同端口，CIDR 去重同网段） */
+            unsigned char norm[17];
+            memcpy(norm, b, 16);
+            for (int bit = prefix; bit < 128; bit++) {
+                norm[bit / 8] &= (unsigned char)~(1u << (7 - (bit % 8)));
+            }
+            norm[16] = (unsigned char)prefix;
+            if (!dedup_insert(&seen, fnv1a_64_bytes(norm, sizeof(norm)))) {
+                dup_lines++;
+                continue;
+            }
             if (prefix == 128) {
                 exact_ip_count++;
+                char full_ip[MAX_IP_LEN];
+                format_ipv6_full(norm, full_ip, sizeof(full_ip));
+                strlist_add(&out, full_ip);
             } else {
                 cidr_count++;
                 if (!random_mode && !warned_ipv6_expand) {
@@ -2071,22 +2489,40 @@ static StringList load_ip_list(const char *filename, int random_mode, int v6_spl
                              v6_split);
                     warned_ipv6_expand = 1;
                 }
-            }
-            int capped = 0;
-            ipv6_cidr_sample_split(line, prefix, v6_split, &out, &capped);
-            if (capped && !warned_ipv6_cap) {
-                warn_msg("部分 IPv6 子网按 -v6-split=/%d 切分超过单行 1024 上限，已自动按高 10 位分层抽样 1024 个防 OOM",
-                         v6_split);
-                warned_ipv6_cap = 1;
+                int capped = 0;
+                ipv6_cidr_sample_split(line, prefix, v6_split, &out, &capped);
+                if (capped && !warned_ipv6_cap) {
+                    warn_msg("部分 IPv6 子网按 -v6-split=/%d 切分超过单行 1024 上限，已自动按高 10 位分层抽样 1024 个防 OOM",
+                             v6_split);
+                    warned_ipv6_cap = 1;
+                }
             }
             continue;
         }
-        cidr_count++;
+
         uint32_t base = ipv4_to_u32(line);
-        if (base == 0 || prefix < 8 || prefix > 32) continue;
-        uint32_t mask = (0xffffffffu << (32 - prefix));
+        if (base == 0) { skipped_lines++; continue; }
+        if (prefix < 0) prefix = 32;
+        if (prefix < 8 || prefix > 32) { skipped_lines++; continue; }
+        if (prefix == 32 && v4_to_cidr >= 8 && v4_to_cidr <= 31) {
+            prefix = v4_to_cidr;
+        }
+        uint32_t mask = (prefix == 32) ? 0xffffffffu : (0xffffffffu << (32 - prefix));
         uint32_t start = base & mask;
-        uint64_t count = prefix == 32 ? 1ULL : (1ULL << (32 - prefix));
+        uint64_t key = ((uint64_t)start << 8) | (uint64_t)(unsigned int)prefix;
+        if (!dedup_insert(&seen, fnv1a_64_bytes(&key, sizeof(key)))) {
+            dup_lines++;
+            continue;
+        }
+        if (prefix == 32) {
+            exact_ip_count++;
+            char ip[MAX_IP_LEN];
+            u32_to_ipv4(start, ip, sizeof(ip));
+            strlist_add(&out, ip);
+            continue;
+        }
+        cidr_count++;
+        uint64_t count = (1ULL << (32 - prefix));
         if (!random_mode && count > 65536) count = 65536;
         if (random_mode) {
             uint32_t off = count > 1 ? (uint32_t)(rand_u64() % count) : 0;
@@ -2105,6 +2541,7 @@ static StringList load_ip_list(const char *filename, int random_mode, int v6_spl
         }
     }
     fclose(f);
+    dedup_free(&seen);
     if (random_mode && out.len > 1) {
         for (size_t i = out.len - 1; i > 0; i--) {
             size_t j = (size_t)(rand_u64() % (uint64_t)(i + 1));
@@ -2114,6 +2551,9 @@ static StringList load_ip_list(const char *filename, int random_mode, int v6_spl
         }
     }
     log_msg("IP 列表加载完成: %zu 个候选（完整 IP 行: %zu，CIDR 行: %zu），耗时 %ld 秒", out.len, exact_ip_count, cidr_count, (now_ms() - start_ms) / 1000);
+    if (skipped_lines > 0 || dup_lines > 0) {
+        debug_msg("IP 列表清洗统计 (%s): 跳过非 IP 行 %zu，去重 %zu", filename, skipped_lines, dup_lines);
+    }
     if (!random_mode && out.len > 100000) {
         warn_msg("当前使用 -random=false，已完整展开大量 IP，扫描会明显变慢；需要快速启动时建议使用 -random=true");
     }
@@ -4592,10 +5032,22 @@ static ResultList load_candidate_cache(const char *path) {
     return load_candidate_cache_for_profile(path, nullptr);
 }
 
+static int ips_file_newer_than_cache(int ips_type, const char *cache_path) {
+    time_t ip_mt = 0, cache_mt = 0;
+    if (file_mtime_and_size(cfg_ips_file_for_type(ips_type), &ip_mt, nullptr) != 0) return 0;
+    if (file_mtime_and_size(cache_path, &cache_mt, nullptr) != 0) return 0;
+    return ip_mt > cache_mt;
+}
+
 static int try_use_candidate_cache(BaiduProxyPool *proxy_pool, ResultList *out) {
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
     const char *path = candidate_cache_file("direct");
+    if (ips_file_newer_than_cache(g_cfg.ips_type, path)) {
+        log_msg("IP 列表文件 %s 新于候选缓存 %s，跳过旧缓存并重新扫描",
+                cfg_ips_file_for_type(g_cfg.ips_type), path);
+        return 0;
+    }
     ResultList cached = load_candidate_cache(path);
     if (cached.len == 0) {
         return 0;
@@ -5298,6 +5750,12 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
     int ips_type = rt->spec.prof.ips_type > 0 ? rt->spec.prof.ips_type : g_cfg.ips_type;
     const char *tcp_path = candidate_cache_file_for_profile(rt->spec.mode, ips_type);
     const char *udp_path = candidate_cache_file_for_profile_udp(rt->spec.mode, ips_type);
+    const char *primary_cache = (!use_h2 && use_h3) ? udp_path : tcp_path;
+    if (ips_file_newer_than_cache(ips_type, primary_cache)) {
+        log_msg("[%s] IP 列表文件 %s 新于候选缓存 %s，跳过旧缓存并重新扫描",
+                carrier_display_name(rt->spec.mode), cfg_ips_file_for_type(ips_type), primary_cache);
+        return 0;
+    }
     int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
     if (target_port <= 0) target_port = 443;
     int delay_ms = udp_probe_timeout_ms((rt->spec.prof.delay_ms > 0) ? rt->spec.prof.delay_ms : g_cfg.delay_ms);
@@ -6625,7 +7083,7 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
         return 1;
     }
 
-    const char *ipfile = (rt->spec.prof.ips_type == 6) ? "ips-v6.txt" : "ips-v4.txt";
+    const char *ipfile = cfg_ips_file_for_type(rt->spec.prof.ips_type);
 
     Config scan_cfg = g_cfg;
     scan_cfg.ips_type = rt->spec.prof.ips_type;
@@ -6774,11 +7232,12 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
         CidrList fresh_cidrs = {0};
         StringList ips = {0};
         uint64_t cand_count = 0;
+        ensure_ips_file_for_type(rt->spec.prof.ips_type, 0);
         if (use_cidr) {
-            fresh_cidrs = load_cidr_list(ipfile, 0);
+            fresh_cidrs = load_cidr_list(ipfile, 0, g_cfg.ips_v4_to_cidr);
             cand_count = fresh_cidrs.len;
         } else {
-            ips = load_ip_list(ipfile, cur_random, cur_v6_split);
+            ips = load_ip_list(ipfile, cur_random, cur_v6_split, g_cfg.ips_v4_to_cidr, g_cfg.ips_v6_to_cidr);
             cand_count = ips.len;
         }
         if (cand_count > 0) {
@@ -8586,14 +9045,14 @@ int main(int argc, char **argv) {
         else need_v4 = 1;
     }
 
-    if (need_v4 && ensure_data_file("ips-v4.txt", IPS_V4_URLS) != 0) {
-        log_msg("下载 ips-v4.txt 失败");
+    if (need_v4 && ensure_ips_file_for_type(4, 1) != 0) {
+        log_msg("准备 IPv4 列表 %s 失败", cfg_ips_file_for_type(4));
         free(carrier_specs);
         free(g_locations);
         return 1;
     }
-    if (need_v6 && ensure_data_file("ips-v6.txt", IPS_V6_URLS) != 0) {
-        log_msg("下载 ips-v6.txt 失败");
+    if (need_v6 && ensure_ips_file_for_type(6, 1) != 0) {
+        log_msg("准备 IPv6 列表 %s 失败", cfg_ips_file_for_type(6));
         free(carrier_specs);
         free(g_locations);
         return 1;
@@ -8725,13 +9184,13 @@ int main(int argc, char **argv) {
                 continue;
             }
 
-            const char *cur_ipfile = (rt->spec.prof.ips_type == 6) ? "ips-v6.txt" : "ips-v4.txt";
+            const char *cur_ipfile = cfg_ips_file_for_type(rt->spec.prof.ips_type);
             int cur_v6_split = (rt->spec.prof.v6_split > 0) ? rt->spec.prof.v6_split : g_cfg.v6_split;
             int use_cidr = (rt->spec.prof.ips_type == 4 && !rt->spec.prof.random_mode);
             CidrList profile_cidrs = {0};
             StringList profile_ips = {0};
             if (use_cidr) {
-                profile_cidrs = load_cidr_list(cur_ipfile, 0);
+                profile_cidrs = load_cidr_list(cur_ipfile, 0, g_cfg.ips_v4_to_cidr);
                 if (profile_cidrs.len == 0) {
                     warn_msg("[%s] 没有可扫描的 IP (%s 为空)", carrier_display_name(rt->spec.mode), cur_ipfile);
                     if (cfnat_socket_valid(rt->listen_fd)) { close(rt->listen_fd); rt->listen_fd = INVALID_SOCKET; }
@@ -8739,7 +9198,7 @@ int main(int argc, char **argv) {
                     continue;
                 }
             } else {
-                profile_ips = load_ip_list(cur_ipfile, rt->spec.prof.random_mode, cur_v6_split);
+                profile_ips = load_ip_list(cur_ipfile, rt->spec.prof.random_mode, cur_v6_split, g_cfg.ips_v4_to_cidr, g_cfg.ips_v6_to_cidr);
                 if (profile_ips.len == 0) {
                     warn_msg("[%s] 没有可扫描的 IP (%s 为空)", carrier_display_name(rt->spec.mode), cur_ipfile);
                     if (cfnat_socket_valid(rt->listen_fd)) { close(rt->listen_fd); rt->listen_fd = INVALID_SOCKET; }
@@ -9054,14 +9513,14 @@ int main(int argc, char **argv) {
         return 0;
     }
     long start = now_ms();
-    const char *cli_ipfile = (g_cfg.ips_type == 6) ? "ips-v6.txt" : "ips-v4.txt";
+    const char *cli_ipfile = cfg_ips_file_for_type(g_cfg.ips_type);
     // 先尝试读取候选缓存，如果命中且健康检查通过则跳过完整扫描
     ResultList results = {0};
     int cache_hit = try_use_candidate_cache(nullptr, &results);
     if (!cache_hit) {
         if (g_cfg.ips_type == 4 && !g_cfg.random_mode) {
             /* IPv4 顺序模式：惰性二分定位，O(1) 内存，零堆分配展开 */
-            CidrList cidrs = load_cidr_list(cli_ipfile, 0);
+            CidrList cidrs = load_cidr_list(cli_ipfile, 0, g_cfg.ips_v4_to_cidr);
             if (cidrs.len == 0) {
                 log_msg("没有可扫描的 IP (%s 为空)", cli_ipfile);
                     free(g_locations);
@@ -9070,7 +9529,7 @@ int main(int argc, char **argv) {
             results = scan_ips(nullptr, &cidrs, &g_cfg, nullptr);
             cidrlist_destroy(&cidrs);
         } else {
-            StringList ips = load_ip_list(cli_ipfile, g_cfg.random_mode, g_cfg.v6_split);
+            StringList ips = load_ip_list(cli_ipfile, g_cfg.random_mode, g_cfg.v6_split, g_cfg.ips_v4_to_cidr, g_cfg.ips_v6_to_cidr);
             if (ips.len == 0) {
                 log_msg("没有可扫描的 IP (%s 为空)", cli_ipfile);
                     free(g_locations);
