@@ -128,8 +128,8 @@ jobs:
 
           launch android-arm64  build_android     aarch64-linux-android 24       cfnat-android-arm64
           launch android-amd64  build_android     x86_64-linux-android  24       cfnat-android-amd64
-          launch freebsd-amd64  build_zig_freebsd freebsd-amd64 x86_64-freebsd.14  amd64 cfnat-freebsd-amd64
-          launch freebsd-arm64  build_zig_freebsd freebsd-arm64 aarch64-freebsd.14 arm64 cfnat-freebsd-arm64
+          launch freebsd-amd64  build_zig_freebsd freebsd-amd64 x86_64-freebsd  amd64 cfnat-freebsd-amd64
+          launch freebsd-arm64  build_zig_freebsd freebsd-arm64 aarch64-freebsd arm64 cfnat-freebsd-arm64
           launch linux-mips     build_zig_linux   linux-mips     mips-linux-musleabi     cfnat-linux-mips
           launch linux-mipsel   build_zig_linux   linux-mipsel   mipsel-linux-musleabi   cfnat-linux-mipsel
           launch linux-mips64   build_zig_linux   linux-mips64   mips64-linux-muslabi64  cfnat-linux-mips64
@@ -245,7 +245,7 @@ jobs:
           launch linux-amd64   build_zig_linux   linux-amd64 x86_64-linux-musl     cfnat-linux-amd64
           launch linux-arm64   build_zig_linux   linux-arm64 aarch64-linux-musl    cfnat-linux-arm64
           launch linux-386     build_zig_linux   linux-386   x86-linux-musl        cfnat-linux-386
-          launch linux-armv5   build_zig_linux   linux-armv5 arm-linux-musleabi    cfnat-linux-armv5 -mcpu=arm926ej_s
+          launch linux-armv5   build_zig_linux   linux-armv5 arm-linux-musleabi    cfnat-linux-armv5 -mcpu=arm926ej_s -Wno-atomic-alignment
           launch linux-armv6   build_zig_linux   linux-armv6 arm-linux-musleabihf  cfnat-linux-armv6 -mcpu=arm1176jzf_s
           launch linux-armv7   build_zig_linux   linux-armv7 arm-linux-musleabihf  cfnat-linux-armv7 -mcpu=cortex_a7
 
