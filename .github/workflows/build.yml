@@ -25,7 +25,7 @@ env:
 
 jobs:
   build-ubuntu:
-    name: Build Ubuntu Pool (Android, FreeBSD & RISC/MIPS/PPC/s390x)
+    name: Build Ubuntu Pool (20 targets: Linux, Windows, Android & FreeBSD)
     runs-on: ubuntu-latest
 
     steps:
@@ -69,7 +69,7 @@ jobs:
             rm -f "/tmp/fbsd-${arch}.txz"
           done
 
-      - name: Build 12 targets concurrently
+      - name: Build 20 targets concurrently
         shell: bash
         run: |
           set -euo pipefail
@@ -96,12 +96,24 @@ jobs:
 
           build_zig_linux() {
             local name="$1" target="$2" out="$3"
+            shift 3
             ZIG_LOCAL_CACHE_DIR="/tmp/zig-cache/${name}/local" \
             ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/${name}/global" \
-            zig cc -target "$target" -O2 -pipe -std=c23 \
+            zig cc -target "$target" "$@" -O2 -pipe -std=c23 \
               -Wall -Wextra -Wno-unused-parameter \
               "$SOURCE_FILE" -o "release/${out}" \
               -pthread -static -s
+          }
+
+          build_zig_windows() {
+            local name="$1" target="$2" out="$3"
+            ZIG_LOCAL_CACHE_DIR="/tmp/zig-cache/${name}/local" \
+            ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/${name}/global" \
+            zig cc -target "$target" -O2 -pipe -std=c23 \
+              -finput-charset=UTF-8 -fexec-charset=UTF-8 \
+              -Wall -Wextra -Wno-unused-parameter \
+              "$SOURCE_FILE" -o "release/${out}" \
+              -lws2_32 -ldnsapi -lwininet -static -s
           }
 
           build_zig_freebsd() {
@@ -128,8 +140,16 @@ jobs:
 
           launch android-arm64  build_android     aarch64-linux-android 24       cfnat-android-arm64
           launch android-amd64  build_android     x86_64-linux-android  24       cfnat-android-amd64
-          launch freebsd-amd64  build_zig_freebsd freebsd-amd64 x86_64-freebsd  amd64 cfnat-freebsd-amd64
-          launch freebsd-arm64  build_zig_freebsd freebsd-arm64 aarch64-freebsd arm64 cfnat-freebsd-arm64
+          launch freebsd-amd64  build_zig_freebsd freebsd-amd64 x86_64-freebsd   amd64 cfnat-freebsd-amd64
+          launch freebsd-arm64  build_zig_freebsd freebsd-arm64 aarch64-freebsd  arm64 cfnat-freebsd-arm64
+          launch windows-amd64  build_zig_windows windows-amd64 x86_64-windows-gnu  cfnat-windows-amd64.exe
+          launch windows-arm64  build_zig_windows windows-arm64 aarch64-windows-gnu cfnat-windows-arm64.exe
+          launch linux-amd64    build_zig_linux   linux-amd64    x86_64-linux-musl       cfnat-linux-amd64
+          launch linux-arm64    build_zig_linux   linux-arm64    aarch64-linux-musl      cfnat-linux-arm64
+          launch linux-386      build_zig_linux   linux-386      x86-linux-musl          cfnat-linux-386
+          launch linux-armv5    build_zig_linux   linux-armv5    arm-linux-musleabi      cfnat-linux-armv5 -mcpu=arm926ej_s -Wno-atomic-alignment
+          launch linux-armv6    build_zig_linux   linux-armv6    arm-linux-musleabihf    cfnat-linux-armv6 -mcpu=arm1176jzf_s
+          launch linux-armv7    build_zig_linux   linux-armv7    arm-linux-musleabihf    cfnat-linux-armv7 -mcpu=cortex_a7
           launch linux-mips     build_zig_linux   linux-mips     mips-linux-musleabi     cfnat-linux-mips
           launch linux-mipsel   build_zig_linux   linux-mipsel   mipsel-linux-musleabi   cfnat-linux-mipsel
           launch linux-mips64   build_zig_linux   linux-mips64   mips64-linux-muslabi64  cfnat-linux-mips64
@@ -161,7 +181,7 @@ jobs:
           retention-days: 1
 
   build-macos:
-    name: Build macOS Pool (Darwin, Windows & x86/ARM Linux)
+    name: Build macOS Pool (2 targets: Darwin amd64 & arm64)
     runs-on: macos-latest
 
     steps:
@@ -171,42 +191,11 @@ jobs:
           fetch-depth: 1
           token: ${{ github.token }}
 
-      - name: Setup Zig
+      - name: Build Darwin binaries
         shell: bash
         run: |
           set -euo pipefail
-          case "$(uname -m)" in
-            x86_64)        zig_arch="x86_64" ;;
-            arm64|aarch64) zig_arch="aarch64" ;;
-            *) echo "Unsupported runner arch: $(uname -m)" >&2; exit 1 ;;
-          esac
-
-          zig_dir="zig-${zig_arch}-macos-${ZIG_VERSION}"
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/${zig_dir}.tar.xz" -o zig.tar.xz
-          tar -xf zig.tar.xz
-          echo "$PWD/$zig_dir" >> "$GITHUB_PATH"
-
-      - name: Build 10 targets concurrently
-        shell: bash
-        run: |
-          set -euo pipefail
-          zig version
-          mkdir -p release /tmp/build-logs /tmp/zig-cache
-
-          names=()
-          pids=()
-
-          launch() {
-            local name="$1"
-            shift
-            while [ "$(jobs -rp | wc -l)" -ge 4 ]; do sleep 0.2; done
-            names+=("$name")
-            (
-              set -euo pipefail
-              "$@"
-            ) >"/tmp/build-logs/${name}.log" 2>&1 &
-            pids+=("$!")
-          }
+          mkdir -p release
 
           build_darwin() {
             local arch="$1" out="$2"
@@ -215,56 +204,14 @@ jobs:
               "$SOURCE_FILE" -o "release/${out}" \
               -pthread
             strip -x "release/${out}"
+            echo "✅ [${out}] build succeeded"
           }
 
-          build_zig_linux() {
-            local name="$1" target="$2" out="$3"
-            shift 3
-            ZIG_LOCAL_CACHE_DIR="/tmp/zig-cache/${name}/local" \
-            ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/${name}/global" \
-            zig cc -target "$target" "$@" -O2 -pipe -std=c23 \
-              -Wall -Wextra -Wno-unused-parameter \
-              "$SOURCE_FILE" -o "release/${out}" \
-              -pthread -static -s
-          }
-
-          build_zig_windows() {
-            local name="$1" target="$2" out="$3"
-            ZIG_LOCAL_CACHE_DIR="/tmp/zig-cache/${name}/local" \
-            ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/${name}/global" \
-            zig cc -target "$target" -O2 -pipe -std=c23 \
-              -finput-charset=UTF-8 -fexec-charset=UTF-8 \
-              -Wall -Wextra -Wno-unused-parameter \
-              "$SOURCE_FILE" -o "release/${out}" \
-              -lws2_32 -ldnsapi -lwininet -static -s
-          }
-
-          launch darwin-amd64  build_darwin      x86_64 cfnat-darwin-amd64
-          launch darwin-arm64  build_darwin      arm64  cfnat-darwin-arm64
-          launch windows-amd64 build_zig_windows windows-amd64 x86_64-windows-gnu  cfnat-windows-amd64.exe
-          launch windows-arm64 build_zig_windows windows-arm64 aarch64-windows-gnu cfnat-windows-arm64.exe
-          launch linux-amd64   build_zig_linux   linux-amd64 x86_64-linux-musl     cfnat-linux-amd64
-          launch linux-arm64   build_zig_linux   linux-arm64 aarch64-linux-musl    cfnat-linux-arm64
-          launch linux-386     build_zig_linux   linux-386   x86-linux-musl        cfnat-linux-386
-          launch linux-armv5   build_zig_linux   linux-armv5 arm-linux-musleabi    cfnat-linux-armv5 -mcpu=arm926ej_s -Wno-atomic-alignment
-          launch linux-armv6   build_zig_linux   linux-armv6 arm-linux-musleabihf  cfnat-linux-armv6 -mcpu=arm1176jzf_s
-          launch linux-armv7   build_zig_linux   linux-armv7 arm-linux-musleabihf  cfnat-linux-armv7 -mcpu=cortex_a7
-
-          failed=0
-          for i in "${!pids[@]}"; do
-            name="${names[$i]}"
-            if wait "${pids[$i]}"; then
-              echo "✅ [${name}] build succeeded"
-            else
-              echo "❌ [${name}] build failed"
-              cat "/tmp/build-logs/${name}.log"
-              failed=1
-            fi
-          done
-          [ "$failed" -eq 0 ]
+          build_darwin x86_64 cfnat-darwin-amd64
+          build_darwin arm64  cfnat-darwin-arm64
           ls -lh release/
 
-      - name: Upload macOS pool artifacts
+      - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
           name: binaries-macos
