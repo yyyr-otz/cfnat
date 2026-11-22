@@ -6,6 +6,10 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
+      targets:
+        description: '构建目标（逗号/空格分隔，all=全量；分组: linux/linux-static/musl/windows/macos/android/freebsd；或具体名如 windows-amd64,linux-mipsel-musl）'
+        required: false
+        default: 'all'
       tag_name:
         description: 'Release 标签版本（例如 v0.2.0，留空则自动从 cfnat.c 提取版本）'
         required: false
@@ -14,6 +18,10 @@ on:
         description: '是否标记为 Pre-release 预发布'
         type: boolean
         default: false
+      publish_release:
+        description: '是否发布 GitHub Release（仅验证编译时可取消勾选）'
+        type: boolean
+        default: true
 
 permissions:
   contents: write
@@ -22,10 +30,19 @@ env:
   SOURCE_FILE: cfnat.c
   ZIG_VERSION: 0.15.1
   FREEBSD_VER: 14.5-RELEASE
+  UPX_VERSION: 5.3.0
 
 jobs:
   build-ubuntu:
-    name: "Build Ubuntu Pool (20 targets: Linux, Windows, Android & FreeBSD)"
+    name: "Build Ubuntu Pool (Linux static/musl, Windows & FreeBSD)"
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.targets == '' ||
+      contains(inputs.targets, 'all') ||
+      contains(inputs.targets, 'linux') ||
+      contains(inputs.targets, 'musl') ||
+      contains(inputs.targets, 'windows') ||
+      contains(inputs.targets, 'freebsd')
     runs-on: ubuntu-latest
 
     steps:
@@ -35,19 +52,17 @@ jobs:
           fetch-depth: 1
           token: ${{ github.token }}
 
-      - name: Setup Android NDK
-        uses: nttld/setup-ndk@v1
-        with:
-          ndk-version: r27c
-          add-to-path: true
-
-      - name: Setup Zig & FreeBSD Sysroots
+      - name: Setup Zig, UPX & FreeBSD Sysroots
         shell: bash
+        env:
+          TARGETS_RAW: ${{ github.event_name == 'workflow_dispatch' && inputs.targets || 'all' }}
         run: |
           set -euo pipefail
+          TARGETS=" $(echo "${TARGETS_RAW:-all}" | tr '[:upper:],' '[:lower:] ') "
+
           case "$(uname -m)" in
-            x86_64)        zig_arch="x86_64" ;;
-            aarch64|arm64) zig_arch="aarch64" ;;
+            x86_64)        zig_arch="x86_64";  upx_arch="amd64" ;;
+            aarch64|arm64) zig_arch="aarch64"; upx_arch="arm64" ;;
             *) echo "Unsupported runner arch: $(uname -m)" >&2; exit 1 ;;
           esac
 
@@ -56,28 +71,62 @@ jobs:
           tar -xf zig.tar.xz
           echo "$PWD/$zig_dir" >> "$GITHUB_PATH"
 
-          # 仅解压 FreeBSD 头文件与系统库，用于 zig cc 交叉编译
-          for arch in amd64 arm64; do
-            mkdir -p "/tmp/freebsd-sysroot/${arch}"
-            if [ "$arch" = "arm64" ]; then
-              fbsd_url="https://download.freebsd.org/releases/arm64/aarch64/${FREEBSD_VER}/base.txz"
-            else
-              fbsd_url="https://download.freebsd.org/releases/amd64/${FREEBSD_VER}/base.txz"
-            fi
-            curl -fsSL "$fbsd_url" -o "/tmp/fbsd-${arch}.txz"
-            tar -xJf "/tmp/fbsd-${arch}.txz" -C "/tmp/freebsd-sysroot/${arch}" ./usr/include ./usr/lib ./lib
-            rm -f "/tmp/fbsd-${arch}.txz"
-          done
+          if [[ "$TARGETS" == *" all "* || "$TARGETS" == *" linux "* || "$TARGETS" == *" linux-static "* || "$TARGETS" == *" musl "* || "$TARGETS" == *" linux-musl "* || "$TARGETS" == *"mips"* ]]; then
+            upx_dir="upx-${UPX_VERSION}-${upx_arch}_linux"
+            curl -fsSL "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/${upx_dir}.tar.xz" -o upx.tar.xz
+            tar -xf upx.tar.xz
+            echo "$PWD/$upx_dir" >> "$GITHUB_PATH"
+          fi
 
-      - name: Build 20 targets concurrently
+          # 仅在需要编译 FreeBSD 时下载对应 sysroot
+          if [[ "$TARGETS" == *" all "* || "$TARGETS" == *" freebsd "* || "$TARGETS" == *"freebsd-"* ]]; then
+            for arch in amd64 arm64; do
+              if [[ "$TARGETS" != *" all "* && "$TARGETS" != *" freebsd "* && "$TARGETS" != *" freebsd-${arch} "* ]]; then
+                continue
+              fi
+              mkdir -p "/tmp/freebsd-sysroot/${arch}"
+              if [ "$arch" = "arm64" ]; then
+                fbsd_url="https://download.freebsd.org/releases/arm64/aarch64/${FREEBSD_VER}/base.txz"
+              else
+                fbsd_url="https://download.freebsd.org/releases/amd64/${FREEBSD_VER}/base.txz"
+              fi
+              curl -fsSL "$fbsd_url" -o "/tmp/fbsd-${arch}.txz"
+              tar -xJf "/tmp/fbsd-${arch}.txz" -C "/tmp/freebsd-sysroot/${arch}" ./usr/include ./usr/lib ./lib
+              rm -f "/tmp/fbsd-${arch}.txz"
+            done
+          fi
+
+      - name: Build selected Ubuntu pool targets concurrently
         shell: bash
+        env:
+          TARGETS_RAW: ${{ github.event_name == 'workflow_dispatch' && inputs.targets || 'all' }}
         run: |
           set -euo pipefail
           zig version
-          mkdir -p release /tmp/build-logs /tmp/zig-cache
+          if command -v upx >/dev/null 2>&1; then
+            upx --version | head -n 1
+          fi
+          mkdir -p release /tmp/build-logs /tmp/zig-cache/global
 
-          NDK_BIN="${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt/linux-x86_64/bin"
-          STRIP="${NDK_BIN}/llvm-strip"
+          TARGETS=" $(echo "${TARGETS_RAW:-all}" | tr '[:upper:],' '[:lower:] ') "
+          echo "Selected targets filter:${TARGETS}"
+
+          want() {
+            local key
+            for key in "$@"; do
+              if [[ "$TARGETS" == *" ${key} "* ]]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          COMMON_SIZE_FLAGS=(
+            -Os -flto -pipe -std=c23
+            -ffunction-sections -fdata-sections
+            -fno-unwind-tables -fno-asynchronous-unwind-tables
+            -Wall -Wextra -Wno-unused-parameter
+          )
 
           names=()
           pids=()
@@ -94,70 +143,232 @@ jobs:
             pids+=("$!")
           }
 
-          build_zig_linux() {
+          build_zig_linux_static() {
             local name="$1" target="$2" out="$3"
             shift 3
             ZIG_LOCAL_CACHE_DIR="/tmp/zig-cache/${name}/local" \
-            ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/${name}/global" \
-            zig cc -target "$target" "$@" -O2 -pipe -std=c23 \
-              -Wall -Wextra -Wno-unused-parameter \
+            ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/global" \
+            zig cc -target "$target" "${COMMON_SIZE_FLAGS[@]}" "$@" \
               "$SOURCE_FILE" -o "release/${out}" \
-              -pthread -static -s
+              -Wl,--gc-sections -pthread -static -s
+          }
+
+          build_zig_linux_musl() {
+            local name="$1" target="$2" out="$3"
+            shift 3
+            ZIG_LOCAL_CACHE_DIR="/tmp/zig-cache/${name}/local" \
+            ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/global" \
+            zig cc -target "$target" "${COMMON_SIZE_FLAGS[@]}" "$@" \
+              "$SOURCE_FILE" -o "release/${out}" \
+              -Wl,--gc-sections -pthread -dynamic -s
           }
 
           build_zig_windows() {
             local name="$1" target="$2" out="$3"
             ZIG_LOCAL_CACHE_DIR="/tmp/zig-cache/${name}/local" \
-            ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/${name}/global" \
-            zig cc -target "$target" -O2 -pipe -std=c23 \
+            ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/global" \
+            zig cc -target "$target" "${COMMON_SIZE_FLAGS[@]}" \
               -finput-charset=UTF-8 -fexec-charset=UTF-8 \
-              -Wall -Wextra -Wno-unused-parameter \
               "$SOURCE_FILE" -o "release/${out}" \
-              -lws2_32 -ldnsapi -lwininet -static -s
+              -Wl,--gc-sections -lws2_32 -ldnsapi -lwininet -static -s
           }
 
           build_zig_freebsd() {
             local name="$1" target="$2" sysarch="$3" out="$4"
             local sr="/tmp/freebsd-sysroot/${sysarch}"
             ZIG_LOCAL_CACHE_DIR="/tmp/zig-cache/${name}/local" \
-            ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/${name}/global" \
-            zig cc -target "$target" --sysroot "$sr" -O2 -pipe -std=c23 \
-              -Wall -Wextra -Wno-unused-parameter \
+            ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/global" \
+            zig cc -target "$target" --sysroot "$sr" "${COMMON_SIZE_FLAGS[@]}" \
               -I"${sr}/usr/include" -L"${sr}/usr/lib" -L"${sr}/lib" \
               "$SOURCE_FILE" -o "release/${out}" \
-              -pthread -s
+              -Wl,--gc-sections -pthread -s
+          }
+
+          # FreeBSD (2)
+          want all freebsd freebsd-amd64 && launch freebsd-amd64 build_zig_freebsd freebsd-amd64 x86_64-freebsd  amd64 cfnat-freebsd-amd64
+          want all freebsd freebsd-arm64 && launch freebsd-arm64 build_zig_freebsd freebsd-arm64 aarch64-freebsd arm64 cfnat-freebsd-arm64
+
+          # Windows (2)
+          want all windows windows-amd64 && launch windows-amd64 build_zig_windows windows-amd64 x86_64-windows-gnu  cfnat-windows-amd64.exe
+          want all windows windows-arm64 && launch windows-arm64 build_zig_windows windows-arm64 aarch64-windows-gnu cfnat-windows-arm64.exe
+
+          # Linux 14 架构（同时支持静态版与 -musl 动态版）
+          LINUX_SPECS=(
+            "linux-amd64|x86_64-linux-musl|"
+            "linux-arm64|aarch64-linux-musl|"
+            "linux-386|x86-linux-musl|"
+            "linux-armv5|arm-linux-musleabi|-mcpu=arm926ej_s -Wno-atomic-alignment -fno-lto"
+            "linux-armv6|arm-linux-musleabihf|-mcpu=arm1176jzf_s"
+            "linux-armv7|arm-linux-musleabihf|-mcpu=cortex_a7"
+            "linux-mips|mips-linux-musleabi|"
+            "linux-mipsel|mipsel-linux-musleabi|"
+            "linux-mips64|mips64-linux-muslabi64|"
+            "linux-mips64el|mips64el-linux-muslabi64|"
+            "linux-ppc64|powerpc64-linux-musl|"
+            "linux-ppc64le|powerpc64le-linux-musl|"
+            "linux-riscv64|riscv64-linux-musl|"
+            "linux-s390x|s390x-linux-musl|"
+          )
+
+          for spec in "${LINUX_SPECS[@]}"; do
+            IFS='|' read -r name target extra <<< "$spec"
+            read -r -a extra_arr <<< "$extra"
+            if want all linux linux-static "$name"; then
+              launch "$name" build_zig_linux_static "$name" "$target" "cfnat-${name}" "${extra_arr[@]}"
+            fi
+            if want all linux musl linux-musl "${name}-musl"; then
+              launch "${name}-musl" build_zig_linux_musl "${name}-musl" "$target" "cfnat-${name}-musl" "${extra_arr[@]}"
+            fi
+          done
+
+          if [ "${#pids[@]}" -eq 0 ]; then
+            echo "ℹ️ No Ubuntu pool targets matched; skipping build."
+            exit 0
+          fi
+
+          failed=0
+          for i in "${!pids[@]}"; do
+            name="${names[$i]}"
+            if wait "${pids[$i]}"; then
+              echo "✅ [${name}] build succeeded"
+            else
+              echo "❌ [${name}] build failed"
+              cat "/tmp/build-logs/${name}.log"
+              failed=1
+            fi
+          done
+          [ "$failed" -eq 0 ]
+
+          # 32 位 MIPS 静态版 UPX 压缩（UPX 官方暂不支持 mips64/mips64el ELF）
+          for bin in cfnat-linux-mips cfnat-linux-mipsel; do
+            if [ -f "release/${bin}" ]; then
+              upx --best --lzma -o "release/${bin}-upx" "release/${bin}"
+              echo "✅ [${bin}-upx] UPX compressed"
+            fi
+          done
+
+          # 32 位 MIPS musl 动态版尝试 UPX 压缩（若不支持或体积无法再压缩则自动跳过）
+          for bin in cfnat-linux-mips-musl cfnat-linux-mipsel-musl; do
+            if [ -f "release/${bin}" ]; then
+              if upx --best --lzma -o "release/${bin}-upx" "release/${bin}"; then
+                echo "✅ [${bin}-upx] UPX compressed"
+              else
+                rm -f "release/${bin}-upx"
+                echo "⚠️ [${bin}-upx] skipped (not compressible or unsupported by UPX)"
+              fi
+            fi
+          done
+
+          ls -lh release/
+
+      - name: Upload Ubuntu artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: binaries-ubuntu
+          path: release/cfnat-*
+          if-no-files-found: ignore
+          retention-days: 1
+
+  build-macos:
+    name: "Build macOS Pool (Darwin & Android)"
+    if: >-
+      github.event_name != 'workflow_dispatch' ||
+      inputs.targets == '' ||
+      contains(inputs.targets, 'all') ||
+      contains(inputs.targets, 'macos') ||
+      contains(inputs.targets, 'darwin') ||
+      contains(inputs.targets, 'android')
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ github.token }}
+
+      - name: Setup Android NDK
+        if: >-
+          github.event_name != 'workflow_dispatch' ||
+          inputs.targets == '' ||
+          contains(inputs.targets, 'all') ||
+          contains(inputs.targets, 'android')
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: true
+
+      - name: Build selected Darwin & Android binaries concurrently
+        shell: bash
+        env:
+          TARGETS_RAW: ${{ github.event_name == 'workflow_dispatch' && inputs.targets || 'all' }}
+        run: |
+          set -euo pipefail
+          mkdir -p release /tmp/build-logs
+
+          TARGETS=" $(echo "${TARGETS_RAW:-all}" | tr '[:upper:],' '[:lower:] ') "
+          echo "Selected targets filter:${TARGETS}"
+
+          want() {
+            local key
+            for key in "$@"; do
+              if [[ "$TARGETS" == *" ${key} "* ]]; then
+                return 0
+              fi
+            done
+            return 1
+          }
+
+          COMMON_SIZE_FLAGS=(
+            -Os -flto -pipe -std=c23
+            -ffunction-sections -fdata-sections
+            -fno-unwind-tables -fno-asynchronous-unwind-tables
+            -Wall -Wextra -Wno-unused-parameter
+          )
+
+          names=()
+          pids=()
+
+          launch() {
+            local name="$1"
+            shift
+            names+=("$name")
+            (
+              set -euo pipefail
+              "$@"
+            ) >"/tmp/build-logs/${name}.log" 2>&1 &
+            pids+=("$!")
+          }
+
+          build_darwin() {
+            local arch="$1" out="$2"
+            clang -arch "$arch" "${COMMON_SIZE_FLAGS[@]}" \
+              "$SOURCE_FILE" -o "release/${out}" \
+              -Wl,-dead_strip -pthread
+            strip "release/${out}"
           }
 
           build_android() {
             local target="$1" api="$2" out="$3"
-            "${NDK_BIN}/${target}${api}-clang" \
-              -O2 -pipe -std=c23 -Wall -Wextra -Wno-unused-parameter \
+            local ndk_bin
+            ndk_bin="$(echo "${ANDROID_NDK_ROOT}"/toolchains/llvm/prebuilt/*/bin)"
+            "${ndk_bin}/${target}${api}-clang" \
+              "${COMMON_SIZE_FLAGS[@]}" \
               -D__ANDROID__ \
               "$SOURCE_FILE" -o "release/${out}" \
-              -pthread
-            "$STRIP" "release/${out}"
+              -Wl,--gc-sections -pthread -s
+            "${ndk_bin}/llvm-strip" --strip-all "release/${out}"
           }
 
-          launch android-arm64  build_android     aarch64-linux-android 24       cfnat-android-arm64
-          launch android-amd64  build_android     x86_64-linux-android  24       cfnat-android-amd64
-          launch freebsd-amd64  build_zig_freebsd freebsd-amd64 x86_64-freebsd   amd64 cfnat-freebsd-amd64
-          launch freebsd-arm64  build_zig_freebsd freebsd-arm64 aarch64-freebsd  arm64 cfnat-freebsd-arm64
-          launch windows-amd64  build_zig_windows windows-amd64 x86_64-windows-gnu  cfnat-windows-amd64.exe
-          launch windows-arm64  build_zig_windows windows-arm64 aarch64-windows-gnu cfnat-windows-arm64.exe
-          launch linux-amd64    build_zig_linux   linux-amd64    x86_64-linux-musl       cfnat-linux-amd64
-          launch linux-arm64    build_zig_linux   linux-arm64    aarch64-linux-musl      cfnat-linux-arm64
-          launch linux-386      build_zig_linux   linux-386      x86-linux-musl          cfnat-linux-386
-          launch linux-armv5    build_zig_linux   linux-armv5    arm-linux-musleabi      cfnat-linux-armv5 -mcpu=arm926ej_s -Wno-atomic-alignment
-          launch linux-armv6    build_zig_linux   linux-armv6    arm-linux-musleabihf    cfnat-linux-armv6 -mcpu=arm1176jzf_s
-          launch linux-armv7    build_zig_linux   linux-armv7    arm-linux-musleabihf    cfnat-linux-armv7 -mcpu=cortex_a7
-          launch linux-mips     build_zig_linux   linux-mips     mips-linux-musleabi     cfnat-linux-mips
-          launch linux-mipsel   build_zig_linux   linux-mipsel   mipsel-linux-musleabi   cfnat-linux-mipsel
-          launch linux-mips64   build_zig_linux   linux-mips64   mips64-linux-muslabi64  cfnat-linux-mips64
-          launch linux-mips64el build_zig_linux   linux-mips64el mips64el-linux-muslabi64 cfnat-linux-mips64el
-          launch linux-ppc64    build_zig_linux   linux-ppc64    powerpc64-linux-musl    cfnat-linux-ppc64
-          launch linux-ppc64le  build_zig_linux   linux-ppc64le  powerpc64le-linux-musl  cfnat-linux-ppc64le
-          launch linux-riscv64  build_zig_linux   linux-riscv64  riscv64-linux-musl      cfnat-linux-riscv64
-          launch linux-s390x    build_zig_linux   linux-s390x    s390x-linux-musl        cfnat-linux-s390x
+          want all macos darwin darwin-amd64  && launch darwin-amd64  build_darwin  x86_64                cfnat-darwin-amd64
+          want all macos darwin darwin-arm64  && launch darwin-arm64  build_darwin  arm64                 cfnat-darwin-arm64
+          want all android android-arm64      && launch android-arm64 build_android aarch64-linux-android 24 cfnat-android-arm64
+          want all android android-amd64      && launch android-amd64 build_android x86_64-linux-android  24 cfnat-android-amd64
+
+          if [ "${#pids[@]}" -eq 0 ]; then
+            echo "ℹ️ No macOS pool targets matched; skipping build."
+            exit 0
+          fi
 
           failed=0
           for i in "${!pids[@]}"; do
@@ -173,55 +384,23 @@ jobs:
           [ "$failed" -eq 0 ]
           ls -lh release/
 
-      - name: Upload Ubuntu artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: binaries-ubuntu
-          path: release/cfnat-*
-          retention-days: 1
-
-  build-macos:
-    name: "Build macOS Pool (2 targets: Darwin amd64 & arm64)"
-    runs-on: macos-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 1
-          token: ${{ github.token }}
-
-      - name: Build Darwin binaries
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p release
-
-          build_darwin() {
-            local arch="$1" out="$2"
-            clang -arch "$arch" -O2 -pipe -std=c23 \
-              -Wall -Wextra -Wno-unused-parameter \
-              "$SOURCE_FILE" -o "release/${out}" \
-              -pthread
-            strip -x "release/${out}"
-            echo "✅ [${out}] build succeeded"
-          }
-
-          build_darwin x86_64 cfnat-darwin-amd64
-          build_darwin arm64  cfnat-darwin-arm64
-          ls -lh release/
-
       - name: Upload macOS artifacts
         uses: actions/upload-artifact@v4
         with:
           name: binaries-macos
           path: release/cfnat-*
+          if-no-files-found: ignore
           retention-days: 1
 
   release:
     name: Merge & Publish GitHub Release
     needs: [build-ubuntu, build-macos]
-    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+    if: >-
+      always() &&
+      (startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish_release)) &&
+      !contains(needs.*.result, 'failure') &&
+      !contains(needs.*.result, 'cancelled') &&
+      contains(needs.*.result, 'success')
     runs-on: ubuntu-latest
 
     steps:
