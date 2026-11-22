@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.1.4"
+#define CFNAT_VERSION "0.2.0"
 
 /* =========================================================================
  * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
@@ -335,8 +335,6 @@ typedef struct {
     int h3_client;            /* 1=使用真实加密 RFC 9001 QUIC v1 Initial (TLS 1.3 ClientHello) 探测 H3; 0=默认轻量 VN 探针 */
     int enable_h2;            /* 全局默认启用 TCP/H2 (默认 1) */
     int enable_h3;            /* 全局默认启用 UDP/H3 (默认 1) */
-    char ips_v4_file[MAX_PATH_LEN]; /* 自定义 IPv4 列表文件路径 (默认 ips-v4.txt) */
-    char ips_v6_file[MAX_PATH_LEN]; /* 自定义 IPv6 列表文件路径 (默认 ips-v6.txt) */
     char ips_v4_url[512];           /* 自定义 IPv4 列表下载 URL */
     char ips_v6_url[512];           /* 自定义 IPv6 列表下载 URL */
     int ips_v4_update_mode;         /* 0=仅缺失下载, 1=每次启动更新, 2=按 mtime 间隔更新 */
@@ -462,8 +460,14 @@ static void sanitize_ip_line(char *line);
 static uint32_t ipv4_to_u32(const char *s);
 static void u32_to_ipv4(uint32_t v, char *out, size_t sz);
 static uint64_t rand_u64(void);
-static int ensure_ips_file_for_type(int ips_type, int is_startup);
+static int ensure_ips_and_hotpool(int ips_type, int enable_h3, int is_startup);
 static const char *cfg_ips_file_for_type(int ips_type);
+static void hotpool_record_success(int ips_type, int is_udp, const char *ip, int lat_ms, int from_traffic);
+static void hotpool_record_failure(int ips_type, int is_udp, const char *ip, int penalty);
+static void hotpool_flush_all(void);
+static int hotpool_has_fresh_cloud(int ips_type, int is_udp);
+static void hotpool_clear_fresh_cloud(int ips_type, int is_udp);
+static StringList build_smart_ip_list(int ips_type, int is_udp, int random_mode, int v6_split, size_t target_ipnum);
 /* ── CidrList 函数实现 ──────────────────────────────────────── */
 
 /* 添加 CIDR 条目 */
@@ -756,8 +760,6 @@ static size_t g_carrier_runtime_count = 0;
 static pthread_mutex_t g_log_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_ips_v4_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_ips_v6_mu = PTHREAD_MUTEX_INITIALIZER;
-static atomic_llong g_ips_v4_last_check_s = 0;
-static atomic_llong g_ips_v6_last_check_s = 0;
 
 static int parse_addr(const char *addr, char *host, size_t hostsz, int *port);
 static socket_t accept_interruptible(socket_t listen_fd, struct sockaddr *addr,
@@ -1292,9 +1294,8 @@ static void usage(const char *p) {
     printf("  -health-log=value         健康状态行(debug 级明细)输出间隔秒数，0=关闭 (default 60)\n");
     printf("  -h3-client[=bool]         H3 探测启用真实 QUIC v1 Initial (TLS 1.3 ClientHello) 模拟 (default false)\n");
     printf("  -h2[=bool] / -h3[=bool]   启用或关闭 H2(TCP) / H3(UDP) 协议，支持 -v4-/-v6-/-baidu- 前缀 (default true)\n");
-    printf("  -v4-file / -v6-file              自定义 IPv4/IPv6 列表文件路径 (default ips-v4.txt / ips-v6.txt)\n");
-    printf("  -v4-url  / -v6-url               自定义 IPv4/IPv6 列表下载 URL (默认使用内置源)\n");
-    printf("  -update / -v4-update / -v6-update IP 列表更新策略: 0/false | 1/true(每次启动) | *m/*h/*d(按文件修改时间)\n");
+    printf("  -v4-url  / -v6-url               自定义云端优选源 URL (注入本地热库观察期，绝不覆盖官方 ips-v*.txt)\n");
+    printf("  -update / -v4-update / -v6-update 云端源更新策略: 0/false | 1/true(每次启动) | *m/*h/*d(按热库同步时间戳)\n");
     printf("  -to-cidr / -v4-to-cidr / -v6-to-cidr 单 IP 转 CIDR 并去重: 0/false | 1/true(/24或/64) | 自定义前缀\n");
     printf("  注: 以上参数均支持 -v4- 或 -v6- 前缀实现精细化覆盖，如 -v6-code=200 -v4-delay=150\n");
 }
@@ -1396,8 +1397,6 @@ static void cfg_defaults(Config *c) {
     c->h3_client = 0;          /* 默认关闭真实 QUIC ClientHello 模拟，使用轻量 VN 探针 */
     c->enable_h2 = 1;          /* 默认双协议启用 */
     c->enable_h3 = 1;
-    strcpy(c->ips_v4_file, "ips-v4.txt");
-    strcpy(c->ips_v6_file, "ips-v6.txt");
     c->ips_v4_update_mode = 0;
     c->ips_v6_update_mode = 0;
     c->ips_v4_update_sec = 0;
@@ -1434,7 +1433,6 @@ static void parse_args(Config *c, int argc, char **argv) {
     int v4_random = -1, v6_random = -1;
     int v4_h2 = -1, v4_h3 = -1, v6_h2 = -1, v6_h3 = -1, baidu_h2 = -1, baidu_h3 = -1;
     int v6_split_val = -1;
-    char v4_file[MAX_PATH_LEN] = {0}, v6_file[MAX_PATH_LEN] = {0};
     char v4_url[512] = {0}, v6_url[512] = {0};
     int has_g_upd = 0, g_upd_mode = 0; long g_upd_sec = 0;
     int has_v4_upd = 0, v4_upd_mode = 0; long v4_upd_sec = 0;
@@ -1580,8 +1578,6 @@ static void parse_args(Config *c, int argc, char **argv) {
         else if (!strcmp(key, "baidu-h3")) baidu_h3 = parse_bool(val);
         /* 运行指标汇报间隔：与健康检查解耦（-stats-interval 为主名，-log-interval 作兼容别名）。
          * 显式传负数一律按 0（关闭）处理，避免出现「间隔 -5 秒」这种无意义配置。 */
-        else if (!strcmp(key, "v4-file") && val) snprintf(v4_file, sizeof(v4_file), "%s", val);
-        else if (!strcmp(key, "v6-file") && val) snprintf(v6_file, sizeof(v6_file), "%s", val);
         else if (!strcmp(key, "v4-url") && val) snprintf(v4_url, sizeof(v4_url), "%s", val);
         else if (!strcmp(key, "v6-url") && val) snprintf(v6_url, sizeof(v6_url), "%s", val);
         else if (!strcmp(key, "update")) {
@@ -1612,8 +1608,6 @@ static void parse_args(Config *c, int argc, char **argv) {
     }
 
     /* 合并全局与分栈自定义 IP 源参数（-v4- / -v6- 优先级高于全局） */
-    if (v4_file[0]) snprintf(c->ips_v4_file, sizeof(c->ips_v4_file), "%s", v4_file);
-    if (v6_file[0]) snprintf(c->ips_v6_file, sizeof(c->ips_v6_file), "%s", v6_file);
     if (v4_url[0]) snprintf(c->ips_v4_url, sizeof(c->ips_v4_url), "%s", v4_url);
     if (v6_url[0]) snprintf(c->ips_v6_url, sizeof(c->ips_v6_url), "%s", v6_url);
 
@@ -1852,25 +1846,25 @@ static void log_current_config(const Config *c) {
         if (c->colo[0]) log_msg("    数据中心筛选: %s", c->colo);
     }
 
-    if (strcmp(c->ips_v4_file, "ips-v4.txt") != 0 || c->ips_v4_url[0] || c->ips_v4_update_mode || c->ips_v4_to_cidr) {
-        char upd[32] = "仅缺失下载";
-        if (c->ips_v4_update_mode == 1) snprintf(upd, sizeof(upd), "每次启动更新");
-        else if (c->ips_v4_update_mode == 2) snprintf(upd, sizeof(upd), "每 %ld 秒(mtime)", c->ips_v4_update_sec);
+    if (c->ips_v4_url[0] || c->ips_v4_update_mode || c->ips_v4_to_cidr) {
+        char upd[32] = "仅缺失拉取";
+        if (c->ips_v4_update_mode == 1) snprintf(upd, sizeof(upd), "每次启动拉取");
+        else if (c->ips_v4_update_mode == 2) snprintf(upd, sizeof(upd), "每 %ld 秒(热库同步)", c->ips_v4_update_sec);
         char cidr_s[16];
         if (c->ips_v4_to_cidr) snprintf(cidr_s, sizeof(cidr_s), "/%d", c->ips_v4_to_cidr);
         else snprintf(cidr_s, sizeof(cidr_s), "关");
-        log_msg("  [IPv4 源配置] 文件: %s | URL: %s | 更新: %s | 单IP转CIDR: %s",
-                c->ips_v4_file, c->ips_v4_url[0] ? c->ips_v4_url : "(内置默认源)", upd, cidr_s);
+        log_msg("  [IPv4 热库/云端源] 底座: ips-v4.txt | 云端URL: %s | 更新: %s | 单IP转CIDR: %s",
+                c->ips_v4_url[0] ? c->ips_v4_url : "(仅本地热库+官方底座)", upd, cidr_s);
     }
-    if (strcmp(c->ips_v6_file, "ips-v6.txt") != 0 || c->ips_v6_url[0] || c->ips_v6_update_mode || c->ips_v6_to_cidr) {
-        char upd[32] = "仅缺失下载";
-        if (c->ips_v6_update_mode == 1) snprintf(upd, sizeof(upd), "每次启动更新");
-        else if (c->ips_v6_update_mode == 2) snprintf(upd, sizeof(upd), "每 %ld 秒(mtime)", c->ips_v6_update_sec);
+    if (c->ips_v6_url[0] || c->ips_v6_update_mode || c->ips_v6_to_cidr) {
+        char upd[32] = "仅缺失拉取";
+        if (c->ips_v6_update_mode == 1) snprintf(upd, sizeof(upd), "每次启动拉取");
+        else if (c->ips_v6_update_mode == 2) snprintf(upd, sizeof(upd), "每 %ld 秒(热库同步)", c->ips_v6_update_sec);
         char cidr_s[16];
         if (c->ips_v6_to_cidr) snprintf(cidr_s, sizeof(cidr_s), "/%d", c->ips_v6_to_cidr);
         else snprintf(cidr_s, sizeof(cidr_s), "关");
-        log_msg("  [IPv6 源配置] 文件: %s | URL: %s | 更新: %s | 单IP转CIDR: %s",
-                c->ips_v6_file, c->ips_v6_url[0] ? c->ips_v6_url : "(内置默认源)", upd, cidr_s);
+        log_msg("  [IPv6 热库/云端源] 底座: ips-v6.txt | 云端URL: %s | 更新: %s | 单IP转CIDR: %s",
+                c->ips_v6_url[0] ? c->ips_v6_url : "(仅本地热库+官方底座)", upd, cidr_s);
     }
     log_msg("  全局设置: 出站网卡: %s | 运行指标间隔: %d 秒 (0=关闭) | H3探针: %s | 日志级别: %s",
             c->bind_if[0] ? c->bind_if : "(系统默认路由)", c->stats_interval,
@@ -2152,70 +2146,7 @@ static int ensure_data_file(const char *expected, const char **urls) {
 }
 
 static const char *cfg_ips_file_for_type(int ips_type) {
-    if (ips_type == 6) return g_cfg.ips_v6_file[0] ? g_cfg.ips_v6_file : "ips-v6.txt";
-    return g_cfg.ips_v4_file[0] ? g_cfg.ips_v4_file : "ips-v4.txt";
-}
-
-/* 统一管理自定义 IPv4/IPv6 列表文件的下载、启动强制更新、运行期 mtime 间隔更新与失败保底 */
-static int ensure_ips_file_for_type(int ips_type, int is_startup) {
-    int is_v6 = (ips_type == 6);
-    pthread_mutex_t *mu = is_v6 ? &g_ips_v6_mu : &g_ips_v4_mu;
-    atomic_llong *last_check_s = is_v6 ? &g_ips_v6_last_check_s : &g_ips_v4_last_check_s;
-    const char *target = cfg_ips_file_for_type(ips_type);
-    const char *custom_url = is_v6 ? g_cfg.ips_v6_url : g_cfg.ips_v4_url;
-    int update_mode = is_v6 ? g_cfg.ips_v6_update_mode : g_cfg.ips_v4_update_mode;
-    long update_sec = is_v6 ? g_cfg.ips_v6_update_sec : g_cfg.ips_v4_update_sec;
-
-    const char *custom_urls[2] = { custom_url, nullptr };
-    const char **urls = (custom_url && custom_url[0]) ? custom_urls : (is_v6 ? IPS_V6_URLS : IPS_V4_URLS);
-
-    pthread_mutex_lock(mu);
-    time_t mtime = 0;
-    int64_t fsize = 0;
-    int exists = (file_mtime_and_size(target, &mtime, &fsize) == 0 && fsize > 0);
-    time_t now_s = time(nullptr);
-    long long prev_chk = atomic_load_explicit(last_check_s, memory_order_relaxed);
-
-    int need_dl = 0;
-    const char *reason = "";
-    if (!exists) {
-        need_dl = 1;
-        reason = "本地文件不存在";
-    } else if (update_mode == 1 && is_startup) {
-        need_dl = 1;
-        reason = "启动强制更新";
-    } else if (update_mode == 2 && update_sec > 0) {
-        long age = (long)(now_s - mtime);
-        long since_chk = (prev_chk > 0) ? (long)((long long)now_s - prev_chk) : age;
-        if (age >= update_sec && since_chk >= update_sec) {
-            need_dl = 1;
-            reason = "已达定时更新间隔";
-        }
-    }
-
-    if (!need_dl) {
-        pthread_mutex_unlock(mu);
-        return 0;
-    }
-
-    log_msg("正在更新 IPv%d 列表 %s（原因: %s，来源: %s）",
-            is_v6 ? 6 : 4, target, reason,
-            (custom_url && custom_url[0]) ? custom_url : "内置默认源");
-    int changed = 0;
-    int rc = download_file_from_urls_ex(urls, target, is_v6 ? 6 : 4, &changed);
-    atomic_store_explicit(last_check_s, (long long)time(nullptr), memory_order_relaxed);
-    pthread_mutex_unlock(mu);
-
-    if (rc == 0) {
-        if (changed) log_msg("IPv%d 列表 %s 已更新并校验通过", is_v6 ? 6 : 4, target);
-        else log_msg("IPv%d 列表 %s 远端无变更，继续沿用本地文件", is_v6 ? 6 : 4, target);
-        return 0;
-    }
-    if (exists) {
-        warn_msg("更新 IPv%d 列表 %s 失败，保底继续使用现有本地文件", is_v6 ? 6 : 4, target);
-        return 0;
-    }
-    return -1;
+    return (ips_type == 6) ? "ips-v6.txt" : "ips-v4.txt";
 }
 
 static char *read_file_all(const char *path, size_t *out_len) {
@@ -2590,6 +2521,620 @@ static StringList load_ip_list(const char *filename, int random_mode, int v6_spl
     if (!random_mode && out.len > 100000) {
         warn_msg("当前使用 -random=false，已完整展开大量 IP，扫描会明显变慢；需要快速启动时建议使用 -random=true");
     }
+    return out;
+}
+
+/* =========================================================================
+ * v0.2.0 分协议定容热库引擎 (HotPool):
+ *   三层漏斗：官方底座 ips-v*.txt -> 记忆层 ips-hotpool-v*(-udp).txt -> 战备层 *-cache-*.txt
+ *   生命周期（利特尔法则对齐）：24h 观察期(hits==1) + 3天半衰期 + 7天硬TTL + 10m 记分节流
+ *   分协议物理隔离：H2 与 H3 各自维护定容热库 (v4 上限 250; v6 上限 450，其中 /48 上限 50)
+ * ========================================================================= */
+
+#define HOTPOOL_SANDBOX_TTL_SEC 86400L
+#define HOTPOOL_HARD_TTL_SEC    604800L
+#define HOTPOOL_HALFLIFE_SEC    259200.0
+#define HOTPOOL_DEBOUNCE_SEC    600L
+#define HOTPOOL_V4_CAP          250
+#define HOTPOOL_V6_CAP          450
+#define HOTPOOL_V6_48_CAP       50
+
+typedef struct {
+    char net[MAX_IP_LEN];
+    uint8_t prefix;
+    uint32_t hits;
+    int ema_lat;
+    int fail_ema;
+    time_t last_seen;
+    time_t last_hit;
+    uint16_t slot_mask;
+} HotEntry;
+
+typedef struct {
+    int ips_type;
+    int is_udp;
+    const char *path;
+    size_t cap_limit;
+    HotEntry *items;
+    size_t len, cap;
+    time_t cloud_sync_ts;
+    uint64_t cloud_hash;
+    int loaded;
+    int dirty;
+    int fresh_cloud;
+    pthread_mutex_t mu;
+} HotPool;
+
+static HotPool g_hp_v4_tcp = { .ips_type = 4, .is_udp = 0, .path = "ips-hotpool-v4.txt",     .cap_limit = HOTPOOL_V4_CAP, .mu = PTHREAD_MUTEX_INITIALIZER };
+static HotPool g_hp_v6_tcp = { .ips_type = 6, .is_udp = 0, .path = "ips-hotpool-v6.txt",     .cap_limit = HOTPOOL_V6_CAP, .mu = PTHREAD_MUTEX_INITIALIZER };
+static HotPool g_hp_v4_udp = { .ips_type = 4, .is_udp = 1, .path = "ips-hotpool-v4-udp.txt", .cap_limit = HOTPOOL_V4_CAP, .mu = PTHREAD_MUTEX_INITIALIZER };
+static HotPool g_hp_v6_udp = { .ips_type = 6, .is_udp = 1, .path = "ips-hotpool-v6-udp.txt", .cap_limit = HOTPOOL_V6_CAP, .mu = PTHREAD_MUTEX_INITIALIZER };
+
+static inline HotPool *hotpool_get(int ips_type, int is_udp) {
+    if (ips_type == 6) return is_udp ? &g_hp_v6_udp : &g_hp_v6_tcp;
+    return is_udp ? &g_hp_v4_udp : &g_hp_v4_tcp;
+}
+
+static inline int current_time_slot(void) {
+    time_t t = time(nullptr);
+    struct tm tmv;
+#ifdef _WIN32
+    localtime_s(&tmv, &t);
+#else
+    localtime_r(&t, &tmv);
+#endif
+    int s = tmv.tm_hour / 2;
+    return (s >= 0 && s < 12) ? s : 0;
+}
+
+/* 零 -lm 依赖的 0.5^(elapsed / 3d) 衰减函数（误差 < 0.5%） */
+static double fast_half_life_decay(double elapsed_sec) {
+    if (elapsed_sec <= 0.0) return 1.0;
+    double hl = elapsed_sec / HOTPOOL_HALFLIFE_SEC;
+    if (hl >= 20.0) return 0.0;
+    int whole = (int)hl;
+    double frac = hl - (double)whole;
+    double base = 1.0 / (double)(1ULL << whole);
+    return base / (1.0 + 0.693147 * frac + 0.240227 * frac * frac);
+}
+
+static double fast_log1p_u32(uint32_t x) {
+    double v = (double)x + 1.0;
+    double l = 0.0;
+    while (v >= 2.0) { v *= 0.5; l += 0.693147; }
+    return l + (v - 1.0);
+}
+
+static double hot_entry_score(const HotEntry *e, time_t now_s, int cur_slot) {
+    if (!e) return -1e9;
+    double base = (e->hits >= 2 ? 4.0 : 1.0) + fast_log1p_u32(e->hits) * 2.0;
+    if (e->ema_lat > 0 && e->ema_lat < 400) base += (double)(400 - e->ema_lat) / 100.0;
+    if (e->slot_mask & (uint16_t)(1u << cur_slot)) base *= 1.25;
+    base -= (double)e->fail_ema * 2.5;
+    double age = (now_s > e->last_seen) ? (double)(now_s - e->last_seen) : 0.0;
+    return base * fast_half_life_decay(age);
+}
+
+/* 规范化网段文本（将主机位清零） */
+static int normalize_subnet_str(int ips_type, const char *ip, int prefix, char *out, size_t outsz) {
+    if (!ip || !*ip || !out || outsz == 0) return -1;
+    if (ips_type == 6) {
+        if (prefix < 1 || prefix > 128) return -1;
+        unsigned char b[16];
+        if (inet_pton(AF_INET6, ip, b) != 1) return -1;
+        for (int bit = prefix; bit < 128; bit++) {
+            b[bit / 8] &= (unsigned char)~(1u << (7 - (bit % 8)));
+        }
+        format_ipv6_full(b, out, outsz);
+        return 0;
+    } else {
+        if (prefix < 8 || prefix > 32) return -1;
+        uint32_t u = ipv4_to_u32(ip);
+        if (u == 0) return -1;
+        uint32_t mask = (prefix == 32) ? 0xffffffffu : (0xffffffffu << (32 - prefix));
+        u32_to_ipv4(u & mask, out, outsz);
+        return 0;
+    }
+}
+
+static void hotpool_load_locked(HotPool *hp) {
+    if (!hp || hp->loaded) return;
+    hp->loaded = 1;
+    FILE *fp = fopen(hp->path, "rb");
+    if (!fp) return;
+    char line[MAX_LINE];
+    while (fgets(line, sizeof(line), fp)) {
+        trim_line(line);
+        if (!line[0]) continue;
+        if (line[0] == '#') {
+            long long sync_ts = 0;
+            unsigned long long h = 0;
+            if (sscanf(line, "# cfnat-hotpool-v1 cloud_sync=%lld cloud_hash=%llx", &sync_ts, &h) >= 1) {
+                hp->cloud_sync_ts = (time_t)sync_ts;
+                hp->cloud_hash = (uint64_t)h;
+            }
+            continue;
+        }
+        HotEntry e = {0};
+        unsigned int pfx = 0, hits = 0, smask = 0;
+        long long lseen = 0, lhit = 0;
+        if (sscanf(line, "%63[^|]|%u|%u|%d|%d|%lld|%lld|%x",
+                   e.net, &pfx, &hits, &e.ema_lat, &e.fail_ema, &lseen, &lhit, &smask) >= 6) {
+            if (hp->ips_type == 6 && (pfx < 1 || pfx > 128)) continue;
+            if (hp->ips_type == 4 && (pfx < 8 || pfx > 32)) continue;
+            e.prefix = (uint8_t)pfx;
+            e.hits = hits > 0 ? hits : 1;
+            e.last_seen = (time_t)lseen;
+            e.last_hit = (time_t)(lhit > 0 ? lhit : lseen);
+            e.slot_mask = (uint16_t)(smask & 0x0fffu);
+            if (hp->len == hp->cap) {
+                size_t nc = hp->cap ? hp->cap * 2 : 128;
+                HotEntry *ni = realloc(hp->items, nc * sizeof(HotEntry));
+                if (!ni) break;
+                hp->items = ni;
+                hp->cap = nc;
+            }
+            hp->items[hp->len++] = e;
+        }
+    }
+    fclose(fp);
+    if (hp->len > 0) {
+        debug_msg("已载入热库 %s: %zu 条记录", hp->path, hp->len);
+    }
+}
+
+static void hotpool_prune_and_trim_locked(HotPool *hp, time_t now_s) {
+    if (!hp || hp->len == 0) return;
+    size_t w = 0;
+    for (size_t i = 0; i < hp->len; i++) {
+        HotEntry *e = &hp->items[i];
+        long age = (now_s > e->last_seen) ? (long)(now_s - e->last_seen) : 0;
+        if (e->fail_ema >= 6) continue;
+        if (age > HOTPOOL_HARD_TTL_SEC) continue;
+        if (e->hits <= 1 && age > HOTPOOL_SANDBOX_TTL_SEC) continue;
+        if (w != i) hp->items[w] = *e;
+        w++;
+    }
+    if (w != hp->len) {
+        hp->len = w;
+        hp->dirty = 1;
+    }
+
+    int slot = current_time_slot();
+    /* 按综合衰减分降序排列（24h 保护期内观察项保底不低于 0.5 分） */
+    for (size_t i = 1; i < hp->len; i++) {
+        HotEntry key = hp->items[i];
+        double ks = hot_entry_score(&key, now_s, slot);
+        if (key.hits <= 1 && (now_s - key.last_seen) <= HOTPOOL_SANDBOX_TTL_SEC && ks < 0.5) ks = 0.5;
+        size_t j = i;
+        while (j > 0) {
+            double ps = hot_entry_score(&hp->items[j - 1], now_s, slot);
+            if (hp->items[j - 1].hits <= 1 && (now_s - hp->items[j - 1].last_seen) <= HOTPOOL_SANDBOX_TTL_SEC && ps < 0.5) ps = 0.5;
+            if (ps >= ks) break;
+            hp->items[j] = hp->items[j - 1];
+            j--;
+        }
+        hp->items[j] = key;
+    }
+
+    /* IPv6 额外限制 /48 父段席位 <= 50，防止全段覆盖 */
+    if (hp->ips_type == 6) {
+        size_t cnt48 = 0, out_w = 0;
+        for (size_t i = 0; i < hp->len; i++) {
+            if (hp->items[i].prefix == 48) {
+                if (cnt48 >= HOTPOOL_V6_48_CAP) continue;
+                cnt48++;
+            }
+            if (out_w != i) hp->items[out_w] = hp->items[i];
+            out_w++;
+        }
+        if (out_w != hp->len) { hp->len = out_w; hp->dirty = 1; }
+    }
+
+    if (hp->len > hp->cap_limit) {
+        hp->len = hp->cap_limit;
+        hp->dirty = 1;
+    }
+}
+
+static void hotpool_save_locked(HotPool *hp) {
+    if (!hp || !hp->dirty) return;
+    hotpool_prune_and_trim_locked(hp, time(nullptr));
+    char tmp[512];
+    snprintf(tmp, sizeof(tmp), "%s.tmp.%u", hp->path, (unsigned int)((rand_u64() ^ (uint64_t)now_ms()) & 0xffffu));
+    FILE *fp = fopen(tmp, "wb");
+    if (!fp) return;
+    fprintf(fp, "# cfnat-hotpool-v1 cloud_sync=%lld cloud_hash=%016llx\n",
+            (long long)hp->cloud_sync_ts, (unsigned long long)hp->cloud_hash);
+    for (size_t i = 0; i < hp->len; i++) {
+        const HotEntry *e = &hp->items[i];
+        fprintf(fp, "%s|%u|%u|%d|%d|%lld|%lld|%x\n",
+                e->net, (unsigned)e->prefix, (unsigned)e->hits, e->ema_lat, e->fail_ema,
+                (long long)e->last_seen, (long long)e->last_hit, (unsigned)e->slot_mask);
+    }
+    fflush(fp);
+#ifdef _WIN32
+    int fd = _fileno(fp);
+    if (fd >= 0) _commit(fd);
+    fclose(fp);
+#else
+    int fd = fileno(fp);
+    if (fd >= 0) fsync(fd);
+    fclose(fp);
+#endif
+    if (atomic_replace_file(tmp, hp->path) == 0) {
+        hp->dirty = 0;
+    } else {
+        remove(tmp);
+    }
+}
+
+static void hotpool_upsert_locked(HotPool *hp, const char *net, uint8_t prefix, int lat_ms, int from_traffic, int is_cloud_seed) {
+    time_t now_s = time(nullptr);
+    uint16_t sbit = (uint16_t)(1u << current_time_slot());
+    for (size_t i = 0; i < hp->len; i++) {
+        HotEntry *e = &hp->items[i];
+        if (e->prefix == prefix && strcmp(e->net, net) == 0) {
+            e->last_seen = now_s;
+            if (!is_cloud_seed) {
+                e->slot_mask |= sbit;
+                if (lat_ms > 0) e->ema_lat = (e->ema_lat > 0) ? ((e->ema_lat * 3 + lat_ms) / 4) : lat_ms;
+                if (e->fail_ema > 0) e->fail_ema--;
+                if ((now_s - e->last_hit) >= HOTPOOL_DEBOUNCE_SEC || (from_traffic && e->hits == 1)) {
+                    e->hits++;
+                    e->last_hit = now_s;
+                }
+            }
+            hp->dirty = 1;
+            return;
+        }
+    }
+    if (hp->len == hp->cap) {
+        size_t nc = hp->cap ? hp->cap * 2 : 128;
+        HotEntry *ni = realloc(hp->items, nc * sizeof(HotEntry));
+        if (!ni) return;
+        hp->items = ni;
+        hp->cap = nc;
+    }
+    HotEntry e = {0};
+    snprintf(e.net, sizeof(e.net), "%s", net);
+    e.prefix = prefix;
+    e.hits = is_cloud_seed ? 1u : (from_traffic ? 2u : 1u);
+    e.ema_lat = lat_ms > 0 ? lat_ms : 0;
+    e.fail_ema = 0;
+    e.last_seen = now_s;
+    e.last_hit = now_s;
+    e.slot_mask = is_cloud_seed ? 0 : sbit;
+    hp->items[hp->len++] = e;
+    hp->dirty = 1;
+}
+
+static void hotpool_record_success(int ips_type, int is_udp, const char *ip, int lat_ms, int from_traffic) {
+    if (!ip || !*ip) return;
+    HotPool *hp = hotpool_get(ips_type, is_udp);
+    char net[MAX_IP_LEN];
+    int pfx = (ips_type == 6) ? 64 : 24;
+    if (normalize_subnet_str(ips_type, ip, pfx, net, sizeof(net)) != 0) return;
+
+    pthread_mutex_lock(&hp->mu);
+    hotpool_load_locked(hp);
+    hotpool_upsert_locked(hp, net, (uint8_t)pfx, lat_ms, from_traffic, 0);
+    if (ips_type == 6) {
+        char net48[MAX_IP_LEN];
+        if (normalize_subnet_str(6, ip, 48, net48, sizeof(net48)) == 0) {
+            hotpool_upsert_locked(hp, net48, 48, lat_ms, from_traffic, 0);
+        }
+    }
+    if (!from_traffic) hotpool_prune_and_trim_locked(hp, time(nullptr));
+    pthread_mutex_unlock(&hp->mu);
+}
+
+static void hotpool_record_failure(int ips_type, int is_udp, const char *ip, int penalty) {
+    if (!ip || !*ip || penalty <= 0) return;
+    HotPool *hp = hotpool_get(ips_type, is_udp);
+    char net[MAX_IP_LEN];
+    int pfx = (ips_type == 6) ? 64 : 24;
+    if (normalize_subnet_str(ips_type, ip, pfx, net, sizeof(net)) != 0) return;
+
+    pthread_mutex_lock(&hp->mu);
+    hotpool_load_locked(hp);
+    for (size_t i = 0; i < hp->len; i++) {
+        if ((hp->items[i].prefix == (uint8_t)pfx && strcmp(hp->items[i].net, net) == 0) ||
+            ((hp->items[i].prefix == 32 || hp->items[i].prefix == 128) && strcmp(hp->items[i].net, ip) == 0)) {
+            hp->items[i].fail_ema += penalty;
+            hp->dirty = 1;
+            if (hp->items[i].fail_ema >= 6) {
+                hp->items[i] = hp->items[--hp->len];
+                break;
+            }
+        }
+    }
+    pthread_mutex_unlock(&hp->mu);
+}
+
+static void hotpool_flush_all(void) {
+    HotPool *all[4] = { &g_hp_v4_tcp, &g_hp_v6_tcp, &g_hp_v4_udp, &g_hp_v6_udp };
+    for (int i = 0; i < 4; i++) {
+        pthread_mutex_lock(&all[i]->mu);
+        if (all[i]->dirty) hotpool_save_locked(all[i]);
+        pthread_mutex_unlock(&all[i]->mu);
+    }
+}
+
+static int hotpool_has_fresh_cloud(int ips_type, int is_udp) {
+    HotPool *hp = hotpool_get(ips_type, is_udp);
+    pthread_mutex_lock(&hp->mu);
+    int v = hp->fresh_cloud;
+    pthread_mutex_unlock(&hp->mu);
+    return v;
+}
+
+static void hotpool_clear_fresh_cloud(int ips_type, int is_udp) {
+    HotPool *hp = hotpool_get(ips_type, is_udp);
+    pthread_mutex_lock(&hp->mu);
+    hp->fresh_cloud = 0;
+    pthread_mutex_unlock(&hp->mu);
+}
+
+/* 将云端下载校验后的临时文件按观察期 (hits=1) 注入对应热库，绝不覆盖官方 ips-v*.txt */
+static size_t hotpool_inject_file_locked(HotPool *hp, const char *tmp_path, int to_cidr) {
+    FILE *fp = fopen(tmp_path, "r");
+    if (!fp) return 0;
+    char line[MAX_LINE];
+    size_t injected = 0;
+    DedupSet64 seen = {0};
+    while (fgets(line, sizeof(line), fp)) {
+        sanitize_ip_line(line);
+        if (!line[0]) continue;
+        char *slash = strchr(line, '/');
+        int pfx = -1;
+        if (slash) {
+            *slash = '\0';
+            const char *ps = slash + 1;
+            int ok = (ps[0] != '\0');
+            for (const char *p = ps; *p && ok; p++) if (!isdigit((unsigned char)*p)) ok = 0;
+            if (!ok) continue;
+            pfx = atoi(ps);
+        }
+        if (hp->ips_type == 6) {
+            if (!strchr(line, ':')) continue;
+            if (pfx < 0) pfx = 128;
+            if (pfx < 1 || pfx > 128) continue;
+            if (pfx == 128 && to_cidr >= 1 && to_cidr <= 127) pfx = to_cidr;
+        } else {
+            if (strchr(line, ':')) continue;
+            if (pfx < 0) pfx = 32;
+            if (pfx < 8 || pfx > 32) continue;
+            if (pfx == 32 && to_cidr >= 8 && to_cidr <= 31) pfx = to_cidr;
+        }
+        char norm[MAX_IP_LEN];
+        if (normalize_subnet_str(hp->ips_type, line, pfx, norm, sizeof(norm)) != 0) continue;
+        char kbuf[MAX_IP_LEN + 8];
+        int klen = snprintf(kbuf, sizeof(kbuf), "%s/%d", norm, pfx);
+        if (!dedup_insert(&seen, fnv1a_64_bytes(kbuf, (size_t)klen))) continue;
+        hotpool_upsert_locked(hp, norm, (uint8_t)pfx, 0, 0, 1);
+        injected++;
+        if (injected >= hp->cap_limit) break;
+    }
+    fclose(fp);
+    dedup_free(&seen);
+    return injected;
+}
+
+/* 统一准备官方底座 + 云端外援注入热库（官方底座失败但热库或云端可用时容错放行） */
+static int ensure_ips_and_hotpool(int ips_type, int enable_h3, int is_startup) {
+    int is_v6 = (ips_type == 6);
+    pthread_mutex_t *mu = is_v6 ? &g_ips_v6_mu : &g_ips_v4_mu;
+    const char *base_file = cfg_ips_file_for_type(ips_type);
+    const char **base_urls = is_v6 ? IPS_V6_URLS : IPS_V4_URLS;
+    const char *cloud_url = is_v6 ? g_cfg.ips_v6_url : g_cfg.ips_v4_url;
+    int update_mode = is_v6 ? g_cfg.ips_v6_update_mode : g_cfg.ips_v4_update_mode;
+    long update_sec = is_v6 ? g_cfg.ips_v6_update_sec : g_cfg.ips_v4_update_sec;
+    int to_cidr = is_v6 ? g_cfg.ips_v6_to_cidr : g_cfg.ips_v4_to_cidr;
+
+    HotPool *hp_tcp = hotpool_get(ips_type, 0);
+    HotPool *hp_udp = hotpool_get(ips_type, 1);
+
+    pthread_mutex_lock(mu);
+    pthread_mutex_lock(&hp_tcp->mu);
+    hotpool_load_locked(hp_tcp);
+    hotpool_prune_and_trim_locked(hp_tcp, time(nullptr));
+    time_t last_sync = hp_tcp->cloud_sync_ts;
+    uint64_t prev_hash = hp_tcp->cloud_hash;
+    size_t hp_tcp_len = hp_tcp->len;
+    pthread_mutex_unlock(&hp_tcp->mu);
+
+    size_t hp_udp_len = 0;
+    if (enable_h3) {
+        pthread_mutex_lock(&hp_udp->mu);
+        hotpool_load_locked(hp_udp);
+        hotpool_prune_and_trim_locked(hp_udp, time(nullptr));
+        if (last_sync == 0) { last_sync = hp_udp->cloud_sync_ts; prev_hash = hp_udp->cloud_hash; }
+        hp_udp_len = hp_udp->len;
+        pthread_mutex_unlock(&hp_udp->mu);
+    }
+
+    int base_ok = file_exists(base_file);
+    if (!base_ok) {
+        log_msg("官方底座 %s 不存在，正在下载...", base_file);
+        base_ok = (download_file_from_urls_ex(base_urls, base_file, is_v6 ? 6 : 4, nullptr) == 0);
+        if (!base_ok) {
+            warn_msg("官方底座 %s 下载失败（若本地热库或云端源可用将继续运行）", base_file);
+        }
+    }
+
+    int cloud_ok = 0;
+    if (cloud_url && cloud_url[0]) {
+        time_t now_s = time(nullptr);
+        int need_sync = 0;
+        const char *reason = "";
+        if (hp_tcp_len == 0 && hp_udp_len == 0) { need_sync = 1; reason = "热库为空冷启动"; }
+        else if (update_mode == 1 && is_startup) { need_sync = 1; reason = "启动拉取"; }
+        else if (update_mode == 2 && update_sec > 0 && (now_s - last_sync) >= update_sec) {
+            need_sync = 1; reason = "已达定时同步间隔";
+        }
+
+        if (need_sync) {
+            char tmp[512];
+            snprintf(tmp, sizeof(tmp), "cfnat-cloud-v%d.tmp.%u", is_v6 ? 6 : 4, (unsigned int)(rand_u64() & 0xffffu));
+            log_msg("正在拉取 IPv%d 云端外援源（原因: %s，来源: %s）", is_v6 ? 6 : 4, reason, cloud_url);
+            if (download_url_to_tmp(cloud_url, tmp) == 0 && validate_ips_temp_file(tmp, is_v6 ? 6 : 4) == 0) {
+                uint64_t new_hash = 0, new_sz = 0;
+                file_content_hash64(tmp, &new_hash, &new_sz);
+                int changed = (new_hash != prev_hash || (hp_tcp_len == 0 && hp_udp_len == 0));
+                time_t sync_now = time(nullptr);
+
+                pthread_mutex_lock(&hp_tcp->mu);
+                hp_tcp->cloud_sync_ts = sync_now;
+                hp_tcp->cloud_hash = new_hash;
+                if (changed) {
+                    size_t n_inj = hotpool_inject_file_locked(hp_tcp, tmp, to_cidr);
+                    hp_tcp->fresh_cloud = 1;
+                    hp_tcp->dirty = 1;
+                    hotpool_save_locked(hp_tcp);
+                    hp_tcp_len = hp_tcp->len;
+                    log_msg("IPv%d 云端源已注入 TCP 热库观察期: 新增/刷新 %zu 条（热库总计 %zu 条）",
+                            is_v6 ? 6 : 4, n_inj, hp_tcp->len);
+                } else {
+                    hp_tcp->dirty = 1;
+                    hotpool_save_locked(hp_tcp);
+                    log_msg("IPv%d 云端源内容无变更，保持现有热库与缓存", is_v6 ? 6 : 4);
+                }
+                pthread_mutex_unlock(&hp_tcp->mu);
+
+                if (enable_h3) {
+                    pthread_mutex_lock(&hp_udp->mu);
+                    hp_udp->cloud_sync_ts = sync_now;
+                    hp_udp->cloud_hash = new_hash;
+                    if (changed) {
+                        hotpool_inject_file_locked(hp_udp, tmp, to_cidr);
+                        hp_udp->fresh_cloud = 1;
+                        hp_udp->dirty = 1;
+                        hotpool_save_locked(hp_udp);
+                        hp_udp_len = hp_udp->len;
+                    } else {
+                        hp_udp->dirty = 1;
+                        hotpool_save_locked(hp_udp);
+                    }
+                    pthread_mutex_unlock(&hp_udp->mu);
+                }
+                cloud_ok = 1;
+            } else {
+                warn_msg("拉取或校验 IPv%d 云端源失败，保底沿用本地热库与官方底座", is_v6 ? 6 : 4);
+            }
+            remove(tmp);
+        }
+    }
+    pthread_mutex_unlock(mu);
+
+    return (base_ok || cloud_ok || hp_tcp_len > 0 || hp_udp_len > 0) ? 0 : -1;
+}
+
+static void sample_one_ip_from_hot_entry(int ips_type, const HotEntry *e, StringList *out) {
+    if (!e || !out) return;
+    if (ips_type == 6) {
+        if (e->prefix == 128) {
+            strlist_add(out, e->net);
+            return;
+        }
+        unsigned char b[16];
+        if (inet_pton(AF_INET6, e->net, b) != 1) return;
+        uint64_t r = 0;
+        int rbits = 0;
+        for (int pos = e->prefix; pos < 128; pos++) {
+            if (rbits == 0) { r = rand_u64(); rbits = 64; }
+            if (r & 1u) b[pos / 8] |= (unsigned char)(1u << (7 - (pos % 8)));
+            r >>= 1;
+            rbits--;
+        }
+        char ip[MAX_IP_LEN];
+        format_ipv6_full(b, ip, sizeof(ip));
+        strlist_add(out, ip);
+    } else {
+        uint32_t start = ipv4_to_u32(e->net);
+        if (start == 0) return;
+        if (e->prefix == 32) {
+            strlist_add(out, e->net);
+            return;
+        }
+        uint64_t cnt = 1ULL << (32 - e->prefix);
+        uint32_t off = (uint32_t)(rand_u64() % cnt);
+        char ip[MAX_IP_LEN];
+        u32_to_ipv4(start + off, ip, sizeof(ip));
+        strlist_add(out, ip);
+    }
+}
+
+/* 三路配额智能抽样器（50% 黄金段 + 30% 观察期/云端种子 + 20% 官方底座 UCB 探索）
+ * 若热库为空则平滑回退标准官方库 load_ip_list */
+static StringList build_smart_ip_list(int ips_type, int is_udp, int random_mode, int v6_split, size_t target_ipnum) {
+    HotPool *hp = hotpool_get(ips_type, is_udp);
+    const char *base_file = cfg_ips_file_for_type(ips_type);
+    int v4_tc = g_cfg.ips_v4_to_cidr;
+    int v6_tc = g_cfg.ips_v6_to_cidr;
+
+    pthread_mutex_lock(&hp->mu);
+    hotpool_load_locked(hp);
+    hotpool_prune_and_trim_locked(hp, time(nullptr));
+    size_t hp_len = hp->len;
+    HotEntry *snap = nullptr;
+    if (hp_len > 0) {
+        snap = malloc(hp_len * sizeof(HotEntry));
+        if (snap) memcpy(snap, hp->items, hp_len * sizeof(HotEntry));
+        else hp_len = 0;
+    }
+    pthread_mutex_unlock(&hp->mu);
+
+    if (hp_len == 0) {
+        return load_ip_list(base_file, random_mode, v6_split, v4_tc, v6_tc);
+    }
+
+    size_t budget = target_ipnum * 6;
+    if (budget < 120) budget = 120;
+    if (budget > 300) budget = 300;
+    size_t q_gold = budget / 2;       /* 50% 黄金已转正段 */
+    size_t q_sand = (budget * 3) / 10;/* 30% 观察期/云端新种子 + /48 探新 /64 */
+    size_t q_base = budget - q_gold - q_sand; /* 20% 官方底座随机探索 */
+
+    StringList out = {0};
+    size_t n_gold = 0, n_sand = 0, n_base = 0;
+
+    /* 1. 黄金段（hits >= 2，按当前时段衰减分已排降序） */
+    for (size_t i = 0; i < hp_len && n_gold < q_gold; i++) {
+        if (snap[i].hits >= 2) {
+            sample_one_ip_from_hot_entry(ips_type, &snap[i], &out);
+            n_gold++;
+        }
+    }
+    /* 2. 观察期 / 云端注入段（hits == 1） */
+    for (size_t i = 0; i < hp_len && n_sand < q_sand; i++) {
+        if (snap[i].hits <= 1) {
+            sample_one_ip_from_hot_entry(ips_type, &snap[i], &out);
+            n_sand++;
+        }
+    }
+    /* 若观察期不足，从黄金 /48 再探新 /64 或从黄金段二次抽不同后缀补齐 */
+    for (size_t i = 0; i < hp_len && (n_gold + n_sand) < (q_gold + q_sand); i++) {
+        sample_one_ip_from_hot_entry(ips_type, &snap[i], &out);
+        n_sand++;
+    }
+    free(snap);
+
+    /* 3. 官方底座随机探索（防陷入局部最优） */
+    if (file_exists(base_file)) {
+        StringList base_ips = load_ip_list(base_file, 1, v6_split, v4_tc, v6_tc);
+        size_t need = (out.len < budget) ? (budget - out.len) : q_base;
+        if (need > base_ips.len) need = base_ips.len;
+        for (size_t i = 0; i < need; i++) {
+            strlist_add(&out, base_ips.items[i]);
+            n_base++;
+        }
+        strlist_free(&base_ips);
+    }
+
+    log_msg("[%s] 智能热库抽样完成: 共 %zu 个候选（黄金段 %zu + 观察/云端 %zu + 官方探索 %zu）",
+            ips_type == 6 ? (is_udp ? "IPv6/H3" : "IPv6/H2") : (is_udp ? "IPv4/H3" : "IPv4/H2"),
+            out.len, n_gold, n_sand, n_base);
     return out;
 }
 
@@ -5076,9 +5621,9 @@ static int try_use_candidate_cache(BaiduProxyPool *proxy_pool, ResultList *out) 
     if (!out) return 0;
     memset(out, 0, sizeof(*out));
     const char *path = candidate_cache_file("direct");
-    if (ips_file_newer_than_cache(g_cfg.ips_type, path)) {
-        log_msg("IP 列表文件 %s 新于候选缓存 %s，跳过旧缓存并重新扫描",
-                cfg_ips_file_for_type(g_cfg.ips_type), path);
+    if (hotpool_has_fresh_cloud(g_cfg.ips_type, 0) || ips_file_newer_than_cache(g_cfg.ips_type, path)) {
+        log_msg("检测到云端新源或底座更新，跳过旧缓存 %s 并重新测优", path);
+        hotpool_clear_fresh_cloud(g_cfg.ips_type, 0);
         return 0;
     }
     ResultList cached = load_candidate_cache(path);
@@ -5784,9 +6329,11 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
     const char *tcp_path = candidate_cache_file_for_profile(rt->spec.mode, ips_type);
     const char *udp_path = candidate_cache_file_for_profile_udp(rt->spec.mode, ips_type);
     const char *primary_cache = (!use_h2 && use_h3) ? udp_path : tcp_path;
-    if (ips_file_newer_than_cache(ips_type, primary_cache)) {
-        log_msg("[%s] IP 列表文件 %s 新于候选缓存 %s，跳过旧缓存并重新扫描",
-                carrier_display_name(rt->spec.mode), cfg_ips_file_for_type(ips_type), primary_cache);
+    int primary_is_udp = (!use_h2 && use_h3);
+    if (hotpool_has_fresh_cloud(ips_type, primary_is_udp) || ips_file_newer_than_cache(ips_type, primary_cache)) {
+        log_msg("[%s] 检测到云端新源或底座更新，跳过旧缓存 %s 并重新测优",
+                carrier_display_name(rt->spec.mode), primary_cache);
+        hotpool_clear_fresh_cloud(ips_type, primary_is_udp);
         return 0;
     }
     int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
@@ -5819,6 +6366,49 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
             return 1;
         }
         free(cached_udp.items);
+
+        /* 纯 H3 优先尝试独立 UDP 热库直接精筛（免跑多余 TCP 扫描） */
+        HotPool *udp_hp = hotpool_get(ips_type, 1);
+        pthread_mutex_lock(&udp_hp->mu);
+        hotpool_load_locked(udp_hp);
+        size_t udp_hp_len = udp_hp->len;
+        pthread_mutex_unlock(&udp_hp->mu);
+        if (udp_hp_len > 0) {
+            StringList u_seeds = build_smart_ip_list(ips_type, 1, 1, rt->spec.prof.v6_split > 0 ? rt->spec.prof.v6_split : g_cfg.v6_split, target_ipnum);
+            if (u_seeds.len > 0) {
+                Result *seed_res = calloc(u_seeds.len, sizeof(Result));
+                if (seed_res) {
+                    for (size_t si = 0; si < u_seeds.len; si++) {
+                        snprintf(seed_res[si].ip, sizeof(seed_res[si].ip), "%s", u_seeds.items[si]);
+                        snprintf(seed_res[si].data_center, sizeof(seed_res[si].data_center), "UNK");
+                        result_init_addr(&seed_res[si]);
+                    }
+                    ResultList fresh_udp = filter_udp_candidates_from_tcp(rt, seed_res, u_seeds.len, target_ipnum);
+                    free(seed_res);
+                    strlist_free(&u_seeds);
+                    if (fresh_udp.len > 0) {
+                        rt->udp_candidates.items = fresh_udp.items;
+                        rt->udp_candidates.len = fresh_udp.len;
+                        carrier_set_current_udp_candidate(rt, 0);
+                        atomic_store(&rt->udp_candidates.cache_valid, 1);
+                        save_candidate_cache(udp_path, fresh_udp.items, fresh_udp.len);
+                        for (size_t hi = 0; hi < fresh_udp.len && hi < 5; hi++) {
+                            hotpool_record_success(ips_type, 1, fresh_udp.items[hi].ip, fresh_udp.items[hi].latency_ms, 0);
+                        }
+                        hotpool_flush_all();
+                        log_msg("[%s] 纯 H3 模式基于 UDP 热库直筛快速启动:\n"
+                                "  └─ [UDP/H3] 最优 IP: %s (延迟 %d ms, 候选 %zu 个)",
+                                carrier_display_name(rt->spec.mode),
+                                rt->udp_candidates.current_ip, rt->udp_candidates.items[0].latency_ms, rt->udp_candidates.len);
+                        return 1;
+                    }
+                } else {
+                    strlist_free(&u_seeds);
+                }
+            } else {
+                strlist_free(&u_seeds);
+            }
+        }
 
         ResultList cached_tcp = load_candidate_cache_for_profile(tcp_path, &rt->spec.prof);
         if (cached_tcp.len == 0) return 0;
@@ -6506,9 +7096,13 @@ out:
     if (atomic_load(&g_running) && cc->runtime && cc->ip[0]) {
         if (conn_ok) {
             carrier_note_connection_success(cc->runtime, cc->ip);
+            if ((now_ms() - conn_start_ms) >= 60000 || up_bytes >= 65536ULL) {
+                hotpool_record_success(cc->runtime->spec.prof.ips_type, 0, cc->ip, best, 1);
+            }
         } else if (upstream_failed) {
             /* 严格排除客户端首字节前挂断或取消预连接的误判，仅在上游拨号失败或上游异常中断时惩罚节点 */
             carrier_note_connection_failed(cc->runtime, cc->ip);
+            hotpool_record_failure(cc->runtime->spec.prof.ips_type, 0, cc->ip, 3);
         }
     }
     if (cc->runtime) {
@@ -6832,6 +7426,10 @@ static int carrier_switch_next_ip(CarrierRuntime *rt) {
             if (idx < rt->candidates.len &&
                 strcmp(rt->candidates.items[idx].ip, tasks[best_k].ip) == 0) {
                 rt->candidates.items[idx].consecutive_fail = 0;
+                if (tasks[best_k].lat > 0) {
+                    rt->candidates.items[idx].ewma_latency = tasks[best_k].lat;
+                    rt->candidates.items[idx].latency_ms = tasks[best_k].lat;
+                }
             }
             pthread_mutex_unlock(&rt->candidates.mu);
             log_msg("[TCP/H2] [%s] 并行切换/按分回灌至可用节点: %s (候选索引: %zu/%zu, 延迟 %d ms)",
@@ -7005,6 +7603,10 @@ CFNAT_NODISCARD static int carrier_switch_next_udp_ip(CarrierRuntime *rt) {
             if (idx < rt->udp_candidates.len &&
                 strcmp(rt->udp_candidates.items[idx].ip, tasks[best_k].ip) == 0) {
                 rt->udp_candidates.items[idx].consecutive_fail = 0;
+                if (tasks[best_k].lat > 0) {
+                    rt->udp_candidates.items[idx].ewma_latency = tasks[best_k].lat;
+                    rt->udp_candidates.items[idx].latency_ms = tasks[best_k].lat;
+                }
             }
             pthread_mutex_unlock(&rt->udp_candidates.mu);
             log_msg("[UDP/H3] [%s] 并行切换/按分回灌至可用节点: %s (候选索引: %zu/%zu, 延迟 %d ms)",
@@ -7063,6 +7665,9 @@ static void carrier_note_connection_failed(CarrierRuntime *rt, const char *ip) {
         if (strcmp(rt->candidates.items[i].ip, ip) == 0) {
             rt->candidates.items[i].consecutive_fail++;
             rt->candidates.items[i].last_fail_ms = now_ms();
+            if (rt->candidates.items[i].ewma_latency < rt->candidates.items[i].latency_ms + 150) {
+                rt->candidates.items[i].ewma_latency += 40;
+            }
             atomic_store_explicit(&rt->candidates.has_node_fail, 1, memory_order_relaxed);
             break;
         }
@@ -7265,12 +7870,12 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
         CidrList fresh_cidrs = {0};
         StringList ips = {0};
         uint64_t cand_count = 0;
-        ensure_ips_file_for_type(rt->spec.prof.ips_type, 0);
+        ensure_ips_and_hotpool(rt->spec.prof.ips_type, rt->spec.prof.enable_h3, 0);
         if (use_cidr) {
             fresh_cidrs = load_cidr_list(ipfile, 0, g_cfg.ips_v4_to_cidr);
             cand_count = fresh_cidrs.len;
         } else {
-            ips = load_ip_list(ipfile, cur_random, cur_v6_split, g_cfg.ips_v4_to_cidr, g_cfg.ips_v6_to_cidr);
+            ips = build_smart_ip_list(rt->spec.prof.ips_type, 0, cur_random, cur_v6_split, target_ipnum);
             cand_count = ips.len;
         }
         if (cand_count > 0) {
@@ -7373,10 +7978,17 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
     /* 内存结构与旧指针已纯粹就绪并安全释放，最后异步/脱锁落盘候选文件，杜绝磁盘 I/O 阻塞内存清理 */
     if (new_tcp_items) {
         save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), new_tcp_items, tcp_count);
+        for (size_t hi = 0; hi < tcp_count && hi < 5; hi++) {
+            hotpool_record_success(rt->spec.prof.ips_type, 0, new_tcp_items[hi].ip, new_tcp_items[hi].latency_ms, 0);
+        }
     }
     if (udp_res.len > 0) {
         save_candidate_cache(candidate_cache_file_for_profile_udp(rt->spec.mode, rt->spec.prof.ips_type), udp_res.items, udp_res.len);
+        for (size_t hi = 0; hi < udp_res.len && hi < 5; hi++) {
+            hotpool_record_success(rt->spec.prof.ips_type, 1, udp_res.items[hi].ip, udp_res.items[hi].latency_ms, 0);
+        }
     }
+    hotpool_flush_all();
 
     int tcp_lat = (rt->candidates.items && rt->candidates.current_index < rt->candidates.len) ?
                   rt->candidates.items[rt->candidates.current_index].latency_ms : 0;
@@ -8348,7 +8960,10 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
                 s->down_collapsed = 0;      /* 下行恢复（含用户重新开始下载）→ 撤销降级标记 */
                 s->down_collapse_ms = 0;
             }
-            if (d_down >= H3_RECOVER_DOWN_BYTES) window_down_ok = 1;
+            if (d_down >= H3_RECOVER_DOWN_BYTES) {
+                window_down_ok = 1;
+                hotpool_record_success(rt->spec.prof.ips_type, 1, s->target_ip, 0, 1);
+            }
 
             /* 2. 上行型窒息检测：覆盖握手黑洞与上行重传型卡死 */
             if (d_up >= UDP_STALL_MIN_UP_BYTES && d_down < UDP_STALL_MAX_DOWN_BYTES && d_up >= d_down * 2) {
@@ -8444,6 +9059,9 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
                 if (strcmp(rt->udp_candidates.items[i].ip, s->target_ip) == 0) {
                     rt->udp_candidates.items[i].consecutive_fail++;
                     rt->udp_candidates.items[i].last_fail_ms = now_ms();
+                    if (rt->udp_candidates.items[i].ewma_latency < rt->udp_candidates.items[i].latency_ms + 150) {
+                        rt->udp_candidates.items[i].ewma_latency += 40;
+                    }
                     break;
                 }
             }
@@ -8469,6 +9087,7 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
                 }
             }
             pthread_mutex_unlock(&rt->udp_candidates.mu);
+            hotpool_record_failure(rt->spec.prof.ips_type, 1, s->target_ip, is_blackhole || is_stalled ? 3 : 2);
         }
 
         if (is_blackhole || is_stalled || cur_ms - s->last_active_ms > UDP_SESSION_TIMEOUT_MS) {
@@ -9078,14 +9697,22 @@ int main(int argc, char **argv) {
         else need_v4 = 1;
     }
 
-    if (need_v4 && ensure_ips_file_for_type(4, 1) != 0) {
-        log_msg("准备 IPv4 列表 %s 失败", cfg_ips_file_for_type(4));
+    int need_v4_h3 = g_cfg.enable_h3, need_v6_h3 = g_cfg.enable_h3;
+    if (carrier_spec_len > 0) {
+        need_v4_h3 = 0; need_v6_h3 = 0;
+        for (size_t i = 0; i < carrier_spec_len; i++) {
+            if (carrier_specs[i].prof.ips_type == 6 && carrier_specs[i].prof.enable_h3) need_v6_h3 = 1;
+            if (carrier_specs[i].prof.ips_type != 6 && carrier_specs[i].prof.enable_h3) need_v4_h3 = 1;
+        }
+    }
+    if (need_v4 && ensure_ips_and_hotpool(4, need_v4_h3, 1) != 0) {
+        log_msg("准备 IPv4 底座与热库均失败（无可用数据源）");
         free(carrier_specs);
         free(g_locations);
         return 1;
     }
-    if (need_v6 && ensure_ips_file_for_type(6, 1) != 0) {
-        log_msg("准备 IPv6 列表 %s 失败", cfg_ips_file_for_type(6));
+    if (need_v6 && ensure_ips_and_hotpool(6, need_v6_h3, 1) != 0) {
+        log_msg("准备 IPv6 底座与热库均失败（无可用数据源）");
         free(carrier_specs);
         free(g_locations);
         return 1;
@@ -9231,7 +9858,7 @@ int main(int argc, char **argv) {
                     continue;
                 }
             } else {
-                profile_ips = load_ip_list(cur_ipfile, rt->spec.prof.random_mode, cur_v6_split, g_cfg.ips_v4_to_cidr, g_cfg.ips_v6_to_cidr);
+                profile_ips = build_smart_ip_list(rt->spec.prof.ips_type, 0, rt->spec.prof.random_mode, cur_v6_split, (size_t)(rt->spec.prof.ipnum > 0 ? rt->spec.prof.ipnum : g_cfg.ipnum));
                 if (profile_ips.len == 0) {
                     warn_msg("[%s] 没有可扫描的 IP (%s 为空)", carrier_display_name(rt->spec.mode), cur_ipfile);
                     if (cfnat_socket_valid(rt->listen_fd)) { close(rt->listen_fd); rt->listen_fd = INVALID_SOCKET; }
@@ -9319,6 +9946,9 @@ int main(int argc, char **argv) {
                 carrier_set_current_candidate(rt, 0);
                 atomic_store(&rt->candidates.cache_valid, 1);
                 save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), rt->candidates.items, rt->candidates.len);
+                for (size_t hi = 0; hi < rt->candidates.len && hi < 5; hi++) {
+                    hotpool_record_success(rt->spec.prof.ips_type, 0, rt->candidates.items[hi].ip, rt->candidates.items[hi].latency_ms, 0);
+                }
             }
 
             // 2. 设置 UDP 候选池 (仅在启用 H3 时执行)
@@ -9330,6 +9960,9 @@ int main(int argc, char **argv) {
                     carrier_set_current_udp_candidate(rt, 0);
                     atomic_store(&rt->udp_candidates.cache_valid, 1);
                     save_candidate_cache(candidate_cache_file_for_profile_udp(rt->spec.mode, rt->spec.prof.ips_type), udp_res.items, udp_res.len);
+                    for (size_t hi = 0; hi < udp_res.len && hi < 5; hi++) {
+                        hotpool_record_success(rt->spec.prof.ips_type, 1, udp_res.items[hi].ip, udp_res.items[hi].latency_ms, 0);
+                    }
                 } else {
                     warn_msg("[%s] 经过多轮滑动检验，未捕获到有效 UDP/QUIC 节点（当地网络可能阻断境外 UDP 443），绝不使用假节点降级，等待自愈重扫",
                              carrier_display_name(rt->spec.mode));
@@ -9466,6 +10099,7 @@ int main(int argc, char **argv) {
                 long cur_ms = now_ms();
                 if ((long long)(cur_ms - last_stats_ms) >= (long long)g_cfg.stats_interval * 1000LL) {
                     last_stats_ms = cur_ms;
+                    hotpool_flush_all();
                     log_runtime_stats();
                 }
             }
@@ -9534,6 +10168,7 @@ int main(int argc, char **argv) {
                 rt->proxy_pool = nullptr;
             }
         }
+        hotpool_flush_all();
         free(g_carrier_runtimes);
         g_carrier_runtimes = nullptr;
         g_carrier_runtime_count = 0;
@@ -9562,7 +10197,7 @@ int main(int argc, char **argv) {
             results = scan_ips(nullptr, &cidrs, &g_cfg, nullptr);
             cidrlist_destroy(&cidrs);
         } else {
-            StringList ips = load_ip_list(cli_ipfile, g_cfg.random_mode, g_cfg.v6_split, g_cfg.ips_v4_to_cidr, g_cfg.ips_v6_to_cidr);
+            StringList ips = build_smart_ip_list(g_cfg.ips_type, 0, g_cfg.random_mode, g_cfg.v6_split, (size_t)g_cfg.ipnum);
             if (ips.len == 0) {
                 log_msg("没有可扫描的 IP (%s 为空)", cli_ipfile);
                     free(g_locations);
@@ -9573,6 +10208,10 @@ int main(int argc, char **argv) {
         }
         if (results.len > 0) {
             save_candidate_cache(candidate_cache_file("direct"), results.items, results.len);
+            for (size_t hi = 0; hi < results.len && hi < 5; hi++) {
+                hotpool_record_success(g_cfg.ips_type, 0, results.items[hi].ip, results.items[hi].latency_ms, 0);
+            }
+            hotpool_flush_all();
         }
     }
     if (!cache_hit || g_cfg.log_level >= LOG_DEBUG) {
