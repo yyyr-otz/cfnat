@@ -3,6 +3,7 @@
 /* =========================================================================
  * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
  * ========================================================================= */
+#ifdef __linux__
 #ifndef TCP_NOTSENT_LOWAT
 #define TCP_NOTSENT_LOWAT 25
 #endif
@@ -11,6 +12,7 @@
 #endif
 #ifndef TCP_CONGESTION
 #define TCP_CONGESTION 13
+#endif
 #endif
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
 #define CFNAT_IS_C23 1
@@ -89,6 +91,7 @@
 #include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stdarg.h>
@@ -362,7 +365,7 @@ typedef struct {
     int ewma_latency;
     int jitter_ms;
     int consecutive_fail;
-    long last_fail_ms;
+    int64_t last_fail_ms;
     struct sockaddr_storage addr; /* 二进制地址预解析，热路径免重复 inet_pton */
     socklen_t addr_len;
 } Result;
@@ -403,6 +406,51 @@ typedef struct {
     StringChunk *chunks;
 } StringList;
 
+/* 跨平台 64 位原子兼容层：64 位平台与支持 8 字节 CAS 的 32 位平台走无锁原生原子，
+ * 缺乏原生 64 位原子指令的老旧 32 位 CPU (如 armv5 / mips / mipsel) 自动退化为全局自旋锁保护，
+ * 避免静态链接 musl 时出现 __atomic_load_8 / __atomic_fetch_add_8 未定义符号。 */
+#if defined(__LP64__) || defined(_WIN64) || defined(__x86_64__) || defined(__aarch64__) || \
+    defined(__mips64) || (defined(__riscv) && __riscv_xlen == 64) || \
+    (defined(__GCC_HAVE_SYNC_COMPARE_AND_SWAP_8) && __GCC_HAVE_SYNC_COMPARE_AND_SWAP_8)
+typedef atomic_llong  cf_a64_t;
+typedef atomic_ullong cf_au64_t;
+#define cf_a64_init(p, v)          atomic_init((p), (v))
+#define cf_a64_load(p)             atomic_load_explicit((p), memory_order_relaxed)
+#define cf_a64_load_acq(p)         atomic_load_explicit((p), memory_order_acquire)
+#define cf_a64_store(p, v)         atomic_store_explicit((p), (v), memory_order_relaxed)
+#define cf_a64_store_rel(p, v)     atomic_store_explicit((p), (v), memory_order_release)
+#define cf_a64_fetch_add(p, v)     atomic_fetch_add_explicit((p), (v), memory_order_relaxed)
+#define cf_a64_fetch_add_rel(p, v) atomic_fetch_add_explicit((p), (v), memory_order_release)
+#define cf_a64_exchange(p, v)      atomic_exchange_explicit((p), (v), memory_order_relaxed)
+#else
+typedef struct { int64_t v; }  cf_a64_t;
+typedef struct { uint64_t v; } cf_au64_t;
+static pthread_mutex_t g_cf_a64_mu = PTHREAD_MUTEX_INITIALIZER;
+#define cf_a64_init(p, val) do { (p)->v = (val); } while (0)
+static inline int64_t cf_a64_load(const cf_a64_t *p) {
+    pthread_mutex_lock(&g_cf_a64_mu); int64_t r = p->v; pthread_mutex_unlock(&g_cf_a64_mu); return r;
+}
+#define cf_a64_load_acq(p) cf_a64_load(p)
+static inline void cf_a64_store(cf_a64_t *p, int64_t val) {
+    pthread_mutex_lock(&g_cf_a64_mu); p->v = val; pthread_mutex_unlock(&g_cf_a64_mu);
+}
+#define cf_a64_store_rel(p, val) cf_a64_store((p), (val))
+static inline uint64_t cf_au64_load(const cf_au64_t *p) {
+    pthread_mutex_lock(&g_cf_a64_mu); uint64_t r = p->v; pthread_mutex_unlock(&g_cf_a64_mu); return r;
+}
+static inline uint64_t cf_au64_fetch_add(cf_au64_t *p, uint64_t d) {
+    pthread_mutex_lock(&g_cf_a64_mu); uint64_t o = p->v; p->v += d; pthread_mutex_unlock(&g_cf_a64_mu); return o;
+}
+static inline uint64_t cf_au64_exchange(cf_au64_t *p, uint64_t nv) {
+    pthread_mutex_lock(&g_cf_a64_mu); uint64_t o = p->v; p->v = nv; pthread_mutex_unlock(&g_cf_a64_mu); return o;
+}
+#define cf_a64_fetch_add(p, d)     cf_au64_fetch_add((p), (uint64_t)(d))
+#define cf_a64_fetch_add_rel(p, d) cf_au64_fetch_add((p), (uint64_t)(d))
+#define cf_a64_exchange(p, v)      cf_au64_exchange((p), (uint64_t)(v))
+#undef cf_a64_load_acq
+#define cf_a64_load_acq(p) _Generic((p), const cf_au64_t *: cf_au64_load, cf_au64_t *: cf_au64_load, default: cf_a64_load)(p)
+#endif
+
 typedef struct BaiduProxyPool BaiduProxyPool;
 typedef struct CarrierRuntime CarrierRuntime;
 
@@ -433,7 +481,7 @@ typedef struct {
     atomic_size_t cfray_miss;
     atomic_size_t colo_skip;
     atomic_size_t http_code_mismatch;
-    long scan_start_ms;
+    int64_t scan_start_ms;
     ResultList *results;
     pthread_mutex_t results_mu;
     Config *cfg;
@@ -451,7 +499,7 @@ typedef struct {
     atomic_size_t code_meta_skip;  /* -code 校验因 80 端口不可达而被跳过的次数（用于一次性提示） */
 } ScanCtx;
 
-static long now_ms(void);
+static int64_t now_ms(void);
 static void log_msg(const char *fmt, ...);
 static void warn_msg(const char *fmt, ...);
 static void debug_msg(const char *fmt, ...);
@@ -650,7 +698,7 @@ typedef struct {
     int port;
     atomic_int active;
     atomic_int failures;
-    atomic_long ewma_ms;
+    atomic_int ewma_ms;
 } BaiduProxyNode;
 
 struct BaiduProxyPool {
@@ -660,7 +708,7 @@ struct BaiduProxyPool {
     size_t cap;
     /* P0-CACHE: 缓存最优节点索引，5 秒有效期，原子无锁并发安全 */
     atomic_int cached_best_idx;
-    atomic_long cached_at_ms;
+    cf_a64_t cached_at_ms;
 };
 
 typedef struct {
@@ -672,7 +720,7 @@ typedef struct {
     socklen_t current_addr_len;
     atomic_int fast_fail_count;
     atomic_int has_node_fail; /* 仅 TCP 候选池使用（UDP 池恒为 0）：避免连接关闭时无锁读取 items 导致 UAF */
-    atomic_ullong epoch;      /* 候选变更版本号：UDP 热路径 O(1) 无锁感知优选 IP 切换 */
+    cf_au64_t epoch;      /* 候选变更版本号：UDP 热路径 O(1) 无锁感知优选 IP 切换 */
     pthread_mutex_t mu;
     atomic_int cache_valid;   /* P0-1: 1=当前 IP 可直接使用，0=需要重新选择 */
     atomic_int switch_lock;   /* P1-3: 防止并发切换竞争导致 current_index 乱序与抖动 */
@@ -726,19 +774,19 @@ struct CarrierRuntime {
     atomic_uint tcp_switch_count;  /* H2 顺位切换累计次数（运行指标，仅统计） */
     atomic_uint udp_switch_count;  /* H3 顺位切换累计次数（运行指标，仅统计） */
     atomic_uint udp_up_drop;       /* 上行（客户端→上游）UDP 发送失败计数，与 udp_down_drop 对称 */
-    atomic_ullong udp_down_drop_stats; /* 下行丢包周期统计原子计数（与 5s 告警解耦，零数据竞争） */
+    cf_au64_t udp_down_drop_stats; /* 下行丢包周期统计原子计数（与 5s 告警解耦，零数据竞争） */
     atomic_int active_tcp_conns;       /* 本栈当前活跃 TCP 连接数（活跃态按需提速健康检查） */
     atomic_int active_udp_conns;       /* 本栈当前活跃 UDP 会话数（无锁读取，供健康检查判断活跃态） */
-    atomic_llong last_tcp_active_ms;   /* 本栈最近一次 TCP 活跃时间戳 */
-    atomic_llong last_udp_active_ms;   /* 本栈最近一次 UDP 活跃时间戳 */
+    cf_a64_t last_tcp_active_ms;   /* 本栈最近一次 TCP 活跃时间戳 */
+    cf_a64_t last_udp_active_ms;   /* 本栈最近一次 UDP 活跃时间戳 */
     atomic_int last_udp_loss_pct;      /* 最近一轮 UDP 健康检查链路丢包率 (0..100, -1=未测) */
     /* 疑似 QoS 窗口（探测侧与转发侧共享）：
      * 到期前，扫描不把 IP 判死、健康检查不计失败、切换最多放行一次，避免双方同时误判造成空池与抖动。 */
-    atomic_llong qos_suspect_until_ms;
+    cf_a64_t qos_suspect_until_ms;
     atomic_int qos_switch_used;        /* 本窗口内是否已执行过顺位切换（防连续切换抖动） */
     /* 线路级限速降级保持：换 IP 已证明无效时，停止「杀会话 + 换 IP」的重连风暴 */
-    atomic_llong h3_degraded_until_ms; /* 降级保持到期时间，0 = 未降级 */
-    atomic_llong h3_last_bh_ms;        /* 上一次黑洞/窒息剔除的时间戳 */
+    cf_a64_t h3_degraded_until_ms; /* 降级保持到期时间，0 = 未降级 */
+    cf_a64_t h3_last_bh_ms;        /* 上一次黑洞/窒息剔除的时间戳 */
     atomic_int h3_bh_streak;           /* 连续「换到不同 IP 仍黑洞」的次数 */
     char h3_last_bh_ip[MAX_IP_LEN];    /* 上一次黑洞命中的目标 IP（仅 prune 线程读写） */
     int udp_dirty;                 /* 会话表变更标记：未变更时直接复用 pollfd 数组，免除每轮链表遍历 */
@@ -751,9 +799,9 @@ static Location *g_locations = nullptr;
 static size_t g_location_count = 0;
 static atomic_int g_running = 1;
 static atomic_int g_active_tcp_conns = 0;
-static atomic_ullong g_tcp_conn_seq = 0;
+static cf_au64_t g_tcp_conn_seq = {0};
 static atomic_int g_active_udp_sessions = 0;
-static atomic_ullong g_udp_sess_seq = 0;
+static cf_au64_t g_udp_sess_seq = {0};
 
 static CarrierRuntime *g_carrier_runtimes = nullptr;
 static size_t g_carrier_runtime_count = 0;
@@ -991,7 +1039,7 @@ static void print_results_table_ex(FILE *stream, const char *proto, const char *
 }
 
 
-static long now_ms(void) {
+static int64_t now_ms(void) {
 #ifdef _WIN32
     static atomic_llong s_qpf = 0;
     static atomic_llong s_qpc_base = 0;
@@ -1010,13 +1058,13 @@ static long now_ms(void) {
         long long base = atomic_load_explicit(&s_qpc_base, memory_order_relaxed);
         long long delta = (long long)qpc.QuadPart - base;
         if (delta < 0) delta = 0;
-        return (long)((delta * 1000LL) / freq);
+        return (int64_t)((delta * 1000LL) / freq);
     }
-    return (long)GetTickCount64();
+    return (int64_t)GetTickCount64();
 #else
     struct timespec ts;
     clock_gettime(CLOCK_MONOTONIC, &ts);
-    return (long)ts.tv_sec * 1000L + (long)(ts.tv_nsec / 1000000L);
+    return (int64_t)ts.tv_sec * 1000LL + (int64_t)(ts.tv_nsec / 1000000LL);
 #endif
 }
 
@@ -3332,7 +3380,7 @@ static void tune_socket_buffers(socket_t s, int mode) {
 
 CFNAT_NODISCARD static socket_t tcp_connect_sa(const struct sockaddr_storage *ss, socklen_t sslen, int port, int timeout_ms, int *latency_ms) {
     if (!ss || sslen == 0) return INVALID_SOCKET;
-    long start = now_ms();
+    int64_t start = now_ms();
     int family = ss->ss_family;
     socket_t fd = socket(family, SOCK_STREAM, 0);
     if (cfnat_socket_invalid(fd)) return INVALID_SOCKET;
@@ -3936,7 +3984,7 @@ CFNAT_NODISCARD static int quic_probe_ip(const char *ip, int port, int timeout_m
         return 0;
     }
 
-    long start = now_ms();
+    int64_t start = now_ms();
     ssize_t sent = send(fd, (const char *)pkt, sizeof(pkt), 0);
     if (sent <= 0) {
         close(fd);
@@ -3968,7 +4016,7 @@ CFNAT_NODISCARD static int quic_probe_ip(const char *ip, int port, int timeout_m
 static int recv_headers(socket_t fd, char *buf, size_t bufsz, int timeout_ms) {
     size_t used = 0;
     size_t search_pos = 0;
-    long deadline = now_ms() + timeout_ms;
+    int64_t deadline = now_ms() + timeout_ms;
     while (used + 1 < bufsz && now_ms() < deadline) {
         int left = (int)(deadline - now_ms());
         if (left <= 0) break;
@@ -3992,7 +4040,7 @@ static int recv_headers(socket_t fd, char *buf, size_t bufsz, int timeout_ms) {
 static int send_all_timeout(socket_t fd, const void *buf, size_t len, int timeout_ms) {
     const char *p = (const char *)buf;
     size_t sent = 0;
-    long deadline = now_ms() + timeout_ms;
+    int64_t deadline = now_ms() + timeout_ms;
     while (sent < len && now_ms() < deadline) {
         int left = (int)(deadline - now_ms());
         if (left <= 0) break;
@@ -4090,7 +4138,7 @@ static int tls_probe_host(socket_t fd, int timeout_ms, const char *sni_host) {
     if (!send_all_timeout(fd, hello, hello_len, timeout_ms)) return 0;
 
     unsigned char first = 0;
-    long deadline = now_ms() + timeout_ms;
+    int64_t deadline = now_ms() + timeout_ms;
     while (now_ms() < deadline) {
         int left = (int)(deadline - now_ms());
         if (left <= 0) break;
@@ -4221,7 +4269,7 @@ static BaiduProxyNode *baidu_pool_pick(BaiduProxyPool *pool) {
     if (!pool || pool->len == 0) return nullptr;
 
     long now = now_ms();
-    long cat = atomic_load_explicit(&pool->cached_at_ms, memory_order_relaxed);
+    long cat = cf_a64_load(&pool->cached_at_ms);
     int cidx = atomic_load_explicit(&pool->cached_best_idx, memory_order_relaxed);
     if (cidx >= 0 && (size_t)cidx < pool->len && (now - cat) < 5000) {
         return &pool->nodes[cidx];
@@ -4239,14 +4287,14 @@ static BaiduProxyNode *baidu_pool_pick(BaiduProxyPool *pool) {
 
     /* 原子更新缓存 */
     atomic_store_explicit(&pool->cached_best_idx, (int)best_idx, memory_order_relaxed);
-    atomic_store_explicit(&pool->cached_at_ms, now, memory_order_relaxed);
+    cf_a64_store(&pool->cached_at_ms, now);
     return &pool->nodes[best_idx];
 }
 
 /* P2-5: 读取代理 CONNECT 响应头，使用 MSG_PEEK 与精确消费，
  * 绝不提前透支或丢弃握手后的首包有效载荷数据 (如 TLS 0-RTT/握手包) */
 static int recv_connect_headers_peek(socket_t fd, char *hdr, size_t bufsz, int timeout_ms) {
-    long deadline = now_ms() + timeout_ms;
+    int64_t deadline = now_ms() + timeout_ms;
     while (now_ms() < deadline) {
         int left = (int)(deadline - now_ms());
         if (left <= 0) break;
@@ -4279,7 +4327,7 @@ static int recv_connect_headers_peek(socket_t fd, char *hdr, size_t bufsz, int t
 }
 
 static socket_t tcp_connect_via_baidu_node(const BaiduProxyNode *node, const char *node_addr_str, const char *target_addr, int timeout_ms, int *latency_ms) {
-    long start = now_ms();
+    int64_t start = now_ms();
     const char *node_addr = (node && node->addr[0]) ? node->addr : node_addr_str;
     socket_t fd = INVALID_SOCKET;
     if (node && node->salen > 0 && node->port > 0) {
@@ -6063,7 +6111,7 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
     if (!canary_ok) {
         /* 整段链路都无回包 ≠ 没有可用节点，而是「疑似 QoS 窗口」：登记窗口，让健康检查/切换侧
          * 在到期前不要把节点判死，也让上层知道这次空池是窗口造成的而非池子质量下降。 */
-        atomic_store_explicit(&rt->qos_suspect_until_ms, (long long)(now_ms() + QOS_WINDOW_SCAN_MS), memory_order_relaxed);
+        cf_a64_store(&rt->qos_suspect_until_ms, now_ms() + QOS_WINDOW_SCAN_MS);
         warn_msg("[UDP/H3] [%s] [金丝雀探路] 连续 %zu 个头部节点均无 UDP 回包（疑似 QoS 惩罚窗/链路阻断），登记 %lds 窗口后等待自愈重扫",
                  carrier_display_name(rt->spec.mode), canary_tries, (long)(QOS_WINDOW_SCAN_MS / 1000));
         return udp_res;
@@ -6182,8 +6230,8 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
             if (cur_len >= 4) {
                 long long now_v = (long long)now_ms();
                 long long want = now_v + QOS_WINDOW_SCAN_MS;
-                if (atomic_load_explicit(&rt->qos_suspect_until_ms, memory_order_relaxed) < want) {
-                    atomic_store_explicit(&rt->qos_suspect_until_ms, want, memory_order_relaxed);
+                if (cf_a64_load(&rt->qos_suspect_until_ms) < want) {
+                    cf_a64_store(&rt->qos_suspect_until_ms, want);
                 }
             }
             debug_msg("[%s] 第 %zu~%zu 个 TCP 候选 IP 全无 UDP 回包，向后滑动选取下一批...",
@@ -6662,7 +6710,7 @@ static int http_probe_host(socket_t fd, int timeout_ms, const char *host, const 
     char req[512];
     int reqlen = snprintf(req, sizeof(req), "GET %s HTTP/1.0\r\nHost: %s\r\nConnection: close\r\n\r\n", path, host);
     if (reqlen <= 0 || reqlen >= (int)sizeof(req)) return 0;
-    long deadline = now_ms() + timeout_ms;
+    int64_t deadline = now_ms() + timeout_ms;
     size_t sent = 0;
     while (sent < (size_t)reqlen && now_ms() < deadline) {
         int left = (int)(deadline - now_ms());
@@ -6959,7 +7007,7 @@ static void *connection_thread(void *arg) {
     ConnCtx *cc = (ConnCtx *)arg;
     socket_t client = cc->client_fd;
     socket_t upstream = INVALID_SOCKET;
-    long conn_start_ms = now_ms();
+    int64_t conn_start_ms = now_ms();
     int conn_ok = 0;
     int upstream_failed = 0;
     const char *carrier_name = cc->runtime ? carrier_display_name(cc->runtime->spec.mode) : "-";
@@ -7344,7 +7392,7 @@ static int carrier_switch_next_ip(CarrierRuntime *rt) {
     int check_scores[64];
     size_t count = 0;
     size_t total_len = 0;
-    long cur_ms = now_ms();
+    int64_t cur_ms = now_ms();
 
     pthread_mutex_lock(&rt->candidates.mu);
     size_t len = rt->candidates.len;
@@ -7476,7 +7524,7 @@ static int carrier_set_current_udp_candidate(CarrierRuntime *rt, size_t idx) {
         rt->udp_candidates.current_addr = rt->udp_candidates.items[idx].addr;
         rt->udp_candidates.current_addr_len = rt->udp_candidates.items[idx].addr_len;
         atomic_store_explicit(&rt->udp_candidates.fast_fail_count, 0, memory_order_relaxed);
-        atomic_fetch_add_explicit(&rt->udp_candidates.epoch, 1, memory_order_release);
+        cf_a64_fetch_add_rel(&rt->udp_candidates.epoch, 1);
         pthread_mutex_unlock(&rt->udp_candidates.mu);
         return 1;
     }
@@ -7490,7 +7538,7 @@ CFNAT_NODISCARD static int carrier_switch_next_udp_ip(CarrierRuntime *rt) {
     /* 线路级限速降级保持期间拒绝一切 H3 顺位切换：换 IP 已证明无效，
      * 每次切换都要拆掉现有会话逼客户端重连，反而延长了不可用时间。 */
     {
-        long long hold_until = atomic_load_explicit(&rt->h3_degraded_until_ms, memory_order_relaxed);
+        long long hold_until = cf_a64_load(&rt->h3_degraded_until_ms);
         if ((long long)now_ms() < hold_until) {
             debug_msg("[UDP/H3] [%s] 线路级限速降级保持中，跳过顺位切换 (剩余 %llds)",
                       carrier_display_name(rt->spec.mode), (hold_until - (long long)now_ms()) / 1000);
@@ -7509,7 +7557,7 @@ CFNAT_NODISCARD static int carrier_switch_next_udp_ip(CarrierRuntime *rt) {
     int check_scores[64];
     size_t count = 0;
     size_t total_len = 0;
-    long cur_ms = now_ms();
+    int64_t cur_ms = now_ms();
 
     pthread_mutex_lock(&rt->udp_candidates.mu);
     size_t len = rt->udp_candidates.len;
@@ -7552,7 +7600,7 @@ CFNAT_NODISCARD static int carrier_switch_next_udp_ip(CarrierRuntime *rt) {
     /* QoS 窗口内最多放行一次切换：同一个窗口里连续切换只会把健康的会话反复拆掉。
      * 窗口登记时会把额度归还（qos_switch_used=0），所以恢复后不受影响。 */
     {
-        long long win_until = atomic_load_explicit(&rt->qos_suspect_until_ms, memory_order_relaxed);
+        long long win_until = cf_a64_load(&rt->qos_suspect_until_ms);
         if ((long long)now_ms() < win_until &&
             atomic_load_explicit(&rt->qos_switch_used, memory_order_relaxed) != 0) {
             debug_msg("[UDP/H3] [%s] 疑似 QoS 窗口内已切换过一次，暂不再切换（窗口剩余 %llds）",
@@ -7973,7 +8021,7 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
         rt->udp_candidates.current_addr = udp_res.items[0].addr;
         rt->udp_candidates.current_addr_len = udp_res.items[0].addr_len;
         atomic_store_explicit(&rt->udp_candidates.fast_fail_count, 0, memory_order_relaxed);
-        atomic_fetch_add_explicit(&rt->udp_candidates.epoch, 1, memory_order_release);
+        cf_a64_fetch_add_rel(&rt->udp_candidates.epoch, 1);
         pthread_mutex_unlock(&rt->udp_candidates.mu);
         free(old_udp_items);
         atomic_store(&rt->udp_candidates.cache_valid, 1);
@@ -8092,7 +8140,7 @@ static void *carrier_health_thread(void *arg) {
     long last = 0;
     int consecutive_success = 0;
     while (atomic_load(&g_running)) {
-        long long last_act = atomic_load_explicit(&rt->last_tcp_active_ms, memory_order_relaxed);
+        long long last_act = cf_a64_load(&rt->last_tcp_active_ms);
         int is_active = (atomic_load_explicit(&rt->active_tcp_conns, memory_order_relaxed) > 0) ||
                         (last_act > 0 && ((long long)now_ms() - last_act) < 30000LL);
         int sleep_dur = (fail > 0) ? 10000 : (is_active ? 20000 : ((consecutive_success >= 5) ? 60000 : 30000));
@@ -8164,7 +8212,7 @@ static void *carrier_udp_health_thread(void *arg) {
     while (atomic_load(&g_running)) {
         char cur_ip[MAX_IP_LEN] = {0};
         carrier_get_current_udp_ip(rt, cur_ip, sizeof(cur_ip));
-        long long last_u_act = atomic_load_explicit(&rt->last_udp_active_ms, memory_order_relaxed);
+        long long last_u_act = cf_a64_load(&rt->last_udp_active_ms);
         int udp_active = (atomic_load_explicit(&rt->active_udp_conns, memory_order_relaxed) > 0) ||
                          (last_u_act > 0 && ((long long)now_ms() - last_u_act) < 30000LL);
         int sleep_dur = !cur_ip[0]
@@ -8292,7 +8340,7 @@ static void *carrier_udp_health_thread(void *arg) {
 
         /* 活跃态：每轮 3 包（间隔 50ms）测丢包，丢包 >= 2/3 (67%) 判异常以抓出半死限速节点；闲置态：单包轻检 */
         long long now_u = (long long)now_ms();
-        long long last_u2 = atomic_load_explicit(&rt->last_udp_active_ms, memory_order_relaxed);
+        long long last_u2 = cf_a64_load(&rt->last_udp_active_ms);
         int active_now = (atomic_load_explicit(&rt->active_udp_conns, memory_order_relaxed) > 0) ||
                          (last_u2 > 0 && (now_u - last_u2) < 30000LL);
         int probe_n = active_now ? 3 : 1;
@@ -8323,7 +8371,7 @@ static void *carrier_udp_health_thread(void *arg) {
 
         int ok = active_now ? (ok_cnt >= 2) : (ok_cnt >= 1);
         if (!ok) {
-            long long win_until = atomic_load_explicit(&rt->qos_suspect_until_ms, memory_order_relaxed);
+            long long win_until = cf_a64_load(&rt->qos_suspect_until_ms);
             long long now_v = (long long)now_ms();
             if (now_v < win_until) {
                 /* 疑似 QoS 窗口内：此刻整段链路都不通，探针失败不能作为「这个 IP 坏了」的证据。
@@ -8358,7 +8406,7 @@ static void *carrier_udp_health_thread(void *arg) {
             }
         } else {
             /* 探针恢复成功 = QoS 窗口结束：清除窗口并归还「本窗口切换额度」 */
-            atomic_store_explicit(&rt->qos_suspect_until_ms, 0, memory_order_relaxed);
+            cf_a64_store(&rt->qos_suspect_until_ms, 0);
             atomic_store_explicit(&rt->qos_switch_used, 0, memory_order_relaxed);
             fail = 0;
             consecutive_success++;
@@ -8430,8 +8478,8 @@ static void *carrier_accept_thread(void *arg) {
         }
         int active = atomic_fetch_add(&g_active_tcp_conns, 1) + 1;
         atomic_fetch_add_explicit(&rt->active_tcp_conns, 1, memory_order_relaxed);
-        atomic_store_explicit(&rt->last_tcp_active_ms, (long long)now_ms(), memory_order_relaxed);
-        unsigned long long conn_id = atomic_fetch_add(&g_tcp_conn_seq, 1) + 1;
+        cf_a64_store(&rt->last_tcp_active_ms, now_ms());
+        unsigned long long conn_id = cf_a64_fetch_add(&g_tcp_conn_seq, 1) + 1;
         conn_msg("[TCP/H2] #%llu [%s] 客户端连接建立 (当前活跃: %d)", conn_id, carrier_display_name(rt->spec.mode), active);
         ConnCtx *cc = calloc(1, sizeof(ConnCtx));
         if (!cc) {
@@ -8601,20 +8649,20 @@ struct UdpSession {
     char target_ip[MAX_IP_LEN];
     int target_port;
     unsigned long long sess_id;
-    long created_ms;
-    long last_active_ms;
-    long last_down_ms;
+    int64_t created_ms;
+    int64_t last_active_ms;
+    int64_t last_down_ms;
     uint64_t bytes_up;
     uint64_t bytes_down;
     uint64_t bytes_up_at_down;
-    long stall_snap_ms;
+    int64_t stall_snap_ms;
     uint64_t stall_snap_up;
     uint64_t stall_snap_down;
     int stall_count;
     /* 下行猝死：历史峰值 + 第一段降级时刻（用于 8s 后二次确认） */
     uint64_t down_peak;
-    long down_peak_ms;
-    long down_collapse_ms;
+    int64_t down_peak_ms;
+    int64_t down_collapse_ms;
     int down_collapsed;
     struct UdpSession *next;
     struct UdpSession *hash_next;
@@ -8810,7 +8858,7 @@ static UdpSession *find_or_create_udp_session_sa(CarrierRuntime *rt, const struc
             s->upstream_fd = udp_connect_upstream_sa(target_ip, target_sa, target_salen, target_port, rt->udp_session_count);
             snprintf(s->target_ip, sizeof(s->target_ip), "%s", target_ip);
             s->target_port = target_port;
-            long migrate_ms = now_ms();
+            int64_t migrate_ms = now_ms();
             s->last_down_ms = migrate_ms;
             s->bytes_up_at_down = s->bytes_up;
             s->stall_snap_ms = migrate_ms;
@@ -8882,10 +8930,10 @@ static UdpSession *find_or_create_udp_session_sa(CarrierRuntime *rt, const struc
     new_sess->down_peak_ms = new_sess->created_ms;
     new_sess->down_collapse_ms = 0;
     new_sess->down_collapsed = 0;
-    new_sess->sess_id = atomic_fetch_add(&g_udp_sess_seq, 1) + 1;
+    new_sess->sess_id = cf_a64_fetch_add(&g_udp_sess_seq, 1) + 1;
     rt->udp_session_count++;
     atomic_store_explicit(&rt->active_udp_conns, (int)rt->udp_session_count, memory_order_relaxed);
-    atomic_store_explicit(&rt->last_udp_active_ms, (long long)new_sess->created_ms, memory_order_relaxed);
+    cf_a64_store(&rt->last_udp_active_ms, new_sess->created_ms);
     int active = atomic_fetch_add(&g_active_udp_sessions, 1) + 1;
     new_sess->next = rt->udp_sessions;
     rt->udp_sessions = new_sess;
@@ -8904,7 +8952,7 @@ static UdpSession *find_or_create_udp_session_sa(CarrierRuntime *rt, const struc
     return new_sess;
 }
 
-static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
+static int prune_udp_sessions(CarrierRuntime *rt, int64_t cur_ms) {
     if (!rt) return 0;
     int should_switch_udp = 0;
     int switch_by_blackhole = 0;
@@ -8918,7 +8966,7 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
         /* 降级保持状态（线路级 UDP 限速）：整个会话处理周期共用同一份判断，
          * 避免后面各分支重复读取原子变量、也保证「保持期间不打日志/不动作」的口径一致。 */
         int degraded_mode = ((long long)cur_ms <
-                             atomic_load_explicit(&rt->h3_degraded_until_ms, memory_order_relaxed));
+                             cf_a64_load(&rt->h3_degraded_until_ms));
 
         /* 1. 双条件黑洞检测：覆盖初始握手黑洞与传输中途黑洞 (4s 零下行判定) */
         int is_blackhole = (s->bytes_down == 0 && cur_ms - s->created_ms >= 4000 && s->bytes_up >= 1200) ||
@@ -8989,10 +9037,10 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
 
             if (collapse_first_stage && !degraded_mode) {
                 long long now_v = (long long)now_ms();
-                if (atomic_load_explicit(&rt->qos_suspect_until_ms, memory_order_relaxed) <= now_v) {
+                if (cf_a64_load(&rt->qos_suspect_until_ms) <= now_v) {
                     atomic_store_explicit(&rt->qos_switch_used, 0, memory_order_relaxed); /* 新窗口：归还一次切换额度 */
                 }
-                atomic_store_explicit(&rt->qos_suspect_until_ms, now_v + QOS_WINDOW_DEFAULT_MS, memory_order_relaxed);
+                cf_a64_store(&rt->qos_suspect_until_ms, now_v + QOS_WINDOW_DEFAULT_MS);
                 /* 单位统一为 KB/s，便于直接对照实际下载速度 */
                 double cur_kbps = (win_s > 0) ? ((double)d_down / 1024.0 / (double)win_s) : 0.0;
                 double peak_kbps = (double)s->down_peak / 1024.0 / (double)(UDP_STALL_WINDOW_MS / 1000);
@@ -9013,10 +9061,10 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
          * （旧实现就是这样，日志里出现「进入保持」和「解除保持」在同一秒）。
          * 探针小包在限速期间本来就能通，也不能用探针判恢复。 */
         if (window_down_ok &&
-            atomic_load_explicit(&rt->h3_degraded_until_ms, memory_order_relaxed) != 0) {
-            atomic_store_explicit(&rt->h3_degraded_until_ms, 0, memory_order_relaxed);
+            cf_a64_load(&rt->h3_degraded_until_ms) != 0) {
+            cf_a64_store(&rt->h3_degraded_until_ms, 0);
             atomic_store_explicit(&rt->h3_bh_streak, 0, memory_order_relaxed);
-            atomic_store_explicit(&rt->qos_suspect_until_ms, 0, memory_order_relaxed);
+            cf_a64_store(&rt->qos_suspect_until_ms, 0);
             log_msg("[UDP/H3] [%s] 检测到线路恢复（5s 内新增下行达标），解除线路级限速降级保持，恢复正常切换",
                     carrier_display_name(rt->spec.mode));
         }
@@ -9035,7 +9083,7 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
             /* 连续「换到不同 IP 仍在 20s 内归零」→ 升级为线路级限速降级保持。
              * 同一 IP 反复黑洞不计数：那是节点自身问题，换 IP 是正确的。 */
             long long now_v = (long long)now_ms();
-            long long last_bh = atomic_load_explicit(&rt->h3_last_bh_ms, memory_order_relaxed);
+            long long last_bh = cf_a64_load(&rt->h3_last_bh_ms);
             int streak = atomic_load_explicit(&rt->h3_bh_streak, memory_order_relaxed);
             if (last_bh > 0 && (now_v - last_bh) <= H3_BH_STREAK_WINDOW_MS &&
                 strcmp(rt->h3_last_bh_ip, s->target_ip) != 0) {
@@ -9044,14 +9092,14 @@ static int prune_udp_sessions(CarrierRuntime *rt, long cur_ms) {
                 streak = 1;
             }
             snprintf(rt->h3_last_bh_ip, sizeof(rt->h3_last_bh_ip), "%s", s->target_ip);
-            atomic_store_explicit(&rt->h3_last_bh_ms, now_v, memory_order_relaxed);
+            cf_a64_store(&rt->h3_last_bh_ms, now_v);
             atomic_store_explicit(&rt->h3_bh_streak, streak, memory_order_relaxed);
             if (streak >= H3_BH_STREAK_LIMIT) {
                 long long hold_until = now_v + H3_DEGRADED_HOLD_MS;
-                atomic_store_explicit(&rt->h3_degraded_until_ms, hold_until, memory_order_relaxed);
+                cf_a64_store(&rt->h3_degraded_until_ms, hold_until);
                 atomic_store_explicit(&rt->h3_bh_streak, 0, memory_order_relaxed);
                 /* 同步登记 QoS 窗口：健康检查在窗口内不会把节点判死，扫描也不会误判空池 */
-                atomic_store_explicit(&rt->qos_suspect_until_ms, hold_until, memory_order_relaxed);
+                cf_a64_store(&rt->qos_suspect_until_ms, hold_until);
                 warn_msg("[UDP/H3] [%s] 连续 %d 次换到不同 IP 仍在 %lds 内下行归零 → 判定为线路级 UDP 限速（换 IP 无效），"
                          "进入降级保持 %lds：暂停主动剔除与顺位切换，等待限速窗口自行解除",
                          carrier_display_name(rt->spec.mode), H3_BH_STREAK_LIMIT,
@@ -9189,7 +9237,7 @@ static void *carrier_udp_thread(void *arg) {
     UdpSession *p_sess[UDP_MAX_SESSIONS + 1];
     size_t npfd = 1;
     rt->udp_dirty = 1;
-    long last_prune_ms = now_ms();
+    int64_t last_prune_ms = now_ms();
     char cur_target_ip[MAX_IP_LEN] = {0};
     struct sockaddr_storage cur_target_sa = {0};
     socklen_t cur_target_salen = 0;
@@ -9230,7 +9278,7 @@ static void *carrier_udp_thread(void *arg) {
             continue;
         }
 
-        long cur_ms = now_ms();
+        int64_t cur_ms = now_ms();
         if (cur_ms - last_prune_ms >= 3000) {
             last_prune_ms = cur_ms;
             int pruned = prune_udp_sessions(rt, cur_ms);
@@ -9309,7 +9357,7 @@ static void *carrier_udp_thread(void *arg) {
                                     } else {
                                         uint64_t dropped = (uint64_t)(out_cnt - s);
                                         rt->udp_down_drop += dropped;
-                                        atomic_fetch_add_explicit(&rt->udp_down_drop_stats, (unsigned long long)dropped, memory_order_relaxed);
+                                        cf_a64_fetch_add(&rt->udp_down_drop_stats, dropped);
                                         break;
                                     }
                                 }
@@ -9332,7 +9380,7 @@ static void *carrier_udp_thread(void *arg) {
                             sess->bytes_up_at_down = sess->bytes_up;
                         } else {
                             rt->udp_down_drop++;
-                            atomic_fetch_add_explicit(&rt->udp_down_drop_stats, 1, memory_order_relaxed);
+                            cf_a64_fetch_add(&rt->udp_down_drop_stats, 1);
                         }
                     }
 #endif
@@ -9347,8 +9395,8 @@ static void *carrier_udp_thread(void *arg) {
 
         /* 2. 监听端口接收客户端 (如 Xray) 发来的 UDP / QUIC 报文 */
         if (pfds[0].revents & POLLIN) {
-            atomic_store_explicit(&rt->last_udp_active_ms, (long long)cur_ms, memory_order_relaxed);
-            unsigned long long cur_epoch = atomic_load_explicit(&rt->udp_candidates.epoch, memory_order_acquire);
+            cf_a64_store(&rt->last_udp_active_ms, cur_ms);
+            unsigned long long cur_epoch = cf_a64_load_acq(&rt->udp_candidates.epoch);
             if (cur_epoch != cached_udp_epoch || !cur_target_ip[0]) {
                 carrier_get_current_udp_ip_sa(rt, cur_target_ip, sizeof(cur_target_ip), &cur_target_sa, &cur_target_salen);
                 cached_udp_epoch = cur_epoch;
@@ -9609,7 +9657,7 @@ static void log_runtime_stats(void) {
         unsigned int tcp_sw = atomic_load_explicit(&rt->tcp_switch_count, memory_order_relaxed);
         unsigned int udp_sw = atomic_load_explicit(&rt->udp_switch_count, memory_order_relaxed);
         unsigned int up_drop = atomic_exchange_explicit(&rt->udp_up_drop, 0, memory_order_relaxed);
-        unsigned long long down_drop = atomic_exchange_explicit(&rt->udp_down_drop_stats, 0, memory_order_relaxed);
+        unsigned long long down_drop = cf_a64_exchange(&rt->udp_down_drop_stats, 0);
 
         int last_loss = atomic_load_explicit(&rt->last_udp_loss_pct, memory_order_relaxed);
         char loss_str[24];
@@ -9748,27 +9796,27 @@ int main(int argc, char **argv) {
             atomic_init(&rt->candidates.switch_lock, 0);
             atomic_init(&rt->candidates.fast_fail_count, 0);
             atomic_init(&rt->candidates.has_node_fail, 0);
-            atomic_init(&rt->candidates.epoch, 0);
+            cf_a64_init(&rt->candidates.epoch, 0);
             pthread_mutex_init(&rt->udp_candidates.mu, nullptr);
             atomic_init(&rt->udp_candidates.cache_valid, 0);
             atomic_init(&rt->udp_candidates.switch_lock, 0);
             atomic_init(&rt->udp_candidates.fast_fail_count, 0);
             atomic_init(&rt->udp_candidates.has_node_fail, 0);
-            atomic_init(&rt->udp_candidates.epoch, 0);
+            cf_a64_init(&rt->udp_candidates.epoch, 0);
             atomic_init(&rt->rescanning_lock, 0);
             atomic_init(&rt->tcp_switch_count, 0);
             atomic_init(&rt->udp_switch_count, 0);
             atomic_init(&rt->udp_up_drop, 0);
-            atomic_init(&rt->udp_down_drop_stats, 0);
+            cf_a64_init(&rt->udp_down_drop_stats, 0);
             atomic_init(&rt->active_tcp_conns, 0);
             atomic_init(&rt->active_udp_conns, 0);
-            atomic_init(&rt->last_tcp_active_ms, 0);
-            atomic_init(&rt->last_udp_active_ms, 0);
+            cf_a64_init(&rt->last_tcp_active_ms, 0);
+            cf_a64_init(&rt->last_udp_active_ms, 0);
             atomic_init(&rt->last_udp_loss_pct, -1);
-            atomic_init(&rt->qos_suspect_until_ms, 0);
+            cf_a64_init(&rt->qos_suspect_until_ms, 0);
             atomic_init(&rt->qos_switch_used, 0);
-            atomic_init(&rt->h3_degraded_until_ms, 0);
-            atomic_init(&rt->h3_last_bh_ms, 0);
+            cf_a64_init(&rt->h3_degraded_until_ms, 0);
+            cf_a64_init(&rt->h3_last_bh_ms, 0);
             atomic_init(&rt->h3_bh_streak, 0);
             atomic_init(&rt->maint_pending, 0);
             pthread_mutex_init(&rt->maint_mu, nullptr);
@@ -10098,11 +10146,11 @@ int main(int argc, char **argv) {
             g_location_count = 0;
             return 1;
         }
-        long last_stats_ms = now_ms();
+        int64_t last_stats_ms = now_ms();
         while (atomic_load(&g_running)) {
             if (sleep_interruptible_ms(1000) != 0) break;
             if (g_cfg.stats_interval > 0) {
-                long cur_ms = now_ms();
+                int64_t cur_ms = now_ms();
                 if ((long long)(cur_ms - last_stats_ms) >= (long long)g_cfg.stats_interval * 1000LL) {
                     last_stats_ms = cur_ms;
                     hotpool_flush_all();
@@ -10186,7 +10234,7 @@ int main(int argc, char **argv) {
 #endif
         return 0;
     }
-    long start = now_ms();
+    int64_t start = now_ms();
     const char *cli_ipfile = cfg_ips_file_for_type(g_cfg.ips_type);
     // 先尝试读取候选缓存，如果命中且健康检查通过则跳过完整扫描
     ResultList results = {0};
