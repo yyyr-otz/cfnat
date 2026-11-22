@@ -407,43 +407,50 @@ typedef struct {
 } StringList;
 
 #if defined(__arm__) && defined(__ARM_ARCH) && (__ARM_ARCH < 6)
-/* ARMv5 (如 arm926ej-s) 无硬件 ldrex/strex 原子指令，Zig compiler-rt 亦未提供 __sync_*_4 符号 */
+/* ARMv5 (如 arm926ej-s) 无硬件 ldrex/strex 原子指令：使用独立 C 符号 + ELF .set 别名避开 Clang 内建函数重声明报错 */
 static pthread_mutex_t g_armv5_sync_mu = PTHREAD_MUTEX_INITIALIZER;
-uint32_t __sync_fetch_and_add_4(volatile void *ptr, uint32_t val) {
+__attribute__((used)) int cf_sync_fetch_and_add_4(volatile int *ptr, int val) {
     pthread_mutex_lock(&g_armv5_sync_mu);
-    uint32_t old = *(volatile uint32_t *)ptr;
-    *(volatile uint32_t *)ptr = old + val;
+    int old = *ptr;
+    *ptr = old + val;
     pthread_mutex_unlock(&g_armv5_sync_mu);
     return old;
 }
-uint32_t __sync_fetch_and_sub_4(volatile void *ptr, uint32_t val) {
+__attribute__((used)) int cf_sync_fetch_and_sub_4(volatile int *ptr, int val) {
     pthread_mutex_lock(&g_armv5_sync_mu);
-    uint32_t old = *(volatile uint32_t *)ptr;
-    *(volatile uint32_t *)ptr = old - val;
+    int old = *ptr;
+    *ptr = old - val;
     pthread_mutex_unlock(&g_armv5_sync_mu);
     return old;
 }
-uint32_t __sync_fetch_and_or_4(volatile void *ptr, uint32_t val) {
+__attribute__((used)) int cf_sync_fetch_and_or_4(volatile int *ptr, int val) {
     pthread_mutex_lock(&g_armv5_sync_mu);
-    uint32_t old = *(volatile uint32_t *)ptr;
-    *(volatile uint32_t *)ptr = old | val;
+    int old = *ptr;
+    *ptr = old | val;
     pthread_mutex_unlock(&g_armv5_sync_mu);
     return old;
 }
-uint32_t __sync_val_compare_and_swap_4(volatile void *ptr, uint32_t oldval, uint32_t newval) {
+__attribute__((used)) int cf_sync_val_compare_and_swap_4(volatile int *ptr, int oldval, int newval) {
     pthread_mutex_lock(&g_armv5_sync_mu);
-    uint32_t cur = *(volatile uint32_t *)ptr;
-    if (cur == oldval) *(volatile uint32_t *)ptr = newval;
+    int cur = *ptr;
+    if (cur == oldval) *ptr = newval;
     pthread_mutex_unlock(&g_armv5_sync_mu);
     return cur;
 }
-uint32_t __sync_lock_test_and_set_4(volatile void *ptr, uint32_t val) {
+__attribute__((used)) int cf_sync_lock_test_and_set_4(volatile int *ptr, int val) {
     pthread_mutex_lock(&g_armv5_sync_mu);
-    uint32_t old = *(volatile uint32_t *)ptr;
-    *(volatile uint32_t *)ptr = val;
+    int old = *ptr;
+    *ptr = val;
     pthread_mutex_unlock(&g_armv5_sync_mu);
     return old;
 }
+__asm__(
+    ".globl __sync_fetch_and_add_4\n.set __sync_fetch_and_add_4, cf_sync_fetch_and_add_4\n"
+    ".globl __sync_fetch_and_sub_4\n.set __sync_fetch_and_sub_4, cf_sync_fetch_and_sub_4\n"
+    ".globl __sync_fetch_and_or_4\n.set __sync_fetch_and_or_4, cf_sync_fetch_and_or_4\n"
+    ".globl __sync_val_compare_and_swap_4\n.set __sync_val_compare_and_swap_4, cf_sync_val_compare_and_swap_4\n"
+    ".globl __sync_lock_test_and_set_4\n.set __sync_lock_test_and_set_4, cf_sync_lock_test_and_set_4\n"
+);
 #endif
 
 /* 跨平台 64 位原子兼容层：64 位平台与支持 8 字节 CAS 的 32 位平台走无锁原生原子，
