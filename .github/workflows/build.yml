@@ -21,7 +21,7 @@ permissions:
 env:
   SOURCE_FILE: cfnat.c
   ZIG_VERSION: 0.15.1
-  FREEBSD_VER: 14.2-RELEASE
+  FREEBSD_VER: 14.5-RELEASE
 
 jobs:
   build-ubuntu:
@@ -59,7 +59,12 @@ jobs:
           # 仅解压 FreeBSD 头文件与系统库，用于 zig cc 交叉编译
           for arch in amd64 arm64; do
             mkdir -p "/tmp/freebsd-sysroot/${arch}"
-            curl -fsSL "https://download.freebsd.org/releases/${arch}/${FREEBSD_VER}/base.txz" -o "/tmp/fbsd-${arch}.txz"
+            if [ "$arch" = "arm64" ]; then
+              fbsd_url="https://download.freebsd.org/releases/arm64/aarch64/${FREEBSD_VER}/base.txz"
+            else
+              fbsd_url="https://download.freebsd.org/releases/amd64/${FREEBSD_VER}/base.txz"
+            fi
+            curl -fsSL "$fbsd_url" -o "/tmp/fbsd-${arch}.txz"
             tar -xJf "/tmp/fbsd-${arch}.txz" -C "/tmp/freebsd-sysroot/${arch}" ./usr/include ./usr/lib ./lib
             rm -f "/tmp/fbsd-${arch}.txz"
           done
