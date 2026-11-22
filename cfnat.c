@@ -6330,11 +6330,14 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
     const char *udp_path = candidate_cache_file_for_profile_udp(rt->spec.mode, ips_type);
     const char *primary_cache = (!use_h2 && use_h3) ? udp_path : tcp_path;
     int primary_is_udp = (!use_h2 && use_h3);
-    if (hotpool_has_fresh_cloud(ips_type, primary_is_udp) || ips_file_newer_than_cache(ips_type, primary_cache)) {
-        log_msg("[%s] 检测到云端新源或底座更新，跳过旧缓存 %s 并重新测优",
-                carrier_display_name(rt->spec.mode), primary_cache);
+    int need_bg_refresh = (hotpool_has_fresh_cloud(ips_type, primary_is_udp) ||
+                           ips_file_newer_than_cache(ips_type, primary_cache));
+    if (need_bg_refresh) {
         hotpool_clear_fresh_cloud(ips_type, primary_is_udp);
-        return 0;
+        /* 优先用本地 cache 快检秒启先接管转发，再异步触发后台热库刷新（绝不阻塞冷启动） */
+        atomic_fetch_or_explicit(&rt->maint_pending, MAINT_RESCAN, memory_order_release);
+        log_msg("[%s] 检测到云端新源或底座更新，将优先快检缓存 %s 秒启转发，随后后台异步从热库刷新",
+                carrier_display_name(rt->spec.mode), primary_cache);
     }
     int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
     if (target_port <= 0) target_port = 443;
@@ -6414,7 +6417,8 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
         if (cached_tcp.len == 0) return 0;
         size_t first_good_tcp = cache_quick_check_parallel(rt, cached_tcp.items, cached_tcp.len, 0, 0, 0);
         if (first_good_tcp == (size_t)-1) {
-            warn_msg("[%s] 纯 H3 模式无有效 UDP/TCP 缓存，将执行前置 TCP 扫描生成 H3 种子", carrier_display_name(rt->spec.mode));
+            warn_msg("[%s] 纯 H3 模式无有效 UDP/TCP 缓存，将立即从热库/底座执行启动扫描", carrier_display_name(rt->spec.mode));
+            atomic_store_explicit(&rt->maint_pending, 0, memory_order_release);
             free(cached_tcp.items);
             return 0;
         }
@@ -6445,12 +6449,14 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
 
     ResultList cached_tcp = load_candidate_cache_for_profile(tcp_path, &rt->spec.prof);
     if (cached_tcp.len == 0) {
+        atomic_store_explicit(&rt->maint_pending, 0, memory_order_release);
         return 0;
     }
 
     size_t first_good_tcp = cache_quick_check_parallel(rt, cached_tcp.items, cached_tcp.len, 0, 0, 0);
     if (first_good_tcp == (size_t)-1) {
-        warn_msg("[%s] TCP 候选缓存健康检查未命中，将执行完整扫描", carrier_display_name(rt->spec.mode));
+        warn_msg("[%s] TCP 候选缓存健康检查未命中，将立即从热库/底座执行启动扫描", carrier_display_name(rt->spec.mode));
+        atomic_store_explicit(&rt->maint_pending, 0, memory_order_release);
         free(cached_tcp.items);
         return 0;
     }
