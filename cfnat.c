@@ -799,9 +799,9 @@ static Location *g_locations = nullptr;
 static size_t g_location_count = 0;
 static atomic_int g_running = 1;
 static atomic_int g_active_tcp_conns = 0;
-static cf_au64_t g_tcp_conn_seq = {0};
+static cf_au64_t g_tcp_conn_seq;
 static atomic_int g_active_udp_sessions = 0;
-static cf_au64_t g_udp_sess_seq = {0};
+static cf_au64_t g_udp_sess_seq;
 
 static CarrierRuntime *g_carrier_runtimes = nullptr;
 static size_t g_carrier_runtime_count = 0;
@@ -4254,7 +4254,7 @@ static void baidu_pool_free(BaiduProxyPool *pool) {
     pool->len = 0;
     pool->cap = 0;
     atomic_store(&pool->cached_best_idx, -1);
-    atomic_store(&pool->cached_at_ms, 0);
+    cf_a64_store(&pool->cached_at_ms, 0);
 }
 
 static long proxy_node_score(const BaiduProxyNode *node) {
@@ -7161,7 +7161,7 @@ out:
     }
     if (cc->runtime) {
         atomic_fetch_sub_explicit(&cc->runtime->active_tcp_conns, 1, memory_order_relaxed);
-        atomic_store_explicit(&cc->runtime->last_tcp_active_ms, (long long)now_ms(), memory_order_relaxed);
+        cf_a64_store(&cc->runtime->last_tcp_active_ms, now_ms());
     }
     int active = atomic_fetch_sub(&g_active_tcp_conns, 1) - 1;
     long lifetime_s = (now_ms() - conn_start_ms) / 1000;
