@@ -1292,10 +1292,10 @@ static void usage(const char *p) {
     printf("  -health-log=value         健康状态行(debug 级明细)输出间隔秒数，0=关闭 (default 60)\n");
     printf("  -h3-client[=bool]         H3 探测启用真实 QUIC v1 Initial (TLS 1.3 ClientHello) 模拟 (default false)\n");
     printf("  -h2[=bool] / -h3[=bool]   启用或关闭 H2(TCP) / H3(UDP) 协议，支持 -v4-/-v6-/-baidu- 前缀 (default true)\n");
-    printf("  -ips-v4-file / -ips-v6-file    自定义 IPv4/IPv6 列表文件路径 (default ips-v4.txt / ips-v6.txt)\n");
-    printf("  -ips-v4-url  / -ips-v6-url     自定义 IPv4/IPv6 列表下载 URL (默认使用内置源)\n");
-    printf("  -ips-v4-update / -ips-v6-update  IP 列表更新策略: 0/false | 1/true(每次启动) | *m/*h/*d(按文件修改时间)\n");
-    printf("  -ips-v4-to-cidr / -ips-v6-to-cidr 将单 IP 转为 CIDR 网段并去重: 0/false | 1/true(/24或/64) | 自定义前缀\n");
+    printf("  -v4-file / -v6-file              自定义 IPv4/IPv6 列表文件路径 (default ips-v4.txt / ips-v6.txt)\n");
+    printf("  -v4-url  / -v6-url               自定义 IPv4/IPv6 列表下载 URL (默认使用内置源)\n");
+    printf("  -update / -v4-update / -v6-update IP 列表更新策略: 0/false | 1/true(每次启动) | *m/*h/*d(按文件修改时间)\n");
+    printf("  -to-cidr / -v4-to-cidr / -v6-to-cidr 单 IP 转 CIDR 并去重: 0/false | 1/true(/24或/64) | 自定义前缀\n");
     printf("  注: 以上参数均支持 -v4- 或 -v6- 前缀实现精细化覆盖，如 -v6-code=200 -v4-delay=150\n");
 }
 
@@ -1322,7 +1322,7 @@ static void parse_ips_update_spec(const char *val, int *out_mode, long *out_sec)
         else if (*end == 'h' || *end == 'H') mult = 3600;
         else if (*end == 'd' || *end == 'D') mult = 86400;
         else {
-            warn_msg("无法识别的 -ips-*-update=%s，期望 0/1/true 或如 30m/6h/1d，已按默认关闭处理", val);
+            warn_msg("无法识别的 -update=%s，期望 0/1/true 或如 30m/6h/1d，已按默认关闭处理", val);
             *out_mode = 0; *out_sec = 0; return;
         }
         if (num > 365L * 86400L / mult) num = 365L * 86400L / mult;
@@ -1330,7 +1330,7 @@ static void parse_ips_update_spec(const char *val, int *out_mode, long *out_sec)
         *out_sec = num * mult;
         return;
     }
-    warn_msg("无法识别的 -ips-*-update=%s，期望 0/1/true 或如 30m/6h/1d，已按默认关闭处理", val);
+    warn_msg("无法识别的 -update=%s，期望 0/1/true 或如 30m/6h/1d，已按默认关闭处理", val);
     *out_mode = 0; *out_sec = 0;
 }
 
@@ -1342,7 +1342,7 @@ static int parse_to_cidr_spec(const char *val, int default_pfx, int min_pfx, int
     const char *p = (*val == '/') ? (val + 1) : val;
     int v = atoi(p);
     if (v >= min_pfx && v <= max_pfx) return v;
-    warn_msg("参数 -ips-*-to-cidr=%s 超出合法范围 [%d, %d]，已回退默认 /%d", val, min_pfx, max_pfx, default_pfx);
+    warn_msg("参数 -to-cidr=%s 超出合法范围 [%d, %d]，已回退默认 /%d", val, min_pfx, max_pfx, default_pfx);
     return default_pfx;
 }
 
@@ -1434,7 +1434,14 @@ static void parse_args(Config *c, int argc, char **argv) {
     int v4_random = -1, v6_random = -1;
     int v4_h2 = -1, v4_h3 = -1, v6_h2 = -1, v6_h3 = -1, baidu_h2 = -1, baidu_h3 = -1;
     int v6_split_val = -1;
-    int explicit_v4_update = 0, explicit_v6_update = 0;
+    char v4_file[MAX_PATH_LEN] = {0}, v6_file[MAX_PATH_LEN] = {0};
+    char v4_url[512] = {0}, v6_url[512] = {0};
+    int has_g_upd = 0, g_upd_mode = 0; long g_upd_sec = 0;
+    int has_v4_upd = 0, v4_upd_mode = 0; long v4_upd_sec = 0;
+    int has_v6_upd = 0, v6_upd_mode = 0; long v6_upd_sec = 0;
+    int has_g_cidr = 0, g_cidr_v4 = 0, g_cidr_v6 = 0;
+    int has_v4_cidr = 0, v4_cidr = 0;
+    int has_v6_cidr = 0, v6_cidr = 0;
     char v4_colo[256] = {0}, v6_colo[256] = {0};
     char v4_domain[MAX_DOMAIN_LEN] = {0}, v6_domain[MAX_DOMAIN_LEN] = {0};
 
@@ -1573,20 +1580,30 @@ static void parse_args(Config *c, int argc, char **argv) {
         else if (!strcmp(key, "baidu-h3")) baidu_h3 = parse_bool(val);
         /* 运行指标汇报间隔：与健康检查解耦（-stats-interval 为主名，-log-interval 作兼容别名）。
          * 显式传负数一律按 0（关闭）处理，避免出现「间隔 -5 秒」这种无意义配置。 */
-        else if (!strcmp(key, "ips-v4-file") && val) snprintf(c->ips_v4_file, sizeof(c->ips_v4_file), "%s", val);
-        else if (!strcmp(key, "ips-v6-file") && val) snprintf(c->ips_v6_file, sizeof(c->ips_v6_file), "%s", val);
-        else if (!strcmp(key, "ips-v4-url") && val) snprintf(c->ips_v4_url, sizeof(c->ips_v4_url), "%s", val);
-        else if (!strcmp(key, "ips-v6-url") && val) snprintf(c->ips_v6_url, sizeof(c->ips_v6_url), "%s", val);
-        else if (!strcmp(key, "ips-v4-update")) {
-            explicit_v4_update = 1;
-            parse_ips_update_spec(val, &c->ips_v4_update_mode, &c->ips_v4_update_sec);
-        } else if (!strcmp(key, "ips-v6-update")) {
-            explicit_v6_update = 1;
-            parse_ips_update_spec(val, &c->ips_v6_update_mode, &c->ips_v6_update_sec);
-        } else if (!strcmp(key, "ips-v4-to-cidr")) {
-            c->ips_v4_to_cidr = parse_to_cidr_spec(val, 24, 8, 31);
-        } else if (!strcmp(key, "ips-v6-to-cidr")) {
-            c->ips_v6_to_cidr = parse_to_cidr_spec(val, 64, 1, 127);
+        else if (!strcmp(key, "v4-file") && val) snprintf(v4_file, sizeof(v4_file), "%s", val);
+        else if (!strcmp(key, "v6-file") && val) snprintf(v6_file, sizeof(v6_file), "%s", val);
+        else if (!strcmp(key, "v4-url") && val) snprintf(v4_url, sizeof(v4_url), "%s", val);
+        else if (!strcmp(key, "v6-url") && val) snprintf(v6_url, sizeof(v6_url), "%s", val);
+        else if (!strcmp(key, "update")) {
+            has_g_upd = 1;
+            parse_ips_update_spec(val, &g_upd_mode, &g_upd_sec);
+        } else if (!strcmp(key, "v4-update")) {
+            has_v4_upd = 1;
+            parse_ips_update_spec(val, &v4_upd_mode, &v4_upd_sec);
+        } else if (!strcmp(key, "v6-update")) {
+            has_v6_upd = 1;
+            parse_ips_update_spec(val, &v6_upd_mode, &v6_upd_sec);
+        } else if (!strcmp(key, "to-cidr")) {
+            has_g_cidr = 1;
+            int on = parse_bool(val);
+            g_cidr_v4 = on ? 24 : 0;
+            g_cidr_v6 = on ? 64 : 0;
+        } else if (!strcmp(key, "v4-to-cidr")) {
+            has_v4_cidr = 1;
+            v4_cidr = parse_to_cidr_spec(val, 24, 8, 31);
+        } else if (!strcmp(key, "v6-to-cidr")) {
+            has_v6_cidr = 1;
+            v6_cidr = parse_to_cidr_spec(val, 64, 1, 127);
         }
         else if ((!strcmp(key, "stats-interval") || !strcmp(key, "log-interval")) && val) {
             int v = atoi(val);
@@ -1594,9 +1611,25 @@ static void parse_args(Config *c, int argc, char **argv) {
         }
     }
 
-    /* 显式指定自定义 URL 且未手动关闭 update 时，默认每次启动拉取一次以确保新源立即生效 */
-    if (c->ips_v4_url[0] && !explicit_v4_update) c->ips_v4_update_mode = 1;
-    if (c->ips_v6_url[0] && !explicit_v6_update) c->ips_v6_update_mode = 1;
+    /* 合并全局与分栈自定义 IP 源参数（-v4- / -v6- 优先级高于全局） */
+    if (v4_file[0]) snprintf(c->ips_v4_file, sizeof(c->ips_v4_file), "%s", v4_file);
+    if (v6_file[0]) snprintf(c->ips_v6_file, sizeof(c->ips_v6_file), "%s", v6_file);
+    if (v4_url[0]) snprintf(c->ips_v4_url, sizeof(c->ips_v4_url), "%s", v4_url);
+    if (v6_url[0]) snprintf(c->ips_v6_url, sizeof(c->ips_v6_url), "%s", v6_url);
+
+    if (has_v4_upd) { c->ips_v4_update_mode = v4_upd_mode; c->ips_v4_update_sec = v4_upd_sec; }
+    else if (has_g_upd) { c->ips_v4_update_mode = g_upd_mode; c->ips_v4_update_sec = g_upd_sec; }
+    else if (c->ips_v4_url[0]) { c->ips_v4_update_mode = 1; c->ips_v4_update_sec = 0; }
+
+    if (has_v6_upd) { c->ips_v6_update_mode = v6_upd_mode; c->ips_v6_update_sec = v6_upd_sec; }
+    else if (has_g_upd) { c->ips_v6_update_mode = g_upd_mode; c->ips_v6_update_sec = g_upd_sec; }
+    else if (c->ips_v6_url[0]) { c->ips_v6_update_mode = 1; c->ips_v6_update_sec = 0; }
+
+    if (has_v4_cidr) c->ips_v4_to_cidr = v4_cidr;
+    else if (has_g_cidr) c->ips_v4_to_cidr = g_cidr_v4;
+
+    if (has_v6_cidr) c->ips_v6_to_cidr = v6_cidr;
+    else if (has_g_cidr) c->ips_v6_to_cidr = g_cidr_v6;
 
     /* 统一合并全局 exclude-colo 到 c->colo */
     if (exclude_colo_buf[0]) {
