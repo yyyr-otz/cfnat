@@ -1,10 +1,10 @@
-# cfnat C 版 (C23 纯静态现代平台版)
+# cfnat C 版 (C23 全平台高性能版)
 
 面向全平台与高性能转发场景的 **Cloudflare IP 扫描 + 单端口 TCP/UDP (H2/H3) 双轨透明转发** 工具。
 
-本项目采用 **C23 国际标准 (ISO/IEC 9899:2024)** 进行现代化构建，针对 **Linux、Windows 11 及 Android Termux 现代平台（amd64 / arm64）** 生成**纯静态（Pure Static）独立二进制**，彻底剥离 glibc 依赖，根除跨发行版兼容性问题。同时全面集成了 **HTTP/2 (TCP) 与 HTTP/3 (QUIC/UDP) 双轨独立测优、按栈协议开关、抗 QoS 节拍化 H3 探测、可选真实 QUIC v1 ClientHello 模拟、按活跃度自适应健康检查、自适应高 BDP 缓冲区架构、Xray XMUX 协同优化以及原子树状防打断日志系统**。
+本项目采用 **C23 国际标准 (ISO/IEC 9899:2024)** 进行现代化构建，覆盖 **Linux（14 种 CPU 架构，同时提供 musl 纯静态版、`-musl` 动态版及 32 位 MIPS UPX 压缩版）、macOS、Windows、FreeBSD 及 Android Termux** 全平台 22 个目标架构，彻底剥离 glibc 依赖并兼容 32/64 位与小端/大端硬件。同时全面集成了 **HTTP/2 (TCP) 与 HTTP/3 (QUIC/UDP) 双轨独立测优、按栈协议开关、抗 QoS 节拍化 H3 探测、可选真实 QUIC v1 ClientHello 模拟、三层漏斗分协议定容热库、按活跃度自适应健康检查、自适应高 BDP 缓冲区架构、Xray XMUX 协同优化以及原子树状防打断日志系统**。
 
-核心目标是完整提供扫描、优选、三栈（IPv4 / IPv6 / 百度前置）H2/H3 同端口（或单协议独立）转发、活跃态高灵敏测活与空池退避自愈能力，同时兼顾极致的单流大吞吐与低 CPU 系统调用开销，适用于 OpenWrt/软路由、手机 Termux、VPS 以及 Windows 11 设备。
+核心目标是完整提供扫描、优选、三栈（IPv4 / IPv6 / 百度前置）H2/H3 同端口（或单协议独立）转发、活跃态高灵敏测活与空池退避自愈能力，同时兼顾极致的单流大吞吐与低 CPU/闪存开销，适用于 OpenWrt/硬路由与软路由、macOS、FreeBSD、手机 Termux、VPS 及 Windows 设备。
 
 ## 现代平台优化与支持说明
 
@@ -12,11 +12,11 @@
 
 | 缓冲区层级 | 适用平台 | 容量配置 | 核心性能收益 |
 | :--- | :--- | :--- | :--- |
-| **TCP 内核套接字缓冲 (`SO_RCVBUF` / `SO_SNDBUF`)** | Windows / Linux / Android | Linux: 接收与发送交由内核 `tcp_moderate_rcvbuf` / `tcp_wmem` 动态调优 + `TCP_NOTSENT_LOWAT=64KB`；Windows: `2 MB`（自适应回退 `1 MB` / `512 KB`）+ `SIO_LOOPBACK_FAST_PATH` | 解除固定窗口对 BBR 高 BDP 跨境吞吐的钳制，兼顾极致单流大带宽、零 Bufferbloat 与低延迟本机回环 |
-| **UDP 内核套接字缓冲 (`SO_RCVBUF` / `SO_SNDBUF`)** | Windows / Linux / Android | 监听 `4 MB`（回退 `2 MB` / `1 MB`） / 会话自适应（≤32 会话 `1 MB`→`512 KB`→`256 KB`；>32 会话 `256 KB`→`128 KB`→`64 KB`） | 吸收 QUIC/H3 多路复用高并发突发流量防丢包，同时防止多会话耗尽内核内存 |
-| **用户态 TCP 转发缓冲 (`COPY_BUF_SIZE`)** | Windows / Android（及 Linux 回退） | `64 KB`（虚拟线程栈 `512 KB`） | 单次 `recv`/`send` 吞吐 4 个满载 16KB TLS 记录帧，命中 CPU 核心 L2 Cache，高并发下较 128KB 节省 50% 物理页占用 |
-| **Linux 零拷贝管道 (`F_SETPIPE_SZ` + `splice`)** | Linux (`amd64` / `arm64`) | `256 KB`（回退 `128 KB` / `64 KB`） | 单次 `splice` 零拷贝系统调用可转移 64 个内核页面引用，长流大吞吐系统调用开销降低 75% |
-| **UDP/H3 批量与逐包边界透传引擎** | Linux / 无 Root Android / Windows 11 | Linux & Android: 上下行双向 `32` 包 `recvmmsg`/`sendmmsg`（单包槽位 `4096 B`）；Windows 11: 非阻塞循环排空 `recvfrom`/`sendto` + 全量关闭 `SIO_UDP_CONNRESET` | Linux/Android 降低 32 倍系统调用开销；Windows 严格保持 QUIC 原始数据报边界，彻底规避部分网卡驱动 URO 合并缺失控制消息导致的握手截断问题 |
+| **TCP 内核套接字缓冲 (`SO_RCVBUF` / `SO_SNDBUF`)** | 全平台（Linux / macOS / FreeBSD / Windows / Android） | Linux: 接收与发送交由内核 `tcp_moderate_rcvbuf` / `tcp_wmem` 动态调优 + `TCP_NOTSENT_LOWAT=64KB`；Windows / macOS / FreeBSD: `2 MB`（自适应回退 `1 MB` / `512 KB`），Windows 额外启用 `SIO_LOOPBACK_FAST_PATH` | 解除固定窗口对 BBR 高 BDP 跨境吞吐的钳制，兼顾极致单流大带宽、零 Bufferbloat 与低延迟本机回环 |
+| **UDP 内核套接字缓冲 (`SO_RCVBUF` / `SO_SNDBUF`)** | 全平台（Linux / macOS / FreeBSD / Windows / Android） | 监听 `4 MB`（回退 `2 MB` / `1 MB`） / 会话自适应（≤32 会话 `1 MB`→`512 KB`→`256 KB`；>32 会话 `256 KB`→`128 KB`→`64 KB`） | 吸收 QUIC/H3 多路复用高并发突发流量防丢包，同时防止多会话耗尽内核内存 |
+| **用户态 TCP 转发缓冲 (`COPY_BUF_SIZE`)** | Windows / macOS / FreeBSD / Android（及 Linux 回退） | `64 KB`（虚拟线程栈 `512 KB`） | 单次 `recv`/`send` 吞吐 4 个满载 16KB TLS 记录帧，命中 CPU 核心 L2 Cache，高并发下较 128KB 节省 50% 物理页占用 |
+| **Linux 零拷贝管道 (`F_SETPIPE_SZ` + `splice`)** | 全架构 Linux | `256 KB`（回退 `128 KB` / `64 KB`） | 单次 `splice` 零拷贝系统调用可转移 64 个内核页面引用，长流大吞吐系统调用开销降低 75% |
+| **UDP/H3 批量与逐包边界透传引擎** | Linux / 无 Root Android / Windows / macOS / FreeBSD | Linux & Android: 上下行双向 `32` 包 `recvmmsg`/`sendmmsg`（单包槽位 `4096 B`）；Windows / macOS / FreeBSD: 非阻塞循环排空 `recvfrom`/`sendto`（Windows 全量关闭 `SIO_UDP_CONNRESET`） | Linux/Android 降低 32 倍系统调用开销；其他平台严格保持 QUIC 原始数据报边界，规避部分驱动合并导致的握手截断问题 |
 
 ### 2. 核心性能与传输层优化
 
@@ -50,14 +50,19 @@
   - 扫描前按各栈启用的协议提前绑定监听端口（TCP Backlog `4096`），客户端首包握手先入内核队列，消除冷启动初期 RST；
   - 扫描线程数依 CPU 核心自适应降载（`min(task, 64 × nproc)`），保护低配软路由。
 
-### 3. 目标平台支持矩阵（纯静态架构）
+### 3. 全平台支持矩阵（22 架构 + musl 动态版 + MIPS UPX 版）
 
-构建产物全面采用**纯静态（Pure Static）独立二进制**或原生免外部依赖二进制，开箱即用：
-- **Linux amd64 (x86_64)**：musl 纯静态独立二进制（`cfnat-linux-amd64`），无视发行版差异（Ubuntu / Debian / Alpine / CentOS / OpenWrt / Arch 均可直接运行）
-- **Linux arm64 (aarch64)**：musl 纯静态独立二进制（`cfnat-linux-arm64`），适配各类 ARM VPS、树莓派及 OpenWrt 软路由
-- **Android Termux (arm64 & amd64)**：Android NDK 编译（`cfnat-android-arm64` / `cfnat-android-amd64`），适配 Bionic libc 与 Android 沙箱 seccomp 审计，Termux 免 root 开箱即用
-- **Windows 11 amd64 (x86_64)**：Win11 原生纯静态可执行文件（`cfnat-windows-amd64.exe`）
-- **Windows 11 arm64 (aarch64)**：Surface / 骁龙 X Elite / ARM 笔记本原生运行（`cfnat-windows-arm64.exe`）
+全平台产物均开启 `-Os`、分节死代码回收（`--gc-sections` / `-dead_strip`）、去栈展开表与完整符号剥离（绝大部分架构同步开启 `-flto`），在兼顾零依赖便携性的同时极限压低体积：
+
+| 操作系统 | 支持架构与产物命名 | 链接方式与适用场景 |
+| :--- | :--- | :--- |
+| **Linux（通用纯静态，14 架构）** | `cfnat-linux-{amd64, arm64, 386, armv5, armv6, armv7, mips, mipsel, mips64, mips64el, ppc64, ppc64le, riscv64, s390x}` | **musl 纯静态独立二进制**，无视发行版差异（Ubuntu / Debian / Armbian / CentOS / Arch / Alpine / OpenWrt 通用），内置 32 位 CPU 64 位原子与 ARMv5 同步原语兼容层 |
+| **Linux（musl 动态版，14 架构）** | `cfnat-linux-<arch>-musl`（对应全部 14 个 Linux 架构） | **动态链接系统 `/lib/ld-musl-*.so.1`**，专为 **OpenWrt 路由器与 Alpine Linux** 打造，省去静态 libc 体积；不可在 glibc 发行版（Ubuntu/Debian）运行 |
+| **Linux MIPS UPX 压缩版** | `cfnat-linux-{mips, mipsel}-upx`（及可用时的 `-musl-upx`） | 针对 8MB/16MB 闪存受限的老旧 32 位 MIPS/MIPSEL 路由器额外提供 UPX LZMA 压缩产物 |
+| **Windows（2 架构）** | `cfnat-windows-amd64.exe`、`cfnat-windows-arm64.exe` | 纯静态原生可执行文件，适配 x64 PC 与骁龙 X / ARM64 Windows 设备 |
+| **macOS（2 架构）** | `cfnat-darwin-amd64`、`cfnat-darwin-arm64` | Apple Clang 原生编译，支持 Intel Mac 与 Apple Silicon（M 系列） |
+| **FreeBSD（2 架构）** | `cfnat-freebsd-amd64`、`cfnat-freebsd-arm64` | 链接 FreeBSD 系统库，适配 FreeBSD 服务器及 OPNsense / pfSense 软路由 |
+| **Android Termux（2 架构）** | `cfnat-android-arm64`、`cfnat-android-amd64` | Android NDK 原生编译，适配 Bionic libc 与 Android 沙箱 seccomp，Termux 免 root 开箱即用 |
 
 ## 项目定位与转发链路
 
@@ -175,28 +180,30 @@ cfnat C 版做四件事：
 
 ### 1. 本地编译 (C23 标准)
 
-推荐使用 Zig (`zig cc`) 或现代 Clang / GCC 进行编译：
+推荐使用 Zig (`zig cc`) 或 Apple Clang / Android NDK 进行编译：
 
-**Linux（musl 纯静态独立版，推荐任意 Linux 发行版及 OpenWrt）**：
+**Linux（musl 纯静态独立版，适用于任意 Linux 发行版及 OpenWrt；将 `-static` 改为 `-dynamic` 即可生成 OpenWrt/Alpine 专用 `-musl` 动态版）**：
 ```bash
-zig cc -target x86_64-linux-musl -O2 -pipe -std=c23 \
+zig cc -target x86_64-linux-musl -Os -flto -pipe -std=c23 \
+  -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables \
   -Wall -Wextra -Wno-unused-parameter \
-  ./cfnat.c -o ./cfnat-linux-amd64 -pthread -static -s
+  ./cfnat.c -o ./cfnat-linux-amd64 -Wl,--gc-sections -pthread -static -s
 ```
 
-**Linux ARM64（musl 纯静态独立版，适用于 OpenWrt / 树莓派 / ARM VPS）**：
+**Windows（Zig 交叉编译，支持 `x86_64-windows-gnu` 与 `aarch64-windows-gnu`）**：
 ```bash
-zig cc -target aarch64-linux-musl -O2 -pipe -std=c23 \
-  -Wall -Wextra -Wno-unused-parameter \
-  ./cfnat.c -o ./cfnat-linux-arm64 -pthread -static -s
+zig cc -target x86_64-windows-gnu -Os -flto -pipe -std=c23 \
+  -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables \
+  -finput-charset=UTF-8 -fexec-charset=UTF-8 -Wall -Wextra -Wno-unused-parameter \
+  ./cfnat.c -o ./cfnat-windows-amd64.exe -Wl,--gc-sections -lws2_32 -ldnsapi -lwininet -static -s
 ```
 
-**Windows 11（Zig 交叉编译，支持 amd64 与 arm64）**：
+**macOS（Apple Clang 原生编译，`-arch` 可选 `arm64` 或 `x86_64`）**：
 ```bash
-zig cc -target x86_64-windows-gnu -O2 -pipe -std=c23 \
-  -finput-charset=UTF-8 -fexec-charset=UTF-8 \
+clang -arch arm64 -Os -flto -pipe -std=c23 \
+  -ffunction-sections -fdata-sections -fno-unwind-tables -fno-asynchronous-unwind-tables \
   -Wall -Wextra -Wno-unused-parameter \
-  ./cfnat.c -o ./cfnat-windows-amd64.exe -lws2_32 -ldnsapi -lwininet -static -s
+  ./cfnat.c -o ./cfnat-darwin-arm64 -Wl,-dead_strip -pthread && strip ./cfnat-darwin-arm64
 ```
 
 ### 2. 启动示例
@@ -343,16 +350,15 @@ journalctl --output cat -f -u cfnat
 
 ## 构建与 GitHub Actions 发布
 
-工作流文件位于 `.github/workflows/build.yml`，采用 **单 Job 6 路并发构建** 架构：
-- 仅占用 **1 个 `ubuntu-latest` runner**，单次下载 Zig 与 Android NDK 后，按目标隔离 Zig 缓存与日志并 6 路后台并发编译，完成后在同机生成 `sha256sums.txt` 直接发布 GitHub Release（省去多容器启动与 Artifact 中转开销）。
-- **自动构建产物（全部为纯静态或原生免外部依赖二进制）**：
-  - `cfnat-linux-amd64` (Linux x86_64 musl 纯静态版)
-  - `cfnat-linux-arm64` (Linux aarch64 musl 纯静态版)
-  - `cfnat-android-arm64` / `cfnat-android-amd64` (Android NDK Termux 原生版)
-  - `cfnat-windows-amd64.exe` / `cfnat-windows-arm64.exe` (Win11 纯静态版)
-- **触发与发布方式**：
-  - **推送 Tag 发布**：推送形如 `v*` 的标签时自动编译并发布到 Release。
-  - **手动网页触发发布**：在 GitHub Actions 页面点击 **Run workflow**，支持输入标签名称或自动从源码提取版本，支持标记为 Pre-release。
+工作流文件位于 `.github/workflows/build.yml`，采用 **双 Job 并行直传（零合并中转）** 架构，全平台构建启用 `-Os` + `-flto`（RISC-V64 与 ARMv5 除外）+ 分节死代码回收 + 去展开表 + 完整符号剥离：
+- **`build-macos`（`macos-latest`）**：4 路并发构建 `darwin-amd64`、`darwin-arm64`、`android-arm64`、`android-amd64`，率先完成后直接通过 `gh release` 创建 Tag/Release 并上传产物。
+- **`build-ubuntu`（`ubuntu-latest`）**：并发构建全部 14 个 Linux 架构（静态版 + `-musl` 动态版）、`windows-amd64/arm64`、`freebsd-amd64/arm64` 以及 32 位 MIPS/MIPSEL 的 UPX 压缩版，完成后直接追加上传至同一个 Release，与 `build-macos` 完全并行互不等待。
+- **触发方式与自定义目标过滤**：
+  - **推送 Tag 发布**：推送形如 `v*` 的标签时自动执行全量构建并发布 GitHub Release（GitHub 自动计算每个附件的 SHA-256）。
+  - **手动网页触发（Run workflow）**：
+    - `targets`：留空或填 `all` 为全量构建；支持填入分组（`linux` / `linux-static` / `musl` / `windows` / `macos` / `android` / `freebsd`）或任意具体目标名（如 `windows-amd64,linux-mipsel-musl`），会自动跳过无关 job 与工具下载，便于单平台快速验证；
+    - `tag_name` / `prerelease`：可手动指定标签或自动从 `cfnat.c` 提取，支持标记为预发布；
+    - `publish_release`：默认勾选发布 Release；仅需功能验证时可取消勾选，改为仅上传 Workflow Artifacts 供下载测试。
 
 ## 资源占用与缓冲区设计说明
 
