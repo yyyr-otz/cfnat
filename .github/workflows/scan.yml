@@ -8,13 +8,20 @@ on:
         required: true
         default: '4,6'
       domain:
-        description: '探测目标域名与路径（用于 TLS SNI 或 HTTP Host/Path）'
+        description: '探测目标域名与路径（用于 TLS SNI 或 HTTP/HTTPS Host/Path）'
         required: false
         default: 'cloudflaremirrors.com/debian'
       code:
-        description: '期望 HTTP 状态码（0=走 443 TLS 握手；200/301 等=走 80 HTTP HEAD 校验）'
+        description: '期望 HTTP 状态码（0=仅测 443 TLS 握手；200/301 等=测 HTTP/HTTPS 状态码）'
         required: false
-        default: '0'
+        default: '200'
+      port:
+        description: '探测端口: 443 (HTTPS / TLS) 或 80 (明文 HTTP)'
+        type: choice
+        options:
+          - '443'
+          - '80'
+        default: '443'
       num:
         description: '每个子网最多随机抽样 IP 数（任意 1 个通即早停）'
         required: false
@@ -47,6 +54,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: cfscan-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   scan:
     name: "Run cfscan (IPv4 / IPv6)"
@@ -59,12 +70,15 @@ jobs:
           fetch-depth: 1
           token: ${{ github.token }}
 
-      - name: Compile cfscan.c (C23)
+      - name: Compile cfscan.c (C23 + OpenSSL)
         shell: bash
         run: |
           set -euo pipefail
+          if [ ! -f /usr/include/openssl/ssl.h ]; then
+            sudo apt-get update -qq && sudo apt-get install -y -qq libssl-dev
+          fi
           cc -O2 -std=c2x -Wall -Wextra -Werror -Wno-unused-parameter \
-            cfscan.c -o ./cfscan -pthread
+            cfscan.c -o ./cfscan -pthread -lssl -lcrypto
           ./cfscan -h
 
       - name: Check IPv6 connectivity & optionally setup WARP SOCKS5
@@ -147,13 +161,14 @@ jobs:
         env:
           DOMAIN: ${{ inputs.domain }}
           CODE: ${{ inputs.code }}
+          PORT: ${{ inputs.port }}
           NUM: ${{ inputs.num }}
           TASK_V4: ${{ inputs.task_v4 }}
           DELAY: ${{ inputs.delay }}
           RESET: ${{ inputs.reset }}
         run: |
           set -euo pipefail
-          args=(-ips=4 "-domain=${DOMAIN}" "-code=${CODE}" "-num=${NUM}" "-task=${TASK_V4}" "-delay=${DELAY}")
+          args=(-ips=4 "-domain=${DOMAIN}" "-code=${CODE}" "-port=${PORT}" "-num=${NUM}" "-task=${TASK_V4}" "-delay=${DELAY}")
           if [ "$RESET" = "true" ]; then args+=(-reset); fi
           ./cfscan "${args[@]}"
 
@@ -163,6 +178,7 @@ jobs:
         env:
           DOMAIN: ${{ inputs.domain }}
           CODE: ${{ inputs.code }}
+          PORT: ${{ inputs.port }}
           NUM: ${{ inputs.num }}
           TASK_V6: ${{ inputs.task_v6 }}
           DELAY: ${{ inputs.delay }}
@@ -170,7 +186,7 @@ jobs:
           V6_PROXY: ${{ steps.v6check.outputs.proxy }}
         run: |
           set -euo pipefail
-          args=(-ips=6 "-domain=${DOMAIN}" "-code=${CODE}" "-num=${NUM}" "-task=${TASK_V6}" "-delay=${DELAY}")
+          args=(-ips=6 "-domain=${DOMAIN}" "-code=${CODE}" "-port=${PORT}" "-num=${NUM}" "-task=${TASK_V6}" "-delay=${DELAY}")
           if [ -n "$V6_PROXY" ]; then args+=("-proxy=${V6_PROXY}"); fi
           if [ "$RESET" = "true" ]; then args+=(-reset); fi
           ./cfscan "${args[@]}"
@@ -183,6 +199,7 @@ jobs:
           IPS_INPUT: ${{ inputs.ips }}
           DOMAIN: ${{ inputs.domain }}
           CODE: ${{ inputs.code }}
+          PORT: ${{ inputs.port }}
         run: |
           set -euo pipefail
           count_lines() { [ -f "$1" ] && wc -l < "$1" | tr -d ' ' || echo 0; }
@@ -192,7 +209,7 @@ jobs:
             echo "| 项目 | 状态 / 数量 |"
             echo "| :--- | :--- |"
             echo "| 扫描协议栈 | \`${IPS_INPUT}\` |"
-            echo "| 目标域名 / 状态码 | \`${DOMAIN}\` (code=\`${CODE}\`) |"
+            echo "| 目标域名 / 端口 / 状态码 | \`${DOMAIN}\` (port=\`${PORT}\`, code=\`${CODE}\`) |"
             echo "| IPv6 连通性测试 | ${V6_INFO} |"
             echo "| \`scan-ips-v4.txt\`（累计有响应） | $(count_lines scan-ips-v4.txt) |"
             echo "| \`underscan-ips-v4.txt\`（剩余待补扫） | $(count_lines underscan-ips-v4.txt) |"
@@ -229,4 +246,5 @@ jobs:
             exit 0
           fi
           git commit -m "chore(cfscan): update scan-ips and underscan-ips [skip ci]"
+          git pull --rebase origin "${GITHUB_REF_NAME}"
           git push
