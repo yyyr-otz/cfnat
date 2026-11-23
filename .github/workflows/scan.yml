@@ -170,7 +170,7 @@ jobs:
           set -euo pipefail
           args=(-ips=4 "-domain=${DOMAIN}" "-code=${CODE}" "-port=${PORT}" "-num=${NUM}" "-task=${TASK_V4}" "-delay=${DELAY}")
           if [ "$RESET" = "true" ]; then args+=(-reset); fi
-          ./cfscan "${args[@]}"
+          ./cfscan "${args[@]}" | tee /tmp/cfscan-v6.log | tee /tmp/cfscan-v4.log
 
       - name: Run IPv6 scan
         if: contains(inputs.ips, '6') && steps.v6check.outputs.mode != 'none'
@@ -203,6 +203,16 @@ jobs:
         run: |
           set -euo pipefail
           count_lines() { [ -f "$1" ] && wc -l < "$1" | tr -d ' ' || echo 0; }
+          get_dist() {
+            local f="$1"
+            if [ -f "$f" ]; then
+              local d
+              d=$(sed -n 's/.*Status distribution: //p' "$f" | tail -n1)
+              echo "${d:-无 (TLS 握手或未运行)}"
+            else
+              echo "未运行"
+            fi
+          }
           {
             echo "### cfscan 扫描汇总"
             echo ""
@@ -211,6 +221,8 @@ jobs:
             echo "| 扫描协议栈 | \`${IPS_INPUT}\` |"
             echo "| 目标域名 / 端口 / 状态码 | \`${DOMAIN}\` (port=\`${PORT}\`, code=\`${CODE}\`) |"
             echo "| IPv6 连通性测试 | ${V6_INFO} |"
+            echo "| IPv4 状态码分布 | \`$(get_dist /tmp/cfscan-v4.log)\` |"
+            echo "| IPv6 状态码分布 | \`$(get_dist /tmp/cfscan-v6.log)\` |"
             echo "| \`scan-ips-v4.txt\`（累计有响应） | $(count_lines scan-ips-v4.txt) |"
             echo "| \`underscan-ips-v4.txt\`（剩余待补扫） | $(count_lines underscan-ips-v4.txt) |"
             echo "| \`scan-ips-v6.txt\`（累计有响应） | $(count_lines scan-ips-v6.txt) |"
