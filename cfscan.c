@@ -785,11 +785,13 @@ static int probe_http_or_https_once(const Config *cfg, SSL_CTX *ssl_ctx,
     sock_t fd = dial_target(cfg, proxy_sa, proxy_salen, ip, is_v6, (uint16_t)cfg->port, deadline);
     if (fd == INVALID_SOCK) return -1;
 
-    char req[768];
+    char req[1024];
     int n = snprintf(req, sizeof(req),
                      "%s %s HTTP/1.1\r\n"
                      "Host: %s\r\n"
-                     "User-Agent: cfscan/1.0\r\n"
+                     "User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36\r\n"
+                     "Accept: */*\r\n"
+                     "Accept-Language: en-US,en;q=0.9\r\n"
                      "Connection: close\r\n\r\n",
                      method, cfg->path, cfg->host);
     if (n <= 0 || (size_t)n >= sizeof(req)) {
@@ -1082,6 +1084,7 @@ int main(int argc, char **argv) {
             return 1;
         }
         SSL_CTX_set_verify(ctx.ssl_ctx, SSL_VERIFY_NONE, CFSCAN_NULL);
+        SSL_CTX_set_session_cache_mode(ctx.ssl_ctx, SSL_SESS_CACHE_OFF);
     }
 
     if (cfg.has_proxy) {
