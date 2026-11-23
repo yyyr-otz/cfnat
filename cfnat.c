@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.2.0"
+#define CFNAT_VERSION "0.2.1"
 
 /* =========================================================================
  * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
@@ -560,6 +560,7 @@ static const char *cfg_ips_file_for_type(int ips_type);
 static void hotpool_record_success(int ips_type, int is_udp, const char *ip, int lat_ms, int from_traffic);
 static void hotpool_record_failure(int ips_type, int is_udp, const char *ip, int penalty);
 static void hotpool_flush_all(void);
+static int network_sentinel_ok(int ips_type, int timeout_ms);
 static int hotpool_has_fresh_cloud(int ips_type, int is_udp);
 static void hotpool_clear_fresh_cloud(int ips_type, int is_udp);
 static StringList build_smart_ip_list(int ips_type, int is_udp, int random_mode, int v6_split, size_t target_ipnum);
@@ -855,6 +856,23 @@ static size_t g_carrier_runtime_count = 0;
 static pthread_mutex_t g_log_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_ips_v4_mu = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t g_ips_v6_mu = PTHREAD_MUTEX_INITIALIZER;
+static atomic_int g_net_frozen_v4 = 0;
+static atomic_int g_net_frozen_v6 = 0;
+
+static inline int net_is_frozen(int ips_type) {
+    return (ips_type == 6)
+        ? atomic_load_explicit(&g_net_frozen_v6, memory_order_acquire)
+        : atomic_load_explicit(&g_net_frozen_v4, memory_order_acquire);
+}
+
+static inline void net_set_frozen(int ips_type, int frozen) {
+    if (ips_type == 6) atomic_store_explicit(&g_net_frozen_v6, frozen ? 1 : 0, memory_order_release);
+    else               atomic_store_explicit(&g_net_frozen_v4, frozen ? 1 : 0, memory_order_release);
+}
+
+static inline const char *network_sentinel_ip(int ips_type) {
+    return (ips_type == 6) ? "2400:3200::1" : "223.5.5.5";
+}
 
 static int parse_addr(const char *addr, char *host, size_t hostsz, int *port);
 static socket_t accept_interruptible(socket_t listen_fd, struct sockaddr *addr,
@@ -2925,7 +2943,7 @@ static void hotpool_record_success(int ips_type, int is_udp, const char *ip, int
 }
 
 static void hotpool_record_failure(int ips_type, int is_udp, const char *ip, int penalty) {
-    if (!ip || !*ip || penalty <= 0) return;
+    if (!ip || !*ip || penalty <= 0 || net_is_frozen(ips_type)) return;
     HotPool *hp = hotpool_get(ips_type, is_udp);
     char net[MAX_IP_LEN];
     int pfx = (ips_type == 6) ? 64 : 24;
@@ -3526,6 +3544,17 @@ CFNAT_NODISCARD static socket_t tcp_connect(const char *ip, int port, int timeou
         sslen = sizeof(struct sockaddr_in);
     }
     return tcp_connect_sa(&ss, sslen, port, timeout_ms, latency_ms);
+}
+
+/* 本机公网哨兵 TCPing 443 探测：平时零发包，仅在候选全灭时区分"节点失效"与"断网/校园网未登录" */
+static int network_sentinel_ok(int ips_type, int timeout_ms) {
+    const char *ip = network_sentinel_ip(ips_type);
+    socket_t fd = tcp_connect(ip, 443, timeout_ms > 0 ? timeout_ms : 1500, nullptr);
+    if (cfnat_socket_valid(fd)) {
+        close(fd);
+        return 1;
+    }
+    return 0;
 }
 
 static inline int sockaddr_ip_equal(const struct sockaddr_storage *a, const struct sockaddr_storage *b) {
@@ -6512,6 +6541,16 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
         if (cached_tcp.len == 0) return 0;
         size_t first_good_tcp = cache_quick_check_parallel(rt, cached_tcp.items, cached_tcp.len, 0, 0, 0);
         if (first_good_tcp == (size_t)-1) {
+            if (!network_sentinel_ok(ips_type, 1500)) {
+                net_set_frozen(ips_type, 1);
+                warn_msg("[%s] 本机 IPv%d 哨兵 (%s:443) 无响应（可能断网或校园网未登录），已冻结热库并保留缓存等待网络恢复",
+                         carrier_display_name(rt->spec.mode), ips_type, network_sentinel_ip(ips_type));
+                rt->candidates.items = cached_tcp.items;
+                rt->candidates.len = cached_tcp.len;
+                atomic_store(&rt->candidates.cache_valid, 0);
+                atomic_store_explicit(&rt->maint_pending, MAINT_RESCAN, memory_order_release);
+                return 1;
+            }
             warn_msg("[%s] 纯 H3 模式无有效 UDP/TCP 缓存，将立即从热库/底座执行启动扫描", carrier_display_name(rt->spec.mode));
             atomic_store_explicit(&rt->maint_pending, 0, memory_order_release);
             free(cached_tcp.items);
@@ -6550,6 +6589,24 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
 
     size_t first_good_tcp = cache_quick_check_parallel(rt, cached_tcp.items, cached_tcp.len, 0, 0, 0);
     if (first_good_tcp == (size_t)-1) {
+        if (!network_sentinel_ok(ips_type, 1500)) {
+            net_set_frozen(ips_type, 1);
+            warn_msg("[%s] 本机 IPv%d 哨兵 (%s:443) 无响应（可能断网或校园网未登录），已冻结热库并保留缓存等待网络恢复",
+                     carrier_display_name(rt->spec.mode), ips_type, network_sentinel_ip(ips_type));
+            rt->candidates.items = cached_tcp.items;
+            rt->candidates.len = cached_tcp.len;
+            atomic_store(&rt->candidates.cache_valid, 0);
+            if (use_h3) {
+                ResultList cached_udp = load_candidate_cache_for_profile(udp_path, &rt->spec.prof);
+                if (cached_udp.len > 0) {
+                    rt->udp_candidates.items = cached_udp.items;
+                    rt->udp_candidates.len = cached_udp.len;
+                    atomic_store(&rt->udp_candidates.cache_valid, 0);
+                }
+            }
+            atomic_store_explicit(&rt->maint_pending, MAINT_RESCAN, memory_order_release);
+            return 1;
+        }
         warn_msg("[%s] TCP 候选缓存健康检查未命中，将立即从热库/底座执行启动扫描", carrier_display_name(rt->spec.mode));
         atomic_store_explicit(&rt->maint_pending, 0, memory_order_release);
         free(cached_tcp.items);
@@ -7957,6 +8014,17 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
             log_msg("[%s] 存活候选 %zu 个 (< 达标线 %zu 个或需补充 UDP)，维持最优存活 IP %s 正常转发，后台启动补充扫描...",
                     carrier_display_name(rt->spec.mode), survivors.len, tcp_heal_min, survivors.items[0].ip);
         } else {
+            int check_ver = rt->spec.prof.ips_type > 0 ? rt->spec.prof.ips_type : g_cfg.ips_type;
+            if (!network_sentinel_ok(check_ver, 1500)) {
+                net_set_frozen(check_ver, 1);
+                atomic_store(&rt->candidates.cache_valid, 0);
+                atomic_store(&rt->udp_candidates.cache_valid, 0);
+                warn_msg("[%s] 本机 IPv%d 哨兵 (%s:443) 无响应（可能断网或校园网未登录），已冻结热库与缓存并暂停扫描",
+                         carrier_display_name(rt->spec.mode), check_ver, network_sentinel_ip(check_ver));
+                free(survivors.items);
+                atomic_store(&rt->rescanning_lock, 0);
+                return 0;
+            }
             warn_msg("[%s] 候选池已全部失效，启动扫描寻找可用候选 IP", carrier_display_name(rt->spec.mode));
             atomic_store(&rt->candidates.cache_valid, 0);
         }
@@ -8128,7 +8196,26 @@ static void *carrier_maintenance_thread(void *arg) {
     CarrierRuntime *rt = (CarrierRuntime *)arg;
     if (!rt) return nullptr;
 
+    int offline_backoff_s = 10;
     while (atomic_load(&g_running)) {
+        int cur_ver = rt->spec.prof.ips_type > 0 ? rt->spec.prof.ips_type : g_cfg.ips_type;
+        if (net_is_frozen(cur_ver)) {
+            if (sleep_interruptible_ms(offline_backoff_s * 1000) != 0) break;
+            if (network_sentinel_ok(cur_ver, 1500)) {
+                net_set_frozen(cur_ver, 0);
+                offline_backoff_s = 10;
+                log_msg("[%s] 本机 IPv%d 哨兵 (%s:443) 已恢复连通，正在无损唤醒恢复候选池...",
+                        carrier_display_name(rt->spec.mode), cur_ver, network_sentinel_ip(cur_ver));
+                if (sleep_interruptible_ms(1000) != 0) break;
+                atomic_exchange_explicit(&rt->maint_pending, 0, memory_order_acq_rel);
+                carrier_rescan_dual_pools(rt);
+            } else {
+                offline_backoff_s = (offline_backoff_s < 30) ? (offline_backoff_s + 10) : 30;
+            }
+            continue;
+        }
+        offline_backoff_s = 10;
+
         pthread_mutex_lock(&rt->maint_mu);
         while (atomic_load(&g_running) && atomic_load_explicit(&rt->maint_pending, memory_order_acquire) == 0) {
             struct timespec ts;
@@ -8192,6 +8279,10 @@ static void *carrier_health_thread(void *arg) {
                         (last_act > 0 && ((long long)now_ms() - last_act) < 30000LL);
         int sleep_dur = (fail > 0) ? 10000 : (is_active ? 20000 : ((consecutive_success >= 5) ? 60000 : 30000));
         if (sleep_interruptible_ms(sleep_dur) != 0) break;
+        if (net_is_frozen(rt->spec.prof.ips_type > 0 ? rt->spec.prof.ips_type : g_cfg.ips_type)) {
+            fail = 0;
+            continue;
+        }
         char ip[MAX_IP_LEN];
         carrier_get_current_ip(rt, ip, sizeof(ip));
 
@@ -8266,6 +8357,10 @@ static void *carrier_udp_health_thread(void *arg) {
                             ? (empty_backoff_s * 1000)
                             : ((fail > 0) ? 10000 : (udp_active ? 15000 : ((consecutive_success >= 5) ? 60000 : 30000)));
         if (sleep_interruptible_ms(sleep_dur) != 0) break;
+        if (net_is_frozen(rt->spec.prof.ips_type > 0 ? rt->spec.prof.ips_type : g_cfg.ips_type)) {
+            fail = 0;
+            continue;
+        }
 
         char ip[MAX_IP_LEN] = {0};
         carrier_get_current_udp_ip(rt, ip, sizeof(ip));
