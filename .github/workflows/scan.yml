@@ -1,0 +1,232 @@
+name: CF Subnet Reachability Scan (cfscan)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ips:
+        description: '扫描协议栈: 4 (仅IPv4), 6 (仅IPv6), 或 4,6 (双栈)'
+        required: true
+        default: '4,6'
+      domain:
+        description: '探测目标域名与路径（用于 TLS SNI 或 HTTP Host/Path）'
+        required: false
+        default: 'cloudflaremirrors.com/debian'
+      code:
+        description: '期望 HTTP 状态码（0=走 443 TLS 握手；200/301 等=走 80 HTTP HEAD 校验）'
+        required: false
+        default: '0'
+      num:
+        description: '每个子网最多随机抽样 IP 数（任意 1 个通即早停）'
+        required: false
+        default: '1'
+      task_v4:
+        description: 'IPv4 直连并发线程数'
+        required: false
+        default: '400'
+      task_v6:
+        description: 'IPv6 扫描并发线程数（经 WARP SOCKS5 建议 32~64，原生 v6 可开 400）'
+        required: false
+        default: '48'
+      delay:
+        description: '单次探测超时（毫秒）'
+        required: false
+        default: '1500'
+      use_warp_for_v6:
+        description: '无原生 IPv6 出口时自动启用 WARP (wireproxy SOCKS5) 尝试扫描 IPv6'
+        type: boolean
+        default: true
+      reset:
+        description: '忽略现有 underscan-ips-v*.txt，强制从原始 ips-v*.txt 重新扫描'
+        type: boolean
+        default: false
+      commit_results:
+        description: '将更新后的 scan-ips-v*.txt / underscan-ips-v*.txt 自动提交回仓库'
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+jobs:
+  scan:
+    name: "Run cfscan (IPv4 / IPv6)"
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 1
+          token: ${{ github.token }}
+
+      - name: Compile cfscan.c (C23)
+        shell: bash
+        run: |
+          set -euo pipefail
+          cc -O2 -std=c2x -Wall -Wextra -Werror -Wno-unused-parameter \
+            cfscan.c -o ./cfscan -pthread
+          ./cfscan -h
+
+      - name: Check IPv6 connectivity & optionally setup WARP SOCKS5
+        id: v6check
+        if: contains(inputs.ips, '6')
+        shell: bash
+        env:
+          DOMAIN: ${{ inputs.domain }}
+          USE_WARP: ${{ inputs.use_warp_for_v6 }}
+        run: |
+          set -euo pipefail
+          v6_mode="none"
+          v6_proxy=""
+          v6_info="No IPv6 egress"
+
+          echo "=== Step 1: Testing native IPv6 egress ==="
+          if v6_ip=$(curl -6 -fsS --max-time 5 https://api64.ipify.org 2>/dev/null) && [[ "$v6_ip" == *:* ]]; then
+            echo "✅ Native IPv6 available: ${v6_ip}"
+            v6_mode="native"
+            v6_info="Native IPv6 (${v6_ip})"
+          else
+            echo "ℹ️ Native IPv6 is not available on this runner."
+          fi
+
+          if [ "$v6_mode" = "none" ] && [ "$USE_WARP" = "true" ]; then
+            echo "=== Step 2: Setting up user-space WARP SOCKS5 (wgcf + wireproxy) ==="
+            mkdir -p /tmp/warp && cd /tmp/warp
+
+            wgcf_url=$(curl -fsSL https://api.github.com/repos/ViRb3/wgcf/releases/latest \
+              | grep -oE 'https://[^"]+linux_amd64' | head -n1)
+            curl -fsSL "$wgcf_url" -o wgcf && chmod +x wgcf
+
+            wp_url=$(curl -fsSL https://api.github.com/repos/whyvl/wireproxy/releases/latest \
+              | grep -oE 'https://[^"]+wireproxy_linux_amd64\.tar\.gz' | head -n1)
+            curl -fsSL "$wp_url" -o wireproxy.tar.gz
+            tar -xzf wireproxy.tar.gz && chmod +x wireproxy
+
+            ./wgcf register --accept-tos >/dev/null
+            ./wgcf generate >/dev/null
+
+            {
+              echo "WGConfig = /tmp/warp/wgcf-profile.conf"
+              echo ""
+              echo "[Socks5]"
+              echo "BindAddress = 127.0.0.1:1080"
+            } > wireproxy.conf
+
+            nohup ./wireproxy -c wireproxy.conf >/tmp/warp/wireproxy.log 2>&1 &
+            sleep 3
+
+            echo "=== Step 3: Testing IPv6 connectivity via WARP SOCKS5 ==="
+            if warp_v6=$(curl --socks5-hostname 127.0.0.1:1080 -6 -fsS --max-time 8 https://api64.ipify.org 2>/dev/null) && [[ "$warp_v6" == *:* ]]; then
+              echo "✅ WARP SOCKS5 IPv6 egress OK: ${warp_v6}"
+              host="${DOMAIN#https://}"
+              host="${host#http://}"
+              host="${host%%/*}"
+              if curl --socks5-hostname 127.0.0.1:1080 -6 -I -sS --max-time 8 "https://${host}" >/dev/null 2>&1; then
+                echo "✅ WARP SOCKS5 -> https://${host} (IPv6) reachable"
+                v6_info="WARP SOCKS5 (${warp_v6}, target HTTPS OK)"
+              else
+                echo "⚠️ WARP SOCKS5 IPv6 egress OK (${warp_v6}), but https://${host} over IPv6 did not respond directly (will still run cfscan)"
+                v6_info="WARP SOCKS5 (${warp_v6}, target probe warn)"
+              fi
+              v6_mode="socks5"
+              v6_proxy="socks5://127.0.0.1:1080"
+            else
+              echo "❌ WARP SOCKS5 IPv6 connectivity check failed:"
+              cat /tmp/warp/wireproxy.log || true
+              v6_info="WARP SOCKS5 IPv6 check failed"
+            fi
+          fi
+
+          echo "mode=${v6_mode}" >> "$GITHUB_OUTPUT"
+          echo "proxy=${v6_proxy}" >> "$GITHUB_OUTPUT"
+          echo "info=${v6_info}" >> "$GITHUB_OUTPUT"
+
+      - name: Run IPv4 scan
+        if: contains(inputs.ips, '4')
+        shell: bash
+        env:
+          DOMAIN: ${{ inputs.domain }}
+          CODE: ${{ inputs.code }}
+          NUM: ${{ inputs.num }}
+          TASK_V4: ${{ inputs.task_v4 }}
+          DELAY: ${{ inputs.delay }}
+          RESET: ${{ inputs.reset }}
+        run: |
+          set -euo pipefail
+          args=(-ips=4 "-domain=${DOMAIN}" "-code=${CODE}" "-num=${NUM}" "-task=${TASK_V4}" "-delay=${DELAY}")
+          if [ "$RESET" = "true" ]; then args+=(-reset); fi
+          ./cfscan "${args[@]}"
+
+      - name: Run IPv6 scan
+        if: contains(inputs.ips, '6') && steps.v6check.outputs.mode != 'none'
+        shell: bash
+        env:
+          DOMAIN: ${{ inputs.domain }}
+          CODE: ${{ inputs.code }}
+          NUM: ${{ inputs.num }}
+          TASK_V6: ${{ inputs.task_v6 }}
+          DELAY: ${{ inputs.delay }}
+          RESET: ${{ inputs.reset }}
+          V6_PROXY: ${{ steps.v6check.outputs.proxy }}
+        run: |
+          set -euo pipefail
+          args=(-ips=6 "-domain=${DOMAIN}" "-code=${CODE}" "-num=${NUM}" "-task=${TASK_V6}" "-delay=${DELAY}")
+          if [ -n "$V6_PROXY" ]; then args+=("-proxy=${V6_PROXY}"); fi
+          if [ "$RESET" = "true" ]; then args+=(-reset); fi
+          ./cfscan "${args[@]}"
+
+      - name: Write scan summary
+        if: always()
+        shell: bash
+        env:
+          V6_INFO: ${{ steps.v6check.outputs.info || 'Not requested' }}
+          IPS_INPUT: ${{ inputs.ips }}
+          DOMAIN: ${{ inputs.domain }}
+          CODE: ${{ inputs.code }}
+        run: |
+          set -euo pipefail
+          count_lines() { [ -f "$1" ] && wc -l < "$1" | tr -d ' ' || echo 0; }
+          {
+            echo "### cfscan 扫描汇总"
+            echo ""
+            echo "| 项目 | 状态 / 数量 |"
+            echo "| :--- | :--- |"
+            echo "| 扫描协议栈 | \`${IPS_INPUT}\` |"
+            echo "| 目标域名 / 状态码 | \`${DOMAIN}\` (code=\`${CODE}\`) |"
+            echo "| IPv6 连通性测试 | ${V6_INFO} |"
+            echo "| \`scan-ips-v4.txt\`（累计有响应） | $(count_lines scan-ips-v4.txt) |"
+            echo "| \`underscan-ips-v4.txt\`（剩余待补扫） | $(count_lines underscan-ips-v4.txt) |"
+            echo "| \`scan-ips-v6.txt\`（累计有响应） | $(count_lines scan-ips-v6.txt) |"
+            echo "| \`underscan-ips-v6.txt\`（剩余待补扫） | $(count_lines underscan-ips-v6.txt) |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload scan results as artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cfscan-results
+          path: |
+            scan-ips-v*.txt
+            underscan-ips-v*.txt
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Commit updated scan files
+        if: inputs.commit_results
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(scan-ips-v*.txt underscan-ips-v*.txt)
+          if [ "${#files[@]}" -eq 0 ]; then
+            echo "No scan files generated."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add "${files[@]}"
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git commit -m "chore(cfscan): update scan-ips and underscan-ips [skip ci]"
+          git push
