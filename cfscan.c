@@ -1,8 +1,8 @@
 /*
- * cfscan.c - Lightweight C23 Subnet Reachability Scanner (IPv4/IPv6 + Optional SOCKS5)
+ * cfscan.c - Lightweight C23 Subnet Reachability Scanner (IPv4/IPv6 + OpenSSL HTTPS + SOCKS5)
  *
  * Features:
- *   - Standalone single-file C23 (ISO/IEC 9899:2024), zero external library dependencies
+ *   - Standalone single-file C23 (ISO/IEC 9899:2024) using system OpenSSL (-lssl -lcrypto)
  *   - Cross-platform: Linux, macOS, FreeBSD, Windows (WinSock2)
  *   - Resumable incremental scanning:
  *       * Automatically resumes from non-empty underscan-ips-v{4,6}.txt if present,
@@ -10,11 +10,11 @@
  *       * Merges, deduplicates, and numerically sorts reachable subnets into
  *         scan-ips-v{4,6}.txt atomically without overwriting prior hits.
  *       * Writes remaining unreachable subnets into underscan-ips-v{4,6}.txt.
- *   - Dual probe modes:
- *       * -code=0 (default): TLS ClientHello (with SNI) on port 443 -> checks ServerHello
- *       * -code=N (non-zero): HTTP HEAD (with Host/path, 405->GET fallback) on port 80
+ *   - Probe modes:
+ *       * -code=0 (default): Lightweight TLS ClientHello (SNI) -> checks ServerHello (port 443)
+ *       * -code=N (>0): Full HTTPS (OpenSSL, port 443 default) or HTTP (port 80) HEAD/GET status check
  *   - Optional RFC 1928 SOCKS5 proxy (-proxy=socks5://host:port) for IPv4 & IPv6 targets
- *   - CI-friendly & TTY-friendly real-time progress reporting
+ *   - CI-friendly & TTY-friendly real-time progress reporting + HTTP status distribution summary
  */
 
 #ifndef _WIN32
@@ -37,6 +37,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+
+#include <openssl/err.h>
+#include <openssl/ssl.h>
 
 #if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 202311L
 #  define CFSCAN_NULL nullptr
@@ -82,8 +85,10 @@ typedef struct {
     int num;                 /* max random IP samples per subnet (early-exit on 1st hit) */
     int task;                /* concurrent worker threads */
     int delay_ms;            /* per-attempt timeout in ms */
-    int expected_code;       /* 0 = TLS handshake, >0 = HTTP status code */
-    int port;                /* 0 = auto (443 for TLS, 80 for HTTP) */
+    int expected_code;       /* 0 = raw TLS handshake, >0 = HTTP/HTTPS status code */
+    int port;                /* target port (default 443) */
+    int tls_mode;            /* -1 = auto by port, 0 = plain HTTP, 1 = HTTPS (OpenSSL) */
+    bool use_https;          /* resolved HTTPS flag when expected_code > 0 */
     bool reset;              /* ignore existing underscan file and scan from base */
     bool has_proxy;
     char proxy_host[256];
@@ -230,7 +235,6 @@ static bool parse_subnet_line(const char *raw, int expected_ver, Subnet *out) {
     if (len == 0 || len >= sizeof(buf)) return false;
     buf[len] = '\0';
 
-    /* Handle bracketed IPv6: [2606:4700::1]:443 or [2606:4700::/32] */
     char *p = buf;
     if (*p == '[') {
         p++;
@@ -248,7 +252,6 @@ static bool parse_subnet_line(const char *raw, int expected_ver, Subnet *out) {
         if (!endp || *endp != '\0' || v < 0 || v > 128) return false;
         prefix = (int)v;
     } else if (expected_ver == 4) {
-        /* Strip trailing :port for IPv4 */
         char *colon = strchr(p, ':');
         if (colon) *colon = '\0';
     }
@@ -370,7 +373,6 @@ static bool write_subnets_atomic(const char *path, const SubnetList *list) {
     return true;
 }
 
-/* Generate a random IP inside the subnet */
 static void sample_random_ip(const Subnet *s, RngState *rng, uint8_t out_addr[16]) {
     if (!s->is_v6) {
         uint32_t net = ((uint32_t)s->addr[0] << 24) | ((uint32_t)s->addr[1] << 16) |
@@ -381,7 +383,6 @@ static void sample_random_ip(const Subnet *s, RngState *rng, uint8_t out_addr[16
             uint32_t mask = (host_bits == 32) ? 0xFFFFFFFFU : ((1U << host_bits) - 1U);
             uint32_t r = (uint32_t)rng_next(rng) & mask;
             if (host_bits >= 2) {
-                /* Avoid network (.0) and broadcast (.255) when >= 4 addresses */
                 if (r == 0) r = 1;
                 else if (r == mask) r = mask - 1;
             }
@@ -411,7 +412,7 @@ static void sample_random_ip(const Subnet *s, RngState *rng, uint8_t out_addr[16
     }
 }
 
-/* ---------------- Non-blocking Socket, SOCKS5 & Probe Logic ---------------- */
+/* ---------------- Non-blocking Socket, SOCKS5, OpenSSL & Probe Logic ---------------- */
 
 static bool set_nonblocking(sock_t fd) {
 #ifdef _WIN32
@@ -453,8 +454,7 @@ static bool send_all_deadline(sock_t fd, const uint8_t *buf, size_t len, int64_t
     while (sent < len) {
         int rem = (int)(deadline - now_ms());
         if (rem <= 0) return false;
-        int pr = poll_fd(fd, POLLOUT, rem);
-        if (pr <= 0) return false;
+        if (poll_fd(fd, POLLOUT, rem) <= 0) return false;
 #ifdef _WIN32
         int n = send(fd, (const char *)(buf + sent), (int)(len - sent), 0);
 #else
@@ -476,8 +476,7 @@ static ssize_t recv_exact_deadline(sock_t fd, uint8_t *buf, size_t len, int64_t 
     while (got < len) {
         int rem = (int)(deadline - now_ms());
         if (rem <= 0) return -1;
-        int pr = poll_fd(fd, POLLIN, rem);
-        if (pr <= 0) return -1;
+        if (poll_fd(fd, POLLIN, rem) <= 0) return -1;
 #ifdef _WIN32
         int n = recv(fd, (char *)(buf + got), (int)(len - got), 0);
 #else
@@ -498,8 +497,7 @@ static ssize_t recv_some_deadline(sock_t fd, uint8_t *buf, size_t cap, int64_t d
     while (true) {
         int rem = (int)(deadline - now_ms());
         if (rem <= 0) return -1;
-        int pr = poll_fd(fd, POLLIN, rem);
-        if (pr <= 0) return -1;
+        if (poll_fd(fd, POLLIN, rem) <= 0) return -1;
 #ifdef _WIN32
         int n = recv(fd, (char *)buf, (int)cap, 0);
 #else
@@ -568,7 +566,6 @@ static sock_t dial_target(const Config *cfg, const struct sockaddr_storage *prox
     sock_t fd = connect_sa_deadline((const struct sockaddr *)proxy_sa, proxy_salen, deadline);
     if (fd == INVALID_SOCK) return INVALID_SOCK;
 
-    /* SOCKS5 greeting: VER=5, NMETHODS=1, NO AUTH(0x00) */
     const uint8_t greet[3] = { 0x05, 0x01, 0x00 };
     uint8_t rep[2];
     if (!send_all_deadline(fd, greet, sizeof(greet), deadline) ||
@@ -578,20 +575,19 @@ static sock_t dial_target(const Config *cfg, const struct sockaddr_storage *prox
         return INVALID_SOCK;
     }
 
-    /* SOCKS5 CONNECT request */
     uint8_t req[22];
     size_t req_len = 0;
-    req[0] = 0x05; /* VER */
-    req[1] = 0x01; /* CMD=CONNECT */
-    req[2] = 0x00; /* RSV */
+    req[0] = 0x05;
+    req[1] = 0x01;
+    req[2] = 0x00;
     if (!is_v6) {
-        req[3] = 0x01; /* ATYP=IPv4 */
+        req[3] = 0x01;
         memcpy(req + 4, target_ip, 4);
         req[8] = (uint8_t)(port >> 8);
         req[9] = (uint8_t)(port & 0xFF);
         req_len = 10;
     } else {
-        req[3] = 0x04; /* ATYP=IPv6 */
+        req[3] = 0x04;
         memcpy(req + 4, target_ip, 16);
         req[20] = (uint8_t)(port >> 8);
         req[21] = (uint8_t)(port & 0xFF);
@@ -610,11 +606,9 @@ static sock_t dial_target(const Config *cfg, const struct sockaddr_storage *prox
     }
 
     size_t skip = 0;
-    if (hdr[3] == 0x01) {
-        skip = 4 + 2;
-    } else if (hdr[3] == 0x04) {
-        skip = 16 + 2;
-    } else if (hdr[3] == 0x03) {
+    if (hdr[3] == 0x01) skip = 4 + 2;
+    else if (hdr[3] == 0x04) skip = 16 + 2;
+    else if (hdr[3] == 0x03) {
         uint8_t dlen = 0;
         if (recv_exact_deadline(fd, &dlen, 1, deadline) != 1) {
             close_sock(fd);
@@ -634,82 +628,64 @@ static sock_t dial_target(const Config *cfg, const struct sockaddr_storage *prox
     return fd;
 }
 
-/* Build minimal TLS 1.2/1.3 ClientHello with SNI */
+/* Lightweight raw TLS ClientHello probe (used when -code=0) */
 static size_t build_tls_client_hello(uint8_t *buf, size_t cap, const char *sni, RngState *rng) {
     size_t sni_len = strlen(sni);
     if (sni_len > 250 || cap < 128 + sni_len) return 0;
 
     uint8_t *p = buf;
-    /* TLS Record Header (filled later) */
     p[0] = 0x16; p[1] = 0x03; p[2] = 0x01;
     uint8_t *rec_len_ptr = p + 3;
     p += 5;
 
-    /* Handshake Header (ClientHello = 0x01) */
     *p++ = 0x01;
     uint8_t *hs_len_ptr = p;
     p += 3;
 
-    /* Client Version: TLS 1.2 */
     *p++ = 0x03; *p++ = 0x03;
 
-    /* 32-byte Random */
     for (int i = 0; i < 4; i++) {
         uint64_t r = rng_next(rng);
         memcpy(p, &r, 8);
         p += 8;
     }
-
-    /* Session ID (0) */
     *p++ = 0x00;
 
-    /* Cipher Suites (TLS 1.3 + common TLS 1.2 ECDHE suites) */
     static const uint8_t suites[] = {
-        0x13, 0x01, /* TLS_AES_128_GCM_SHA256 */
-        0x13, 0x02, /* TLS_AES_256_GCM_SHA384 */
-        0x13, 0x03, /* TLS_CHACHA20_POLY1305_SHA256 */
-        0xC0, 0x2F, /* TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256 */
-        0xC0, 0x2B, /* TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256 */
-        0xCC, 0xA9, /* TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256 */
-        0xCC, 0xA8  /* TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256 */
+        0x13, 0x01, 0x13, 0x02, 0x13, 0x03,
+        0xC0, 0x2F, 0xC0, 0x2B, 0xCC, 0xA9, 0xCC, 0xA8
     };
     *p++ = 0x00; *p++ = (uint8_t)sizeof(suites);
     memcpy(p, suites, sizeof(suites));
     p += sizeof(suites);
 
-    /* Compression Methods: null only */
     *p++ = 0x01; *p++ = 0x00;
 
-    /* Extensions */
     uint8_t *ext_len_ptr = p;
     p += 2;
     uint8_t *ext_start = p;
 
-    /* Extension 1: server_name (SNI) */
     if (sni_len > 0) {
         uint16_t list_len = (uint16_t)(sni_len + 3);
         uint16_t ext_len = (uint16_t)(list_len + 2);
         *p++ = 0x00; *p++ = 0x00;
         *p++ = (uint8_t)(ext_len >> 8);  *p++ = (uint8_t)(ext_len & 0xFF);
         *p++ = (uint8_t)(list_len >> 8); *p++ = (uint8_t)(list_len & 0xFF);
-        *p++ = 0x00; /* host_name */
+        *p++ = 0x00;
         *p++ = (uint8_t)(sni_len >> 8);  *p++ = (uint8_t)(sni_len & 0xFF);
         memcpy(p, sni, sni_len);
         p += sni_len;
     }
 
-    /* Extension 2: supported_groups (x25519, secp256r1) */
     static const uint8_t groups[] = { 0x00, 0x0A, 0x00, 0x06, 0x00, 0x04, 0x00, 0x1D, 0x00, 0x17 };
     memcpy(p, groups, sizeof(groups)); p += sizeof(groups);
 
-    /* Extension 3: signature_algorithms */
     static const uint8_t sigs[] = {
         0x00, 0x0D, 0x00, 0x0C, 0x00, 0x0A,
         0x04, 0x03, 0x08, 0x04, 0x04, 0x01, 0x05, 0x03, 0x02, 0x01
     };
     memcpy(p, sigs, sizeof(sigs)); p += sizeof(sigs);
 
-    /* Extension 4: supported_versions (TLS 1.3, TLS 1.2) */
     static const uint8_t vers[] = { 0x00, 0x2B, 0x00, 0x05, 0x04, 0x03, 0x04, 0x03, 0x03 };
     memcpy(p, vers, sizeof(vers)); p += sizeof(vers);
 
@@ -729,8 +705,8 @@ static size_t build_tls_client_hello(uint8_t *buf, size_t cap, const char *sni, 
     return (size_t)(p - buf);
 }
 
-static bool probe_tls(const Config *cfg, const struct sockaddr_storage *proxy_sa, socklen_t proxy_salen,
-                      const uint8_t ip[16], bool is_v6, RngState *rng) {
+static bool probe_tls_hello(const Config *cfg, const struct sockaddr_storage *proxy_sa, socklen_t proxy_salen,
+                            const uint8_t ip[16], bool is_v6, RngState *rng) {
     int64_t deadline = now_ms() + cfg->delay_ms;
     sock_t fd = dial_target(cfg, proxy_sa, proxy_salen, ip, is_v6, (uint16_t)cfg->port, deadline);
     if (fd == INVALID_SOCK) return false;
@@ -741,7 +717,6 @@ static bool probe_tls(const Config *cfg, const struct sockaddr_storage *proxy_sa
     if (ch_len > 0 && send_all_deadline(fd, ch, ch_len, deadline)) {
         uint8_t resp[5];
         if (recv_exact_deadline(fd, resp, 5, deadline) == 5) {
-            /* 0x16 = TLS Handshake (ServerHello), major version 0x03 */
             if (resp[0] == 0x16 && resp[1] == 0x03) ok = true;
         }
     }
@@ -759,8 +734,53 @@ static int parse_http_status(const char *buf, size_t len) {
     return (sp[0] - '0') * 100 + (sp[1] - '0') * 10 + (sp[2] - '0');
 }
 
-static int probe_http_once(const Config *cfg, const struct sockaddr_storage *proxy_sa, socklen_t proxy_salen,
-                           const uint8_t ip[16], bool is_v6, const char *method) {
+/* OpenSSL non-blocking helpers */
+static bool ssl_wait_io(SSL *ssl, sock_t fd, int rc, int64_t deadline) {
+    int err = SSL_get_error(ssl, rc);
+    int rem = (int)(deadline - now_ms());
+    if (rem <= 0) return false;
+    if (err == SSL_ERROR_WANT_READ) return poll_fd(fd, POLLIN, rem) > 0;
+    if (err == SSL_ERROR_WANT_WRITE) return poll_fd(fd, POLLOUT, rem) > 0;
+    return false;
+}
+
+static bool ssl_connect_deadline(SSL *ssl, sock_t fd, int64_t deadline) {
+    while (true) {
+        if (now_ms() >= deadline) return false;
+        int rc = SSL_connect(ssl);
+        if (rc == 1) return true;
+        if (!ssl_wait_io(ssl, fd, rc, deadline)) return false;
+    }
+}
+
+static bool ssl_write_all_deadline(SSL *ssl, sock_t fd, const uint8_t *buf, size_t len, int64_t deadline) {
+    size_t sent = 0;
+    while (sent < len) {
+        if (now_ms() >= deadline) return false;
+        int rc = SSL_write(ssl, buf + sent, (int)(len - sent));
+        if (rc > 0) {
+            sent += (size_t)rc;
+        } else {
+            if (!ssl_wait_io(ssl, fd, rc, deadline)) return false;
+        }
+    }
+    return true;
+}
+
+static ssize_t ssl_read_some_deadline(SSL *ssl, sock_t fd, uint8_t *buf, size_t cap, int64_t deadline) {
+    while (true) {
+        if (now_ms() >= deadline) return -1;
+        int rc = SSL_read(ssl, buf, (int)cap);
+        if (rc > 0) return (ssize_t)rc;
+        int err = SSL_get_error(ssl, rc);
+        if (err == SSL_ERROR_ZERO_RETURN) return 0;
+        if (!ssl_wait_io(ssl, fd, rc, deadline)) return -1;
+    }
+}
+
+static int probe_http_or_https_once(const Config *cfg, SSL_CTX *ssl_ctx,
+                                    const struct sockaddr_storage *proxy_sa, socklen_t proxy_salen,
+                                    const uint8_t ip[16], bool is_v6, const char *method) {
     int64_t deadline = now_ms() + cfg->delay_ms;
     sock_t fd = dial_target(cfg, proxy_sa, proxy_salen, ip, is_v6, (uint16_t)cfg->port, deadline);
     if (fd == INVALID_SOCK) return -1;
@@ -772,31 +792,78 @@ static int probe_http_once(const Config *cfg, const struct sockaddr_storage *pro
                      "User-Agent: cfscan/1.0\r\n"
                      "Connection: close\r\n\r\n",
                      method, cfg->path, cfg->host);
+    if (n <= 0 || (size_t)n >= sizeof(req)) {
+        close_sock(fd);
+        return -1;
+    }
+
     int code = -1;
-    if (n > 0 && (size_t)n < sizeof(req) &&
-        send_all_deadline(fd, (const uint8_t *)req, (size_t)n, deadline)) {
-        uint8_t resp[256];
-        ssize_t r = recv_some_deadline(fd, resp, sizeof(resp) - 1, deadline);
-        if (r > 0) {
-            resp[r] = '\0';
-            code = parse_http_status((const char *)resp, (size_t)r);
+    if (cfg->use_https) {
+        SSL *ssl = SSL_new(ssl_ctx);
+        if (!ssl) {
+            close_sock(fd);
+            return -1;
+        }
+        SSL_set_fd(ssl, (int)fd);
+        if (cfg->host[0] != '\0') SSL_set_tlsext_host_name(ssl, cfg->host);
+        SSL_set_connect_state(ssl);
+
+        if (ssl_connect_deadline(ssl, fd, deadline) &&
+            ssl_write_all_deadline(ssl, fd, (const uint8_t *)req, (size_t)n, deadline)) {
+            uint8_t resp[512];
+            ssize_t r = ssl_read_some_deadline(ssl, fd, resp, sizeof(resp) - 1, deadline);
+            if (r > 0) {
+                resp[r] = '\0';
+                code = parse_http_status((const char *)resp, (size_t)r);
+            }
+        }
+        SSL_free(ssl);
+    } else {
+        if (send_all_deadline(fd, (const uint8_t *)req, (size_t)n, deadline)) {
+            uint8_t resp[512];
+            ssize_t r = recv_some_deadline(fd, resp, sizeof(resp) - 1, deadline);
+            if (r > 0) {
+                resp[r] = '\0';
+                code = parse_http_status((const char *)resp, (size_t)r);
+            }
         }
     }
+
     close_sock(fd);
     return code;
 }
 
-static bool probe_subnet(const Config *cfg, const struct sockaddr_storage *proxy_sa, socklen_t proxy_salen,
-                         const Subnet *s, RngState *rng) {
+typedef struct {
+    const Config *cfg;
+    SSL_CTX *ssl_ctx;
+    SubnetList *work;
+    struct sockaddr_storage proxy_sa;
+    socklen_t proxy_salen;
+    atomic_size_t next_idx;
+    atomic_size_t done_cnt;
+    atomic_size_t ok_cnt;
+    atomic_size_t http_code_cnt[600];
+    atomic_size_t http_err_cnt;
+} ScanCtx;
+
+static bool probe_subnet(ScanCtx *ctx, const Subnet *s, RngState *rng) {
+    const Config *cfg = ctx->cfg;
     for (int i = 0; i < cfg->num; i++) {
         uint8_t ip[16];
         sample_random_ip(s, rng, ip);
         if (cfg->expected_code == 0) {
-            if (probe_tls(cfg, proxy_sa, proxy_salen, ip, s->is_v6 != 0, rng)) return true;
+            if (probe_tls_hello(cfg, &ctx->proxy_sa, ctx->proxy_salen, ip, s->is_v6 != 0, rng)) return true;
         } else {
-            int code = probe_http_once(cfg, proxy_sa, proxy_salen, ip, s->is_v6 != 0, "HEAD");
+            int code = probe_http_or_https_once(cfg, ctx->ssl_ctx, &ctx->proxy_sa, ctx->proxy_salen,
+                                                ip, s->is_v6 != 0, "HEAD");
             if (code == 405 && cfg->expected_code != 405) {
-                code = probe_http_once(cfg, proxy_sa, proxy_salen, ip, s->is_v6 != 0, "GET");
+                code = probe_http_or_https_once(cfg, ctx->ssl_ctx, &ctx->proxy_sa, ctx->proxy_salen,
+                                                ip, s->is_v6 != 0, "GET");
+            }
+            if (code >= 100 && code < 600) {
+                atomic_fetch_add_explicit(&ctx->http_code_cnt[code], 1, memory_order_relaxed);
+            } else {
+                atomic_fetch_add_explicit(&ctx->http_err_cnt, 1, memory_order_relaxed);
             }
             if (code == cfg->expected_code) return true;
         }
@@ -805,17 +872,6 @@ static bool probe_subnet(const Config *cfg, const struct sockaddr_storage *proxy
 }
 
 /* ---------------- Worker Pool & Progress Reporting ---------------- */
-
-typedef struct {
-    const Config *cfg;
-    SubnetList *work;
-    struct sockaddr_storage proxy_sa;
-    socklen_t proxy_salen;
-    atomic_size_t next_idx;
-    atomic_size_t done_cnt;
-    atomic_size_t ok_cnt;
-    atomic_bool finished;
-} ScanCtx;
 
 typedef struct {
     ScanCtx *ctx;
@@ -836,7 +892,7 @@ static void *worker_main(void *arg) {
     while (true) {
         size_t idx = atomic_fetch_add_explicit(&ctx->next_idx, 1, memory_order_relaxed);
         if (idx >= total) break;
-        bool hit = probe_subnet(ctx->cfg, &ctx->proxy_sa, ctx->proxy_salen, &ctx->work->items[idx], &rng);
+        bool hit = probe_subnet(ctx, &ctx->work->items[idx], &rng);
         ctx->work->items[idx].ok = hit;
         if (hit) atomic_fetch_add_explicit(&ctx->ok_cnt, 1, memory_order_relaxed);
         atomic_fetch_add_explicit(&ctx->done_cnt, 1, memory_order_relaxed);
@@ -892,13 +948,18 @@ static bool parse_proxy(Config *cfg, const char *val) {
     return true;
 }
 
+static bool is_https_port(int port) {
+    return port == 443 || port == 8443 || port == 2053 || port == 2083 || port == 2087 || port == 2096;
+}
+
 static void print_usage(const char *prog) {
     printf(
         "Usage: %s [options]\n"
         "  -ips=4|6              IP version to scan (alias: -4, -6, -scan=4|6) [default: 4]\n"
         "  -domain=HOST[/PATH]   Target domain for TLS SNI / HTTP Host [default: cloudflaremirrors.com/debian]\n"
-        "  -code=N               0 = TLS handshake (443); >0 = HTTP status check (80) [default: 0]\n"
-        "  -port=N               Override target port [default: 443 for TLS, 80 for HTTP]\n"
+        "  -code=N               0 = lightweight TLS handshake; >0 = HTTP/HTTPS status check [default: 0]\n"
+        "  -port=N               Target port (e.g. 443 for HTTPS or 80 for HTTP) [default: 443]\n"
+        "  -tls=auto|0|1         Force HTTPS (1) or plain HTTP (0) when -code>0 [default: auto by port]\n"
         "  -num=N                Max random IP samples per subnet (early-exit on hit) [default: 1]\n"
         "  -task=N               Concurrent worker threads [default: 200]\n"
         "  -delay=MS             Per-attempt timeout in milliseconds [default: 1500]\n"
@@ -939,7 +1000,8 @@ int main(int argc, char **argv) {
     cfg.task = 200;
     cfg.delay_ms = 1500;
     cfg.expected_code = 0;
-    cfg.port = 0;
+    cfg.port = 443;
+    cfg.tls_mode = -1;
     parse_domain(&cfg, "cloudflaremirrors.com/debian");
 
     for (int i = 1; i < argc; i++) {
@@ -952,6 +1014,10 @@ int main(int argc, char **argv) {
             cfg.ip_ver = 4;
         } else if (strcmp(a, "-6") == 0) {
             cfg.ip_ver = 6;
+        } else if (strcmp(a, "-https") == 0) {
+            cfg.tls_mode = 1;
+        } else if (strcmp(a, "-http") == 0) {
+            cfg.tls_mode = 0;
         } else if (strcmp(a, "-reset") == 0 || strcmp(a, "--reset") == 0) {
             cfg.reset = true;
         } else if (match_arg(a, "ips", &v) || match_arg(a, "scan", &v)) {
@@ -962,6 +1028,10 @@ int main(int argc, char **argv) {
             cfg.expected_code = atoi(v);
         } else if (match_arg(a, "port", &v)) {
             cfg.port = atoi(v);
+        } else if (match_arg(a, "tls", &v)) {
+            if (strcmp(v, "auto") == 0) cfg.tls_mode = -1;
+            else if (strcmp(v, "1") == 0 || strcmp(v, "true") == 0) cfg.tls_mode = 1;
+            else cfg.tls_mode = 0;
         } else if (match_arg(a, "num", &v)) {
             cfg.num = atoi(v);
         } else if (match_arg(a, "task", &v)) {
@@ -990,15 +1060,30 @@ int main(int argc, char **argv) {
     if (cfg.task < 1) cfg.task = 1;
     if (cfg.task > 2000) cfg.task = 2000;
     if (cfg.delay_ms < 100) cfg.delay_ms = 100;
-    if (cfg.port <= 0) cfg.port = (cfg.expected_code == 0) ? 443 : 80;
+    if (cfg.port <= 0 || cfg.port > 65535) cfg.port = 443;
+
+    if (cfg.expected_code > 0) {
+        if (cfg.tls_mode == 1) cfg.use_https = true;
+        else if (cfg.tls_mode == 0) cfg.use_https = false;
+        else cfg.use_https = is_https_port(cfg.port);
+    }
 
     snprintf(cfg.scan_file, sizeof(cfg.scan_file), "scan-ips-v%d.txt", cfg.ip_ver);
     snprintf(cfg.underscan_file, sizeof(cfg.underscan_file), "underscan-ips-v%d.txt", cfg.ip_ver);
 
-    /* Resolve SOCKS5 proxy address once before spawning workers */
     ScanCtx ctx;
     memset(&ctx, 0, sizeof(ctx));
     ctx.cfg = &cfg;
+
+    if (cfg.expected_code > 0 && cfg.use_https) {
+        ctx.ssl_ctx = SSL_CTX_new(TLS_client_method());
+        if (!ctx.ssl_ctx) {
+            fprintf(stderr, "Failed to create OpenSSL SSL_CTX\n");
+            return 1;
+        }
+        SSL_CTX_set_verify(ctx.ssl_ctx, SSL_VERIFY_NONE, CFSCAN_NULL);
+    }
+
     if (cfg.has_proxy) {
         struct addrinfo hints, *res = CFSCAN_NULL;
         memset(&hints, 0, sizeof(hints));
@@ -1007,6 +1092,7 @@ int main(int argc, char **argv) {
         snprintf(pbuf, sizeof(pbuf), "%d", cfg.proxy_port);
         if (getaddrinfo(cfg.proxy_host, pbuf, &hints, &res) != 0 || !res) {
             fprintf(stderr, "Failed to resolve SOCKS5 proxy %s:%d\n", cfg.proxy_host, cfg.proxy_port);
+            if (ctx.ssl_ctx) SSL_CTX_free(ctx.ssl_ctx);
             return 1;
         }
         memcpy(&ctx.proxy_sa, res->ai_addr, res->ai_addrlen);
@@ -1014,7 +1100,6 @@ int main(int argc, char **argv) {
         freeaddrinfo(res);
     }
 
-    /* Select input source: explicit -in > non-empty underscan > base ips-v*.txt */
     SubnetList work = {0};
     char chosen_src[540];
     if (cfg.in_file[0] != '\0') {
@@ -1033,15 +1118,14 @@ int main(int argc, char **argv) {
     if (work.len == 0) {
         fprintf(stderr, "No valid IPv%d subnets found in %s\n", cfg.ip_ver, chosen_src);
         free(work.items);
+        if (ctx.ssl_ctx) SSL_CTX_free(ctx.ssl_ctx);
         return 1;
     }
 
-    /* Load existing scan-ips-v*.txt so we merge without ever overwriting */
     SubnetList existing_ok = {0};
     load_subnets_file(cfg.scan_file, cfg.ip_ver, &existing_ok);
     subnet_list_sort_dedup(&existing_ok);
 
-    /* Exclude subnets already verified in scan-ips-v*.txt from the pending work queue */
     if (existing_ok.len > 0) {
         size_t w = 0;
         for (size_t i = 0; i < work.len; i++) {
@@ -1056,6 +1140,7 @@ int main(int argc, char **argv) {
             write_subnets_atomic(cfg.underscan_file, &work);
             free(work.items);
             free(existing_ok.items);
+            if (ctx.ssl_ctx) SSL_CTX_free(ctx.ssl_ctx);
 #ifdef _WIN32
             WSACleanup();
 #endif
@@ -1063,7 +1148,6 @@ int main(int argc, char **argv) {
         }
     }
 
-    /* Shuffle subnets to avoid sequential scanning patterns */
     RngState shuf_rng;
     rng_seed(&shuf_rng, (uint64_t)time(CFSCAN_NULL) ^ ((uint64_t)now_ms() << 20));
     for (size_t i = work.len - 1; i > 0; i--) {
@@ -1076,11 +1160,11 @@ int main(int argc, char **argv) {
     int workers = cfg.task;
     if ((size_t)workers > work.len) workers = (int)work.len;
 
+    const char *mode_str = (cfg.expected_code == 0) ? "TLS-Hello" : (cfg.use_https ? "HTTPS" : "HTTP");
     printf("[cfscan] IPv%d | Source: %s (%zu subnets) | Mode: %s (port %d) | Domain: %s | Samples/subnet: %d | Workers: %d | Timeout: %dms",
-           cfg.ip_ver, chosen_src, work.len,
-           cfg.expected_code == 0 ? "TLS" : "HTTP", cfg.port,
+           cfg.ip_ver, chosen_src, work.len, mode_str, cfg.port,
            cfg.domain, cfg.num, workers, cfg.delay_ms);
-    if (cfg.expected_code > 0) printf(" | Expect HTTP %d", cfg.expected_code);
+    if (cfg.expected_code > 0) printf(" | Expect %d", cfg.expected_code);
     if (cfg.has_proxy) printf(" | Proxy: socks5://%s:%d", cfg.proxy_host, cfg.proxy_port);
     printf("\n");
     fflush(stdout);
@@ -1089,7 +1173,8 @@ int main(int argc, char **argv) {
     atomic_init(&ctx.next_idx, 0);
     atomic_init(&ctx.done_cnt, 0);
     atomic_init(&ctx.ok_cnt, 0);
-    atomic_init(&ctx.finished, false);
+    atomic_init(&ctx.http_err_cnt, 0);
+    for (int i = 0; i < 600; i++) atomic_init(&ctx.http_code_cnt[i], 0);
 
     WorkerArg *wargs = (WorkerArg *)calloc((size_t)workers, sizeof(WorkerArg));
 #ifdef _WIN32
@@ -1099,6 +1184,7 @@ int main(int argc, char **argv) {
 #endif
     if (!wargs || !threads) {
         fprintf(stderr, "Out of memory\n");
+        if (ctx.ssl_ctx) SSL_CTX_free(ctx.ssl_ctx);
         return 1;
     }
 
@@ -1121,7 +1207,6 @@ int main(int argc, char **argv) {
 #endif
     }
 
-    /* Progress monitor: TTY single-line bar vs CI-friendly periodic log lines */
     bool is_ci = (getenv("CI") != CFSCAN_NULL || getenv("GITHUB_ACTIONS") != CFSCAN_NULL || !isatty_stdout());
     int last_pct_bucket = -1;
     int64_t last_log_ms = t_start;
@@ -1168,7 +1253,6 @@ int main(int argc, char **argv) {
     free(threads);
     free(wargs);
 
-    /* Partition results: merge new hits into existing_ok; collect misses into new_under */
     SubnetList new_under = {0};
     size_t newly_ok = 0;
     for (size_t i = 0; i < work.len; i++) {
@@ -1186,10 +1270,12 @@ int main(int argc, char **argv) {
 
     if (!write_subnets_atomic(cfg.scan_file, &existing_ok)) {
         fprintf(stderr, "Error writing %s\n", cfg.scan_file);
+        if (ctx.ssl_ctx) SSL_CTX_free(ctx.ssl_ctx);
         return 1;
     }
     if (!write_subnets_atomic(cfg.underscan_file, &new_under)) {
         fprintf(stderr, "Error writing %s\n", cfg.underscan_file);
+        if (ctx.ssl_ctx) SSL_CTX_free(ctx.ssl_ctx);
         return 1;
     }
 
@@ -1199,9 +1285,25 @@ int main(int argc, char **argv) {
            cfg.scan_file, existing_ok.len, prev_ok_cnt,
            cfg.underscan_file, new_under.len);
 
+    if (cfg.expected_code > 0) {
+        printf("[cfscan] Status distribution:");
+        bool any = false;
+        for (int c = 100; c < 600; c++) {
+            size_t cnt = atomic_load_explicit(&ctx.http_code_cnt[c], memory_order_relaxed);
+            if (cnt > 0) {
+                printf(" %d=%zu", c, cnt);
+                any = true;
+            }
+        }
+        size_t err_cnt = atomic_load_explicit(&ctx.http_err_cnt, memory_order_relaxed);
+        if (err_cnt > 0 || !any) printf(" err/timeout=%zu", err_cnt);
+        printf("\n");
+    }
+
     free(work.items);
     free(existing_ok.items);
     free(new_under.items);
+    if (ctx.ssl_ctx) SSL_CTX_free(ctx.ssl_ctx);
 #ifdef _WIN32
     WSACleanup();
 #endif
