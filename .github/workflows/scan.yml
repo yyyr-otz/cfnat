@@ -170,7 +170,7 @@ jobs:
           set -euo pipefail
           args=(-ips=4 "-domain=${DOMAIN}" "-code=${CODE}" "-port=${PORT}" "-num=${NUM}" "-task=${TASK_V4}" "-delay=${DELAY}")
           if [ "$RESET" = "true" ]; then args+=(-reset); fi
-          ./cfscan "${args[@]}" | tee /tmp/cfscan-v6.log | tee /tmp/cfscan-v4.log
+          ./cfscan "${args[@]}" | tee /tmp/cfscan-v4.log
 
       - name: Run IPv6 scan
         if: contains(inputs.ips, '6') && steps.v6check.outputs.mode != 'none'
@@ -189,7 +189,7 @@ jobs:
           args=(-ips=6 "-domain=${DOMAIN}" "-code=${CODE}" "-port=${PORT}" "-num=${NUM}" "-task=${TASK_V6}" "-delay=${DELAY}")
           if [ -n "$V6_PROXY" ]; then args+=("-proxy=${V6_PROXY}"); fi
           if [ "$RESET" = "true" ]; then args+=(-reset); fi
-          ./cfscan "${args[@]}"
+          ./cfscan "${args[@]}" | tee /tmp/cfscan-v6.log
 
       - name: Write scan summary
         if: always()
