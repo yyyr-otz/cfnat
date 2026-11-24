@@ -289,10 +289,39 @@ jobs:
             echo "✅ Using cached Zig: /tmp/zig-toolchain/${zig_dir}"
           else
             mkdir -p /tmp/zig-toolchain
+            echo "🔍 Benchmarking Zig community mirrors for ${zig_dir}.tar.xz ..."
+            mirror_list=()
+            if mirrors_raw=$(curl -fsSL --connect-timeout 5 --max-time 10 https://ziglang.org/download/community-mirrors.txt 2>/dev/null); then
+              : > /tmp/zig-mirrors.txt
+              while IFS= read -r m; do
+                m="${m%%#*}"
+                m="$(echo "$m" | tr -d '[:space:]')"
+                [ -z "$m" ] && continue
+                m="${m%/}"
+                (
+                  res=$(curl -o /dev/null -s -L -I -w "%{http_code} %{time_total}" --connect-timeout 3 --max-time 5 "${m}/${zig_dir}.tar.xz" || echo "000 99.0")
+                  code="${res%% *}"
+                  t="${res#* }"
+                  if [ "$code" = "200" ]; then
+                    printf "%s %s\n" "$t" "$m" >> /tmp/zig-mirrors.txt
+                  fi
+                ) &
+              done <<< "$mirrors_raw"
+              wait || true
+              if [ -s /tmp/zig-mirrors.txt ]; then
+                echo "Fastest reachable Zig mirrors:"
+                sort -k1 -n /tmp/zig-mirrors.txt | tee /tmp/zig-mirrors-sorted.txt
+                while IFS=' ' read -r _ murl; do
+                  mirror_list+=("$murl")
+                done < /tmp/zig-mirrors-sorted.txt
+              fi
+              rm -f /tmp/zig-mirrors.txt /tmp/zig-mirrors-sorted.txt
+            fi
+            mirror_list+=("https://ziglang.org/download/${ZIG_VERSION}")
+
             echo "⬇️ Downloading ${zig_dir}.tar.xz ..."
             zig_ok=0
-            for base_url in               "https://ziglang.org/download/${ZIG_VERSION}"               "https://pkg.machengine.org/zig"               "https://zigmirror.hryx.net/zig"
-            do
+            for base_url in "${mirror_list[@]}"; do
               if "${CURL_SAFE[@]}" "${base_url}/${zig_dir}.tar.xz" -o /tmp/zig.tar.xz; then
                 zig_ok=1
                 echo "✅ Downloaded Zig from ${base_url}"
