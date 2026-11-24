@@ -829,6 +829,8 @@ struct CarrierRuntime {
     cf_a64_t last_tcp_active_ms;   /* 本栈最近一次 TCP 活跃时间戳 */
     cf_au64_t tcp_total_up_bytes;  /* 本栈活跃 H2 连接累计上行字节（供全连接综合黑洞/窒息判定） */
     cf_au64_t tcp_total_down_bytes;/* 本栈活跃 H2 连接累计下行字节（供全连接综合黑洞/窒息判定） */
+    atomic_int tcp_short_fail_streak; /* 10s 窗口内连续短命闪断次数（<=2.5s 且下行 <4KB，防 TLS 拒连/RST 假成功不切 IP） */
+    cf_a64_t tcp_short_fail_win_ms;   /* 短命闪断滑动窗口起始时间 */
     cf_a64_t last_udp_active_ms;   /* 本栈最近一次 UDP 活跃时间戳 */
     atomic_int last_udp_loss_pct;      /* 最近一轮 UDP 健康检查链路丢包率 (0..100, -1=未测) */
     /* 疑似 QoS 窗口（探测侧与转发侧共享）：
@@ -5583,6 +5585,7 @@ static void carrier_trigger_maintenance(CarrierRuntime *rt, int flags);
 static void *carrier_maintenance_thread(void *arg);
 static void carrier_note_connection_success(CarrierRuntime *rt, const char *ip);
 static void carrier_note_connection_failed(CarrierRuntime *rt, const char *ip);
+static void carrier_penalize_h2_anomaly(CarrierRuntime *rt, const char *ip, int anomaly_kind, uint64_t d_up, uint64_t d_down);
 static int carrier_try_use_candidate_caches(CarrierRuntime *rt);
 static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Result *tcp_results, size_t count, size_t target_ipnum);
 static void *carrier_udp_health_thread(void *arg);
@@ -5815,34 +5818,110 @@ typedef struct {
     Result res;
     struct sockaddr_storage addr;
     socklen_t addr_len;
-    long send_time;
+    int64_t send_time;
+    uint8_t expect_cid[8]; /* 本轮发送的 8 字节 SCID，用于校验服务端回显的 DCID，防上一轮迟到包串轮产生 1ms 假延迟 */
     int latency_ms;
     int responded;
 } QuicProbeItem;
 
-/* 全异步非阻塞并发 QUIC 探针齐射批次执行函数（与 0.0.16 逐字一致）
- * 使用「每协议族一个共享非阻塞 UDP 套接字 + sendto」齐射，再用 poll + recvfrom 按来源地址配对。
- * 不使用 per-IP connect()：连通性探针一旦被内核/防火墙记上 ICMP 错误，per-IP 套接字会整条失效，
- * 且 32~64 个 fd 在 Windows 上更容易触发瞬时耗尽；共享套接字是 0.0.16 实测三栈可用的唯一形态。 */
+static inline int quic_resp_matches_cid(const uint8_t *resp, ssize_t n, const uint8_t expect_cid[8]) {
+    if (!resp || n < 14) return 0;
+    if ((resp[0] & 0x80u) == 0) return 0; /* 非 QUIC 长包头 */
+    if (resp[5] != 8) return 0;           /* 回包 DCID 长度必须等于我们发送的 8 字节 SCID */
+    return memcmp(resp + 6, expect_cid, 8) == 0;
+}
+
+static void quic_poll_once(CarrierRuntime *rt, socket_t fd4, socket_t fd6, size_t sent_v4, size_t sent_v6,
+                           QuicProbeItem *items, size_t active_sent, int poll_timeout, size_t *responded_count) {
+#ifdef _WIN32
+    WSAPOLLFD pfds[2];
+#else
+    struct pollfd pfds[2];
+#endif
+    int npfd = 0;
+    if (sent_v4 > 0 && cfnat_socket_valid(fd4)) {
+        pfds[npfd].fd = fd4;
+        pfds[npfd].events = POLLIN;
+        pfds[npfd].revents = 0;
+        npfd++;
+    }
+    if (sent_v6 > 0 && cfnat_socket_valid(fd6)) {
+        pfds[npfd].fd = fd6;
+        pfds[npfd].events = POLLIN;
+        pfds[npfd].revents = 0;
+        npfd++;
+    }
+    if (npfd == 0) return;
+
+    int pr =
+#ifdef _WIN32
+        WSAPoll(pfds, npfd, poll_timeout);
+#else
+        poll(pfds, npfd, poll_timeout);
+#endif
+    if (pr <= 0) return;
+
+    for (int p = 0; p < npfd; p++) {
+        if (!(pfds[p].revents & (POLLIN | POLLERR))) continue;
+        socket_t rfd = pfds[p].fd;
+        while (1) {
+            uint8_t resp[2048];
+            struct sockaddr_storage from;
+#ifdef _WIN32
+            int fromlen = (int)sizeof(from);
+#else
+            socklen_t fromlen = sizeof(from);
+#endif
+            ssize_t n = recvfrom(rfd, (char *)resp, sizeof(resp), 0, (struct sockaddr *)&from, &fromlen);
+            if (n < 0) {
+                if (cfnat_last_socket_transient()) continue;
+                break;
+            }
+            if (n <= 0) break;
+            if (n < 14 || (resp[0] & 0x80u) == 0) continue;
+
+            int64_t r_now = now_ms();
+            for (size_t i = 0; i < active_sent; i++) {
+                if (items[i].responded || items[i].send_time <= 0) continue;
+                if (sockaddr_ip_equal(&from, &items[i].addr) &&
+                    quic_resp_matches_cid(resp, n, items[i].expect_cid)) {
+                    items[i].responded = 1;
+                    int lat = (int)(r_now - items[i].send_time);
+                    if (lat <= 0) lat = 1;
+                    items[i].latency_ms = lat;
+                    (*responded_count)++;
+                    debug_msg("[UDP/H3] [%s] QUIC 探针响应成功: %s 延迟 %d ms",
+                              carrier_display_name(rt ? rt->spec.mode : nullptr), items[i].res.ip, lat);
+                    break;
+                }
+            }
+        }
+    }
+}
+
+/* 全异步非阻塞并发 QUIC 探针齐射批次执行函数：
+ * 1) 每轮每 IP 生成独立 8 字节 SCID 并校验回包 DCID 回显，彻底杜绝上一轮迟到包串轮产生 1ms 假延迟；
+ * 2) 发包节拍期边等边收，消除先发包多算后续发包排队时间的 RTT 虚高误差。 */
 static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, int target_port,
                                int timeout_ms, QuicProbeItem *items, size_t count, size_t needed_responses, int pacing_ms) {
     if (!items || count == 0) return 0;
 
-    /* C23 thread_local 预格式化探针模板：头部 0..22 固定，其余 1177 字节必须保持全零 */
     static thread_local uint8_t pkt[1200] = {
         0xC0, 0x5A, 0x5A, 0x5A, 0x5A, 0x08,
         [14] = 0x08
     };
 
-    uint32_t seed = (uint32_t)now_ms();
-    memcpy(pkt + 6, &seed, 4);
+    uint64_t batch_seed = rand_u64() ^ (uint64_t)now_ms();
+    memcpy(pkt + 6, &batch_seed, 8);
 
-    long start_time = now_ms();
+    int64_t start_time = now_ms();
     size_t sent_v4 = 0, sent_v6 = 0;
+    size_t responded_count = 0;
 
     for (size_t i = 0; i < count; i++) {
         items[i].responded = 0;
         items[i].latency_ms = 0;
+        items[i].send_time = 0;
         int is_v6 = (strchr(items[i].res.ip, ':') != nullptr);
         socket_t sfd = is_v6 ? fd6 : fd4;
         if (cfnat_socket_invalid(sfd)) continue;
@@ -5856,7 +5935,6 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
             if (is_v6) ((struct sockaddr_in6 *)&items[i].addr)->sin6_port = htons((uint16_t)target_port);
             else ((struct sockaddr_in *)&items[i].addr)->sin_port = htons((uint16_t)target_port);
         } else {
-            /* 预解析缺失时的安全兜底 */
             if (is_v6) {
                 struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)&items[i].addr;
                 memset(sa6, 0, sizeof(*sa6));
@@ -5875,22 +5953,34 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
         }
 
         if (i > 0 && pacing_ms > 0) {
-            if (sleep_interruptible_ms(pacing_ms) != 0) break;
+            if (!atomic_load(&g_running)) break;
+            int64_t pace_end = now_ms() + pacing_ms;
+            while (now_ms() < pace_end && atomic_load(&g_running)) {
+                int rem = (int)(pace_end - now_ms());
+                if (rem <= 0) break;
+                if (sent_v4 + sent_v6 > 0) {
+                    quic_poll_once(rt, fd4, fd6, sent_v4, sent_v6, items, i, rem, &responded_count);
+                } else {
+                    if (sleep_interruptible_ms(rem) != 0) break;
+                }
+            }
+            if (!atomic_load(&g_running)) break;
         }
+
+        uint64_t s_val = rand_u64() ^ (batch_seed << 13) ^ ((uint64_t)(i + 1) * 0x9e3779b97f4a7c15ULL);
+        memcpy(items[i].expect_cid, &s_val, 8);
+
         uint8_t ch_pkt[1200];
         const uint8_t *send_buf = pkt;
         if (g_cfg.h3_client) {
-            uint64_t d_val = rand_u64() ^ ((uint64_t)seed << 17) ^ (uint64_t)(i + 1);
-            uint64_t s_val = rand_u64() ^ ((uint64_t)(~seed) << 11) ^ ((uint64_t)(i + 1) << 29);
-            uint8_t dcid[8], scid_b[8];
+            uint64_t d_val = rand_u64() ^ (batch_seed >> 7) ^ (uint64_t)(i + 1);
+            uint8_t dcid[8];
             memcpy(dcid, &d_val, 8);
-            memcpy(scid_b, &s_val, 8);
             const char *dom = (rt && rt->spec.prof.domain[0]) ? rt->spec.prof.domain : g_cfg.domain;
-            quic_build_initial_client_hello(ch_pkt, dcid, scid_b, dom);
+            quic_build_initial_client_hello(ch_pkt, dcid, items[i].expect_cid, dom);
             send_buf = ch_pkt;
         } else {
-            uint32_t scid = seed ^ (uint32_t)(i + 1);
-            memcpy(pkt + 15, &scid, 4);
+            memcpy(pkt + 15, items[i].expect_cid, 8);
         }
 
         items[i].send_time = now_ms();
@@ -5901,81 +5991,12 @@ static size_t quic_batch_probe(CarrierRuntime *rt, socket_t fd4, socket_t fd6, i
         }
     }
 
-    size_t responded_count = 0;
-    long deadline = start_time + timeout_ms;
-
-    while (responded_count < count && now_ms() < deadline) {
+    int64_t deadline = now_ms() + timeout_ms;
+    while (responded_count < count && now_ms() < deadline && atomic_load(&g_running)) {
         int left = (int)(deadline - now_ms());
         if (left <= 0) break;
-
-#ifdef _WIN32
-        WSAPOLLFD pfds[2];
-#else
-        struct pollfd pfds[2];
-#endif
-        int npfd = 0;
-        /* 仅轮询实际发过包的地址族，避免 Windows WSAPoll 传入未绑定空闲 UDP 套接字触发 POLLNVAL/WSAEINVAL */
-        if (sent_v4 > 0 && cfnat_socket_valid(fd4)) {
-            pfds[npfd].fd = fd4;
-            pfds[npfd].events = POLLIN;
-            pfds[npfd].revents = 0;
-            npfd++;
-        }
-        if (sent_v6 > 0 && cfnat_socket_valid(fd6)) {
-            pfds[npfd].fd = fd6;
-            pfds[npfd].events = POLLIN;
-            pfds[npfd].revents = 0;
-            npfd++;
-        }
-        if (npfd == 0) break;
-
         int poll_timeout = left > 20 ? 20 : left;
-        int pr =
-#ifdef _WIN32
-            WSAPoll(pfds, npfd, poll_timeout);
-#else
-            poll(pfds, npfd, poll_timeout);
-#endif
-        if (pr <= 0) continue;
-
-        for (int p = 0; p < npfd; p++) {
-            if (!(pfds[p].revents & (POLLIN | POLLERR))) continue;
-            socket_t rfd = pfds[p].fd;
-
-            while (1) {
-                char resp[2048];
-                struct sockaddr_storage from;
-#ifdef _WIN32
-                int fromlen = (int)sizeof(from);
-#else
-                socklen_t fromlen = sizeof(from);
-#endif
-                ssize_t n = recvfrom(rfd, resp, sizeof(resp), 0, (struct sockaddr *)&from, &fromlen);
-                if (n < 0) {
-                    /* 仅在网络瞬态与中断错误时消费并继续读取队列后续报文，杜绝致命错误导致死循环 */
-                    if (cfnat_last_socket_transient()) continue;
-                    break;
-                }
-                if (n <= 0) break;
-                if (n < 7 || ((uint8_t)resp[0] & 0x80) == 0) continue; /* 过滤非 QUIC 长包头噪声 */
-
-                long r_now = now_ms();
-                for (size_t i = 0; i < count; i++) {
-                    if (items[i].responded) continue;
-                    if (sockaddr_ip_equal(&from, &items[i].addr)) {
-                        items[i].responded = 1;
-                        int lat = (int)(r_now - items[i].send_time);
-                        if (lat <= 0) lat = 1;
-                        items[i].latency_ms = lat;
-                        responded_count++;
-                        debug_msg("[UDP/H3] [%s] QUIC 探针响应成功: %s 延迟 %d ms",
-                                  carrier_display_name(rt ? rt->spec.mode : nullptr), items[i].res.ip, lat);
-                        break;
-                    }
-                }
-            }
-        }
-
+        quic_poll_once(rt, fd4, fd6, sent_v4, sent_v6, items, count, poll_timeout, &responded_count);
         if (responded_count >= needed_responses && (now_ms() - start_time) >= 250) {
             break;
         }
@@ -6474,6 +6495,22 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
         if (dup) continue;
         snprintf(merged[mlen].ip, sizeof(merged[mlen].ip), "%s", hp_seeds.items[i]);
         snprintf(merged[mlen].data_center, sizeof(merged[mlen].data_center), "UNK");
+        {
+            char seed_net[MAX_IP_LEN] = {0}, tcp_net[MAX_IP_LEN] = {0};
+            int pfx = (ips_type == 6) ? 64 : 24;
+            if (normalize_subnet_str(ips_type, hp_seeds.items[i], pfx, seed_net, sizeof(seed_net)) == 0) {
+                for (size_t k = 0; k < count; k++) {
+                    if (tcp_results[k].data_center[0] && strcmp(tcp_results[k].data_center, "UNK") != 0 &&
+                        normalize_subnet_str(ips_type, tcp_results[k].ip, pfx, tcp_net, sizeof(tcp_net)) == 0 &&
+                        strcmp(seed_net, tcp_net) == 0) {
+                        snprintf(merged[mlen].data_center, sizeof(merged[mlen].data_center), "%s", tcp_results[k].data_center);
+                        snprintf(merged[mlen].region, sizeof(merged[mlen].region), "%s", tcp_results[k].region);
+                        snprintf(merged[mlen].city, sizeof(merged[mlen].city), "%s", tcp_results[k].city);
+                        break;
+                    }
+                }
+            }
+        }
         result_init_addr(&merged[mlen]);
         mlen++;
     }
@@ -7190,7 +7227,7 @@ static void set_socket_timeouts_and_keepalive(socket_t s, int timeout_sec) {
 #endif
 }
 
-static int relay_bidirectional(socket_t c, socket_t u, uint64_t *out_up_bytes, CarrierRuntime *rt) {
+static int relay_bidirectional(socket_t c, socket_t u, uint64_t *out_up_bytes, uint64_t *out_down_bytes, CarrierRuntime *rt) {
     /* 启用内核 KeepAlive (45s+10s*3) 与 TCP_USER_TIMEOUT (25s)，不设 SO_RCVTIMEO 避免单向大流量长连接被误拆 */
     set_socket_timeouts_and_keepalive(c, 0);
     set_socket_timeouts_and_keepalive(u, 0);
@@ -7201,12 +7238,14 @@ static int relay_bidirectional(socket_t c, socket_t u, uint64_t *out_up_bytes, C
     if (rc1 != 0) {
         close_pair(c, u);
         if (out_up_bytes) *out_up_bytes = 0;
+        if (out_down_bytes) *out_down_bytes = 0;
         return -1;
     }
     /* 当前 connection_thread 线程直接执行反向转发，免除第 2 个子线程的 clone/mmap 与调度开销 */
     pipe_worker(&b);
     pthread_join(t1, nullptr);
     if (out_up_bytes) *out_up_bytes = a.bytes;
+    if (out_down_bytes) *out_down_bytes = b.bytes;
     if (b.bytes > 0) return 1;
     if (a.bytes > 0 && b.bytes == 0) return -2; /* 客户端已发请求但上游无应答/异常中断 */
     return 0;
@@ -7219,6 +7258,8 @@ static void *connection_thread(void *arg) {
     int64_t conn_start_ms = now_ms();
     int conn_ok = 0;
     int upstream_failed = 0;
+    int is_short_flash = 0;
+    uint64_t up_bytes = 0, down_bytes = 0;
     const char *carrier_name = cc->runtime ? carrier_display_name(cc->runtime->spec.mode) : "-";
     unsigned char first = 0;
     /* P1-2: 仅用 MSG_PEEK 嗅探首字节识别 TLS (0x16) 或 HTTP，绝不从内核缓冲区消费或重组 ClientHello：
@@ -7320,12 +7361,13 @@ static void *connection_thread(void *arg) {
     }
     /* client 已在 accept 阶段设置 TCP_NODELAY 与 256KB 缓冲，upstream 已在 connect 阶段设置 TCP_NODELAY，仅需补充 upstream 缓冲 */
     tune_socket_buffers(upstream, 0);
-    uint64_t up_bytes = 0;
-    int had_data = relay_bidirectional(client, upstream, &up_bytes, cc->runtime);
-    if (had_data > 0 || (now_ms() - conn_start_ms) >= 3000) {
-        conn_ok = 1;
-    } else if (had_data == -2) {
+    int had_data = relay_bidirectional(client, upstream, &up_bytes, &down_bytes, cc->runtime);
+    int64_t conn_dur_ms = now_ms() - conn_start_ms;
+    is_short_flash = (up_bytes > 0 && conn_dur_ms <= 2500 && down_bytes < 4096ULL);
+    if (had_data == -2) {
         upstream_failed = 1; /* 客户端正常发包但上游无应答或异常中断，判定上游故障 */
+    } else if ((had_data > 0 && !is_short_flash) || conn_dur_ms >= 3000) {
+        conn_ok = 1;
     }
 #if defined(__linux__) && defined(TCP_INFO)
     /* C3: 连接收尾时采样内核总重传数 (tcpi_total_retrans)，作为软信号温和抬高 EWMA 延迟而不触发 fast_fail 切换抖动 */
@@ -7357,26 +7399,45 @@ static void *connection_thread(void *arg) {
 out:
     if (cfnat_socket_valid(upstream)) close(upstream);
     if (cfnat_socket_valid(client)) close(client);
+    int64_t close_ms = now_ms();
     if (atomic_load(&g_running) && cc->runtime && cc->ip[0]) {
         if (conn_ok) {
             carrier_note_connection_success(cc->runtime, cc->ip);
-            if ((now_ms() - conn_start_ms) >= 60000 || up_bytes >= 65536ULL) {
+            if ((close_ms - conn_start_ms) >= 5000 || down_bytes >= 16384ULL) {
+                atomic_store_explicit(&cc->runtime->tcp_short_fail_streak, 0, memory_order_relaxed);
+            }
+            if ((close_ms - conn_start_ms) >= 60000 || up_bytes >= 65536ULL || down_bytes >= 131072ULL) {
                 hotpool_record_success(cc->runtime->spec.prof.ips_type, 0, cc->ip, best, 1);
             }
         } else if (upstream_failed) {
             /* 严格排除客户端首字节前挂断或取消预连接的误判，仅在上游拨号失败或上游异常中断时惩罚节点 */
             carrier_note_connection_failed(cc->runtime, cc->ip);
             hotpool_record_failure(cc->runtime->spec.prof.ips_type, 0, cc->ip, 3);
+        } else if (is_short_flash) {
+            /* 短命闪断风暴检测（<=2.5s 且下行 <4KB，常见于 TLS 握手被拒/RST/403 错页导致客户端疯狂重连） */
+            long long win0 = cf_a64_load(&cc->runtime->tcp_short_fail_win_ms);
+            if (win0 <= 0 || (long long)close_ms - win0 > 10000LL) {
+                cf_a64_store(&cc->runtime->tcp_short_fail_win_ms, close_ms);
+                atomic_store_explicit(&cc->runtime->tcp_short_fail_streak, 1, memory_order_relaxed);
+            } else {
+                int st = atomic_fetch_add_explicit(&cc->runtime->tcp_short_fail_streak, 1, memory_order_relaxed) + 1;
+                if (st >= 6) {
+                    atomic_store_explicit(&cc->runtime->tcp_short_fail_streak, 0, memory_order_relaxed);
+                    cf_a64_store(&cc->runtime->tcp_short_fail_win_ms, 0);
+                    carrier_penalize_h2_anomaly(cc->runtime, cc->ip, 3, up_bytes, down_bytes);
+                }
+            }
         }
     }
     if (cc->runtime) {
         atomic_fetch_sub_explicit(&cc->runtime->active_tcp_conns, 1, memory_order_relaxed);
-        cf_a64_store(&cc->runtime->last_tcp_active_ms, now_ms());
+        cf_a64_store(&cc->runtime->last_tcp_active_ms, close_ms);
     }
     int active = atomic_fetch_sub(&g_active_tcp_conns, 1) - 1;
-    long lifetime_s = (now_ms() - conn_start_ms) / 1000;
-    conn_msg("[TCP/H2] #%llu [%s] 客户端连接关闭 (存活 %lds, 当前活跃: %d)",
-             cc->conn_id, carrier_name, lifetime_s > 0 ? lifetime_s : 0, active);
+    long lifetime_s = (close_ms - conn_start_ms) / 1000;
+    conn_msg("[TCP/H2] #%llu [%s] 客户端连接关闭 (存活 %lds, 上行 %llu B / 下行 %llu B, 当前活跃: %d)",
+             cc->conn_id, carrier_name, lifetime_s > 0 ? lifetime_s : 0,
+             (unsigned long long)up_bytes, (unsigned long long)down_bytes, active);
     free(cc);
     return nullptr;
 }
@@ -8418,7 +8479,7 @@ static void carrier_penalize_h2_anomaly(CarrierRuntime *rt, const char *ip, int 
         atomic_store(&rt->candidates.cache_valid, 0);
         warn_msg("[TCP/H2] [%s] 疑似全连接%s，但本机 IPv%d 哨兵 (%s:443) 无响应（可能断网或校园网掉线），已冻结热库免扣分并等待恢复",
                  carrier_display_name(rt->spec.mode),
-                 anomaly_kind == 2 ? "黑洞断流" : "窒息低速",
+                 anomaly_kind == 2 ? "黑洞断流" : (anomaly_kind == 3 ? "频繁闪断/握手拒连" : "窒息低速"),
                  ips_type, network_sentinel_ip(ips_type));
         return;
     }
@@ -8445,7 +8506,7 @@ static void carrier_penalize_h2_anomaly(CarrierRuntime *rt, const char *ip, int 
 
     warn_msg("[TCP/H2] [%s] 检测到全连接%s (IP %s, 6s 汇总上行 %llu B / 下行 %llu B)，已扣热库分并触发顺位切换",
              carrier_display_name(rt->spec.mode),
-             anomaly_kind == 2 ? "黑洞断流" : "窒息低速",
+             anomaly_kind == 2 ? "黑洞断流" : (anomaly_kind == 3 ? "频繁闪断/握手拒连" : "窒息低速"),
              ip, (unsigned long long)d_up, (unsigned long long)d_down);
     carrier_trigger_maintenance(rt, MAINT_SWITCH_TCP);
 }
