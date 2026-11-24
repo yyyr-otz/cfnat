@@ -51,16 +51,48 @@ jobs:
           fetch-depth: 1
           token: ${{ github.token }}
 
-      - name: Setup Android NDK
+      - name: Cache Android NDK
+        id: cache-ndk
         if: >-
           github.event_name != 'workflow_dispatch' ||
           inputs.targets == '' ||
           contains(inputs.targets, 'all') ||
           contains(inputs.targets, 'android')
+        uses: actions/cache@v4
+        with:
+          path: /tmp/android-ndk-r27c
+          key: ndk-${{ runner.os }}-${{ runner.arch }}-r27c-v1
+
+      - name: Setup Android NDK (on cache miss)
+        if: >-
+          (github.event_name != 'workflow_dispatch' ||
+          inputs.targets == '' ||
+          contains(inputs.targets, 'all') ||
+          contains(inputs.targets, 'android')) &&
+          steps.cache-ndk.outputs.cache-hit != 'true'
         uses: nttld/setup-ndk@v1
         with:
           ndk-version: r27c
           add-to-path: true
+
+      - name: Populate or activate cached Android NDK
+        if: >-
+          github.event_name != 'workflow_dispatch' ||
+          inputs.targets == '' ||
+          contains(inputs.targets, 'all') ||
+          contains(inputs.targets, 'android')
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [ -d /tmp/android-ndk-r27c/toolchains/llvm/prebuilt ]; then
+            echo "✅ Using cached Android NDK: /tmp/android-ndk-r27c"
+            echo "ANDROID_NDK_ROOT=/tmp/android-ndk-r27c" >> "$GITHUB_ENV"
+          else
+            echo "📦 Caching Android NDK llvm toolchain to /tmp/android-ndk-r27c ..."
+            mkdir -p /tmp/android-ndk-r27c/toolchains/llvm
+            cp -a "${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt" /tmp/android-ndk-r27c/toolchains/llvm/
+            echo "ANDROID_NDK_ROOT=/tmp/android-ndk-r27c" >> "$GITHUB_ENV"
+          fi
 
       - name: Build selected Darwin & Android binaries concurrently
         shell: bash
@@ -215,12 +247,26 @@ jobs:
           fetch-depth: 1
           token: ${{ github.token }}
 
-      - name: Cache Zig toolchain
+      - name: Cache Zig & UPX toolchains
         id: cache-zig
         uses: actions/cache@v4
         with:
-          path: /tmp/zig-toolchain
-          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ env.ZIG_VERSION }}
+          path: |
+            /tmp/zig-toolchain
+            /tmp/upx-toolchain
+          key: zig-upx-${{ runner.os }}-${{ runner.arch }}-${{ env.ZIG_VERSION }}-${{ env.UPX_VERSION }}
+
+      - name: Cache FreeBSD sysroots
+        id: cache-freebsd
+        if: >-
+          github.event_name != 'workflow_dispatch' ||
+          inputs.targets == '' ||
+          contains(inputs.targets, 'all') ||
+          contains(inputs.targets, 'freebsd')
+        uses: actions/cache@v4
+        with:
+          path: /tmp/freebsd-sysroot
+          key: freebsd-sysroot-${{ env.FREEBSD_VER }}-v1
 
       - name: Setup Zig, UPX & FreeBSD Sysroots
         shell: bash
@@ -265,17 +311,26 @@ jobs:
 
           if [[ "$TARGETS" == *" all "* || "$TARGETS" == *" linux "* || "$TARGETS" == *" linux-static "* || "$TARGETS" == *" musl "* || "$TARGETS" == *" linux-musl "* || "$TARGETS" == *"mips"* ]]; then
             upx_dir="upx-${UPX_VERSION}-${upx_arch}_linux"
-            echo "⬇️ Downloading ${upx_dir}.tar.xz ..."
-            "${CURL_SAFE[@]}" "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/${upx_dir}.tar.xz" -o upx.tar.xz
-            tar -xf upx.tar.xz
-            rm -f upx.tar.xz
-            echo "$PWD/$upx_dir" >> "$GITHUB_PATH"
+            if [ -x "/tmp/upx-toolchain/${upx_dir}/upx" ]; then
+              echo "✅ Using cached UPX: /tmp/upx-toolchain/${upx_dir}"
+            else
+              mkdir -p /tmp/upx-toolchain
+              echo "⬇️ Downloading ${upx_dir}.tar.xz ..."
+              "${CURL_SAFE[@]}" "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/${upx_dir}.tar.xz" -o /tmp/upx.tar.xz
+              tar -xf /tmp/upx.tar.xz -C /tmp/upx-toolchain
+              rm -f /tmp/upx.tar.xz
+            fi
+            echo "/tmp/upx-toolchain/${upx_dir}" >> "$GITHUB_PATH"
           fi
 
-          # 仅在需要编译 FreeBSD 时下载对应 sysroot
+          # 仅在需要编译 FreeBSD 且缓存未命中时下载对应 sysroot
           if [[ "$TARGETS" == *" all "* || "$TARGETS" == *" freebsd "* || "$TARGETS" == *"freebsd-"* ]]; then
             for arch in amd64 arm64; do
               if [[ "$TARGETS" != *" all "* && "$TARGETS" != *" freebsd "* && "$TARGETS" != *" freebsd-${arch} "* ]]; then
+                continue
+              fi
+              if [ -d "/tmp/freebsd-sysroot/${arch}/usr/include" ] && [ -d "/tmp/freebsd-sysroot/${arch}/usr/lib" ]; then
+                echo "✅ Using cached FreeBSD ${FREEBSD_VER} sysroot (${arch})"
                 continue
               fi
               echo "⬇️ Downloading FreeBSD ${FREEBSD_VER} sysroot (${arch}) ..."
