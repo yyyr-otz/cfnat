@@ -215,6 +215,13 @@ jobs:
           fetch-depth: 1
           token: ${{ github.token }}
 
+      - name: Cache Zig toolchain
+        id: cache-zig
+        uses: actions/cache@v4
+        with:
+          path: /tmp/zig-toolchain
+          key: zig-${{ runner.os }}-${{ runner.arch }}-${{ env.ZIG_VERSION }}
+
       - name: Setup Zig, UPX & FreeBSD Sysroots
         shell: bash
         env:
@@ -229,15 +236,39 @@ jobs:
             *) echo "Unsupported runner arch: $(uname -m)" >&2; exit 1 ;;
           esac
 
+          CURL_SAFE=(curl -fsSL --connect-timeout 15 --max-time 120 --speed-limit 20480 --speed-time 15 --retry 2 --retry-delay 2)
+
           zig_dir="zig-${zig_arch}-linux-${ZIG_VERSION}"
-          curl -fsSL "https://ziglang.org/download/${ZIG_VERSION}/${zig_dir}.tar.xz" -o zig.tar.xz
-          tar -xf zig.tar.xz
-          echo "$PWD/$zig_dir" >> "$GITHUB_PATH"
+          if [ -x "/tmp/zig-toolchain/${zig_dir}/zig" ]; then
+            echo "✅ Using cached Zig: /tmp/zig-toolchain/${zig_dir}"
+          else
+            mkdir -p /tmp/zig-toolchain
+            echo "⬇️ Downloading ${zig_dir}.tar.xz ..."
+            zig_ok=0
+            for base_url in               "https://ziglang.org/download/${ZIG_VERSION}"               "https://pkg.machengine.org/zig"               "https://zigmirror.hryx.net/zig"
+            do
+              if "${CURL_SAFE[@]}" "${base_url}/${zig_dir}.tar.xz" -o /tmp/zig.tar.xz; then
+                zig_ok=1
+                echo "✅ Downloaded Zig from ${base_url}"
+                break
+              fi
+              echo "⚠️ Mirror ${base_url} failed or timed out, trying next..."
+            done
+            if [ "$zig_ok" -ne 1 ]; then
+              echo "❌ All Zig download mirrors failed" >&2
+              exit 1
+            fi
+            tar -xf /tmp/zig.tar.xz -C /tmp/zig-toolchain
+            rm -f /tmp/zig.tar.xz
+          fi
+          echo "/tmp/zig-toolchain/${zig_dir}" >> "$GITHUB_PATH"
 
           if [[ "$TARGETS" == *" all "* || "$TARGETS" == *" linux "* || "$TARGETS" == *" linux-static "* || "$TARGETS" == *" musl "* || "$TARGETS" == *" linux-musl "* || "$TARGETS" == *"mips"* ]]; then
             upx_dir="upx-${UPX_VERSION}-${upx_arch}_linux"
-            curl -fsSL "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/${upx_dir}.tar.xz" -o upx.tar.xz
+            echo "⬇️ Downloading ${upx_dir}.tar.xz ..."
+            "${CURL_SAFE[@]}" "https://github.com/upx/upx/releases/download/v${UPX_VERSION}/${upx_dir}.tar.xz" -o upx.tar.xz
             tar -xf upx.tar.xz
+            rm -f upx.tar.xz
             echo "$PWD/$upx_dir" >> "$GITHUB_PATH"
           fi
 
@@ -247,13 +278,14 @@ jobs:
               if [[ "$TARGETS" != *" all "* && "$TARGETS" != *" freebsd "* && "$TARGETS" != *" freebsd-${arch} "* ]]; then
                 continue
               fi
+              echo "⬇️ Downloading FreeBSD ${FREEBSD_VER} sysroot (${arch}) ..."
               mkdir -p "/tmp/freebsd-sysroot/${arch}"
               if [ "$arch" = "arm64" ]; then
                 fbsd_url="https://download.freebsd.org/releases/arm64/aarch64/${FREEBSD_VER}/base.txz"
               else
                 fbsd_url="https://download.freebsd.org/releases/amd64/${FREEBSD_VER}/base.txz"
               fi
-              curl -fsSL "$fbsd_url" -o "/tmp/fbsd-${arch}.txz"
+              "${CURL_SAFE[@]}" "$fbsd_url" -o "/tmp/fbsd-${arch}.txz"
               tar -xJf "/tmp/fbsd-${arch}.txz" -C "/tmp/freebsd-sysroot/${arch}" ./usr/include ./usr/lib ./lib
               rm -f "/tmp/fbsd-${arch}.txz"
             done
