@@ -1579,6 +1579,11 @@ static void parse_args(Config *c, int argc, char **argv) {
         if (eq) {
             *eq = 0;
             val = eq + 1;
+            size_t vlen = strlen(val);
+            if (vlen >= 2 && ((val[0] == '"' && val[vlen - 1] == '"') || (val[0] == 0x27 && val[vlen - 1] == 0x27))) {
+                val[vlen - 1] = 0;
+                val++;
+            }
         } else if (i + 1 < argc) {
             if (argv[i + 1][0] != '-') {
                 val = argv[++i];
