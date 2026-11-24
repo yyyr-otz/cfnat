@@ -1,4 +1,4 @@
-#define CFNAT_VERSION "0.2.1"
+#define CFNAT_VERSION "0.2.2"
 
 /* =========================================================================
  * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
@@ -790,6 +790,7 @@ typedef struct {
 typedef struct {
     socket_t from, to;
     uint64_t bytes;
+    cf_au64_t *rt_bytes;
 } PipeCtx;
 
 typedef struct UdpSession UdpSession;
@@ -826,6 +827,8 @@ struct CarrierRuntime {
     atomic_int active_tcp_conns;       /* 本栈当前活跃 TCP 连接数（活跃态按需提速健康检查） */
     atomic_int active_udp_conns;       /* 本栈当前活跃 UDP 会话数（无锁读取，供健康检查判断活跃态） */
     cf_a64_t last_tcp_active_ms;   /* 本栈最近一次 TCP 活跃时间戳 */
+    cf_au64_t tcp_total_up_bytes;  /* 本栈活跃 H2 连接累计上行字节（供全连接综合黑洞/窒息判定） */
+    cf_au64_t tcp_total_down_bytes;/* 本栈活跃 H2 连接累计下行字节（供全连接综合黑洞/窒息判定） */
     cf_a64_t last_udp_active_ms;   /* 本栈最近一次 UDP 活跃时间戳 */
     atomic_int last_udp_loss_pct;      /* 最近一轮 UDP 健康检查链路丢包率 (0..100, -1=未测) */
     /* 疑似 QoS 窗口（探测侧与转发侧共享）：
@@ -3171,7 +3174,9 @@ static void sample_one_ip_from_hot_entry(int ips_type, const HotEntry *e, String
             return;
         }
         uint64_t cnt = 1ULL << (32 - e->prefix);
-        uint32_t off = (uint32_t)(rand_u64() % cnt);
+        uint32_t off = (e->prefix <= 30 && cnt > 2ULL)
+            ? (uint32_t)(1ULL + (rand_u64() % (cnt - 2ULL)))
+            : (uint32_t)(rand_u64() % cnt);
         char ip[MAX_IP_LEN];
         u32_to_ipv4(start + off, ip, sizeof(ip));
         strlist_add(out, ip);
@@ -5215,7 +5220,6 @@ static void *scan_worker(void *arg) {
         socket_t fd = INVALID_SOCKET;     /* 仅非 TLS 分支使用的 Keep-Alive 连接 */
         int conn_lat = 0;
         int eff_probes = is_tls ? (probes > 2 ? 2 : probes) : probes;
-        int code_meta_unavailable = 0;
         for (int attempt = 0; atomic_load(&g_running) && attempt < eff_probes; attempt++) {
             int cur_latency = 0;
             char cur_colo[MAX_COLO_LEN] = {0};
@@ -5242,14 +5246,16 @@ static void *scan_worker(void *arg) {
                 int tls_rtt = (int)(t_tls_end - t_tls_start);
                 cur_latency = tls_rtt > 0 ? tls_rtt : (tls_conn_lat > 0 ? tls_conn_lat : 1);
 
-                /* ── 首轮附带一次 :80 元数据采集（短超时，失败绝不淘汰该 IP）── */
+                /* ── 首轮强制 :80 HTTP 响应校验：不返回有效 HTTP 状态码一律直接淘汰 ── */
                 if (attempt == 0) {
-                    int meta_to = hdr_timeout > 600 ? 600 : hdr_timeout;
+                    int meta_to = hdr_timeout;
                     socket_t mfd = dial_target_with_proxy_sa(ip, &probe_sa, probe_salen, probe_port,
                                                              meta_to, ctx->proxy_pool, nullptr);
                     if (cfnat_socket_invalid(mfd)) {
-                        code_meta_unavailable = 1;
-                        if (ctx->cfg->code > 0) atomic_fetch_add(&ctx->code_meta_skip, 1);
+                        atomic_fetch_add(&ctx->code_meta_skip, 1);
+                        atomic_fetch_add(&ctx->http_code_mismatch, 1);
+                        code_failed = 1;
+                        break;
                     } else {
                         char mhdr[4096];
                         int mn = -1;
@@ -5257,30 +5263,35 @@ static void *scan_worker(void *arg) {
                             mn = recv_headers(mfd, mhdr, sizeof(mhdr), meta_to);
                         }
                         close(mfd);
-                        if (mn > 0) {
-                            if (extract_cfray(mhdr, cur_colo, sizeof(cur_colo)) == 0) {
-                                /* 仅当用户显式指定 -colo 时，机房不匹配才淘汰 */
-                                if (ctx->cfg->colo[0] && !colo_rule_allowed(ctx->cfg->colo, cur_colo)) {
-                                    atomic_fetch_add(&ctx->colo_skip, 1);
-                                    code_failed = 1;
-                                    break;
-                                }
-                            } else {
-                                atomic_fetch_add(&ctx->cfray_miss, 1); /* 只统计，不再淘汰 */
-                            }
-                            if (ctx->cfg->code > 0) {
-                                int rc_meta = extract_http_status_code(mhdr);
-                                if (rc_meta == ctx->cfg->code) {
-                                    code_matched = 1;
-                                } else if (rc_meta != 405) {
-                                    atomic_fetch_add(&ctx->http_code_mismatch, 1);
-                                    code_failed = 1;
-                                    break;
-                                }
+                        int rc_meta = (mn > 0) ? extract_http_status_code(mhdr) : -1;
+                        if (mn <= 0 || rc_meta <= 0) {
+                            atomic_fetch_add(&ctx->code_meta_skip, 1);
+                            atomic_fetch_add(&ctx->http_code_mismatch, 1);
+                            code_failed = 1;
+                            break;
+                        }
+                        if (extract_cfray(mhdr, cur_colo, sizeof(cur_colo)) == 0) {
+                            /* 仅当用户显式指定 -colo 时，机房不匹配才淘汰 */
+                            if (ctx->cfg->colo[0] && !colo_rule_allowed(ctx->cfg->colo, cur_colo)) {
+                                atomic_fetch_add(&ctx->colo_skip, 1);
+                                code_failed = 1;
+                                break;
                             }
                         } else {
-                            code_meta_unavailable = 1;
-                            if (ctx->cfg->code > 0) atomic_fetch_add(&ctx->code_meta_skip, 1);
+                            atomic_fetch_add(&ctx->cfray_miss, 1);
+                            if (ctx->cfg->colo[0]) {
+                                code_failed = 1;
+                                break;
+                            }
+                        }
+                        if (ctx->cfg->code > 0) {
+                            if (rc_meta == ctx->cfg->code) {
+                                code_matched = 1;
+                            } else if (rc_meta != 405) {
+                                atomic_fetch_add(&ctx->http_code_mismatch, 1);
+                                code_failed = 1;
+                                break;
+                            }
                         }
                     }
                 }
@@ -5438,7 +5449,7 @@ static void *scan_worker(void *arg) {
          * 但当 80 端口完全不可达（IPv6 常见 / ISP 过滤）时不再做「连不上就淘汰」的判定：
          * -code 的语义是校验 HTTP 状态码，而不是要求 80 必须可达；否则会与 TLS 主路径互相打架，
          * 造成「443 完全可用、却因 80 不通被整批淘汰」。此时仅计数并在扫描结束时提示一次。 */
-        if (ctx->cfg->code > 0 && !code_matched && !code_meta_unavailable) {
+        if (ctx->cfg->code > 0 && !code_matched) {
             int target_code = ctx->cfg->code;
             socket_t check_fd = dial_target_with_proxy_sa(ip, &probe_sa, probe_salen, probe_port, ctx->cfg->delay_ms, ctx->proxy_pool, nullptr);
             if (cfnat_socket_invalid(check_fd)) {
@@ -6135,8 +6146,35 @@ static size_t quic_probe_batch_multi_round(CarrierRuntime *rt,
     return added;
 }
 
+/* 从独立 UDP 热库 (ips-hotpool-v4-udp.txt / ips-hotpool-v6-udp.txt) 抽取高分子网种子 */
+static size_t hotpool_sample_udp_seeds(int ips_type, size_t max_n, StringList *out) {
+    if (!out || max_n == 0) return 0;
+    HotPool *hp = hotpool_get(ips_type, 1);
+    pthread_mutex_lock(&hp->mu);
+    hotpool_load_locked(hp);
+    hotpool_prune_and_trim_locked(hp, time(nullptr));
+    size_t take = hp->len < max_n ? hp->len : max_n;
+    HotEntry *snap = nullptr;
+    if (take > 0) {
+        snap = malloc(take * sizeof(HotEntry));
+        if (snap) memcpy(snap, hp->items, take * sizeof(HotEntry));
+        else take = 0;
+    }
+    pthread_mutex_unlock(&hp->mu);
+    if (!snap || take == 0) {
+        free(snap);
+        return 0;
+    }
+    size_t before = out->len;
+    for (size_t i = 0; i < take; i++) {
+        sample_one_ip_from_hot_entry(ips_type, &snap[i], out);
+    }
+    free(snap);
+    return out->len - before;
+}
+
 /* P0-H3: 方案C抗QoS多轮QUIC测速引擎（冷却 -> 金丝雀探路 -> 小批次换源端口+节拍 -> 子网裂变循环补齐） */
-static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Result *tcp_results, size_t count, size_t target_ipnum) {
+static ResultList filter_udp_candidates_from_tcp_core(CarrierRuntime *rt, const Result *tcp_results, size_t count, size_t target_ipnum) {
     ResultList udp_res = {0};
     if (!tcp_results || count == 0 || target_ipnum == 0) return udp_res;
 
@@ -6403,6 +6441,60 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
     return udp_res;
 }
 
+static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Result *tcp_results, size_t count, size_t target_ipnum) {
+    if (!rt || target_ipnum == 0) {
+        ResultList empty = {0};
+        return empty;
+    }
+    int ips_type = rt->spec.prof.ips_type > 0 ? rt->spec.prof.ips_type : g_cfg.ips_type;
+    size_t hp_quota = target_ipnum;
+    if (hp_quota > 24) hp_quota = 24;
+    if (hp_quota < 8) hp_quota = 8;
+
+    StringList hp_seeds = {0};
+    size_t hp_got = hotpool_sample_udp_seeds(ips_type, hp_quota, &hp_seeds);
+    if (hp_got == 0) {
+        strlist_free(&hp_seeds);
+        return filter_udp_candidates_from_tcp_core(rt, tcp_results, count, target_ipnum);
+    }
+
+    size_t max_total = hp_got + count;
+    Result *merged = calloc(max_total, sizeof(Result));
+    if (!merged) {
+        strlist_free(&hp_seeds);
+        return filter_udp_candidates_from_tcp_core(rt, tcp_results, count, target_ipnum);
+    }
+
+    size_t mlen = 0;
+    for (size_t i = 0; i < hp_seeds.len && mlen < max_total; i++) {
+        int dup = 0;
+        for (size_t j = 0; j < mlen; j++) {
+            if (strcmp(merged[j].ip, hp_seeds.items[i]) == 0) { dup = 1; break; }
+        }
+        if (dup) continue;
+        snprintf(merged[mlen].ip, sizeof(merged[mlen].ip), "%s", hp_seeds.items[i]);
+        snprintf(merged[mlen].data_center, sizeof(merged[mlen].data_center), "UNK");
+        result_init_addr(&merged[mlen]);
+        mlen++;
+    }
+    size_t hp_added = mlen;
+    for (size_t i = 0; i < count && mlen < max_total; i++) {
+        int dup = 0;
+        for (size_t j = 0; j < mlen; j++) {
+            if (strcmp(merged[j].ip, tcp_results[i].ip) == 0) { dup = 1; break; }
+        }
+        if (dup) continue;
+        merged[mlen++] = tcp_results[i];
+    }
+    strlist_free(&hp_seeds);
+
+    debug_msg("[UDP/H3] [%s] 已合并独立 UDP 热库种子 %zu 个 + TCP 候选 %zu 个（去重后共 %zu 个）参与 H3 精筛",
+              carrier_display_name(rt->spec.mode), hp_added, count, mlen);
+    ResultList res = filter_udp_candidates_from_tcp_core(rt, merged, mlen, target_ipnum);
+    free(merged);
+    return res;
+}
+
 typedef struct {
     CarrierRuntime *rt;
     const char *ip;
@@ -6490,6 +6582,16 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
                 print_results_table_ex(stderr, "UDP/H3", carrier_display_name(rt->spec.mode),
                                        rt->udp_candidates.items, rt->udp_candidates.len, 0);
             }
+            return 1;
+        }
+        if (cached_udp.len > 0 && !network_sentinel_ok(ips_type, 1500)) {
+            net_set_frozen(ips_type, 1);
+            warn_msg("[%s] 纯 H3 缓存快检全灭且本机 IPv%d 哨兵 (%s:443) 无响应（可能断网或校园网未登录），已冻结热库并保留缓存等待恢复",
+                     carrier_display_name(rt->spec.mode), ips_type, network_sentinel_ip(ips_type));
+            rt->udp_candidates.items = cached_udp.items;
+            rt->udp_candidates.len = cached_udp.len;
+            atomic_store(&rt->udp_candidates.cache_valid, 0);
+            atomic_store_explicit(&rt->maint_pending, MAINT_RESCAN, memory_order_release);
             return 1;
         }
         free(cached_udp.items);
@@ -6801,7 +6903,7 @@ static ResultList scan_ips(StringList *ips, CidrList *cidrs, Config *cfg, BaiduP
             warn_msg("已连接到部分 IP，但响应中没有 CF-RAY 或不匹配 -colo；可先去掉 -colo 验证网络链路");
         }
         if (atomic_load(&ctx.code_meta_skip) > 0) {
-            warn_msg("有 %zu 个候选因 %d 端口不可达而跳过 -code 状态码校验（其 443 TLS 与转发均正常）；如需强制校验请确保该端口可达",
+            warn_msg("有 %zu 个候选因 %d 端口未返回有效 HTTP 状态码而被直接淘汰",
                      atomic_load(&ctx.code_meta_skip), probe_port);
         }
     }
@@ -6905,6 +7007,7 @@ static void *pipe_worker_fallback(PipeCtx *pc) {
                 goto err;
             }
             pc->bytes += (uint64_t)w;
+            if (pc->rt_bytes) cf_a64_fetch_add(pc->rt_bytes, (uint64_t)w);
             p += w;
             left -= w;
         }
@@ -6949,6 +7052,7 @@ static void *pipe_worker(void *arg) {
             }
             if (w == 0) goto err;
             pc->bytes += (uint64_t)w;
+            if (pc->rt_bytes) cf_a64_fetch_add(pc->rt_bytes, (uint64_t)w);
             n -= w;
         }
     }
@@ -6991,6 +7095,7 @@ static void *pipe_worker(void *arg) {
                 goto err;
             }
             pc->bytes += (uint64_t)w;
+            if (pc->rt_bytes) cf_a64_fetch_add(pc->rt_bytes, (uint64_t)w);
             p += w;
             left -= w;
         }
@@ -7085,13 +7190,13 @@ static void set_socket_timeouts_and_keepalive(socket_t s, int timeout_sec) {
 #endif
 }
 
-static int relay_bidirectional(socket_t c, socket_t u, uint64_t *out_up_bytes) {
+static int relay_bidirectional(socket_t c, socket_t u, uint64_t *out_up_bytes, CarrierRuntime *rt) {
     /* 启用内核 KeepAlive (45s+10s*3) 与 TCP_USER_TIMEOUT (25s)，不设 SO_RCVTIMEO 避免单向大流量长连接被误拆 */
     set_socket_timeouts_and_keepalive(c, 0);
     set_socket_timeouts_and_keepalive(u, 0);
     pthread_t t1 = 0;
-    PipeCtx a = { .from = c, .to = u, .bytes = 0 };
-    PipeCtx b = { .from = u, .to = c, .bytes = 0 };
+    PipeCtx a = { .from = c, .to = u, .bytes = 0, .rt_bytes = rt ? &rt->tcp_total_up_bytes : nullptr };
+    PipeCtx b = { .from = u, .to = c, .bytes = 0, .rt_bytes = rt ? &rt->tcp_total_down_bytes : nullptr };
     int rc1 = create_small_thread(&t1, pipe_worker, &a);
     if (rc1 != 0) {
         close_pair(c, u);
@@ -7216,7 +7321,7 @@ static void *connection_thread(void *arg) {
     /* client 已在 accept 阶段设置 TCP_NODELAY 与 256KB 缓冲，upstream 已在 connect 阶段设置 TCP_NODELAY，仅需补充 upstream 缓冲 */
     tune_socket_buffers(upstream, 0);
     uint64_t up_bytes = 0;
-    int had_data = relay_bidirectional(client, upstream, &up_bytes);
+    int had_data = relay_bidirectional(client, upstream, &up_bytes, cc->runtime);
     if (had_data > 0 || (now_ms() - conn_start_ms) >= 3000) {
         conn_ok = 1;
     } else if (had_data == -2) {
@@ -7245,6 +7350,7 @@ static void *connection_thread(void *arg) {
                 }
             }
             pthread_mutex_unlock(&cc->runtime->candidates.mu);
+            hotpool_record_failure(cc->runtime->spec.prof.ips_type, 0, cc->ip, 1);
         }
     }
 #endif
@@ -8240,6 +8346,12 @@ static void *carrier_maintenance_thread(void *arg) {
             log_msg("[TCP/H2] [%s] 后台维护线程触发顺位切换", carrier_display_name(rt->spec.mode));
             int src = carrier_switch_next_ip(rt);
             if (src == 0) {
+                if (!network_sentinel_ok(cur_ver, 1500)) {
+                    net_set_frozen(cur_ver, 1);
+                    warn_msg("[TCP/H2] [%s] 候选池全灭且本机 IPv%d 哨兵 (%s:443) 无响应，已冻结热库并暂停重扫等待恢复",
+                             carrier_display_name(rt->spec.mode), cur_ver, network_sentinel_ip(cur_ver));
+                    continue;
+                }
                 log_msg("[TCP/H2] [%s] 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护双轨候选池", carrier_display_name(rt->spec.mode));
                 rescan_needed = 1;
             } else if (src < 0) {
@@ -8251,6 +8363,12 @@ static void *carrier_maintenance_thread(void *arg) {
             log_msg("[UDP/H3] [%s] 后台维护线程触发顺位切换", carrier_display_name(rt->spec.mode));
             int src = carrier_switch_next_udp_ip(rt);
             if (src == 0) {
+                if (!network_sentinel_ok(cur_ver, 1500)) {
+                    net_set_frozen(cur_ver, 1);
+                    warn_msg("[UDP/H3] [%s] 候选池全灭且本机 IPv%d 哨兵 (%s:443) 无响应，已冻结热库并暂停重扫等待恢复",
+                             carrier_display_name(rt->spec.mode), cur_ver, network_sentinel_ip(cur_ver));
+                    continue;
+                }
                 log_msg("[UDP/H3] [%s] 候选池消耗达 70%% 或无可用顺位 IP，开始自愈维护双轨候选池", carrier_display_name(rt->spec.mode));
                 rescan_needed = 1;
             } else if (src < 0) {
@@ -8267,24 +8385,128 @@ static void *carrier_maintenance_thread(void *arg) {
     return nullptr;
 }
 
-/* P1-HC: 渐进式 TCP 健康检查线程 */
+/* H2 全连接综合窗口判定（同 IP 所有活跃连接汇总）：
+ * 返回 2 = 黑洞（6s 内上行 >= 2KB 且总下行 == 0）；
+ * 返回 1 = 窒息低速（6s 内上行 >= 4KB、总下行 < 16KB 且上行 >= 2×下行，连续 2 次）；
+ * 返回 0 = 正常或观察中（仅下行 >= 32KB 或无上行静默时清零窒息计数，防抖动误清零）。 */
+static int h2_eval_aggregate_window(uint64_t d_up, uint64_t d_down, int *stall_streak) {
+    if (d_up >= 2048ULL && d_down == 0ULL) {
+        if (stall_streak) *stall_streak = 0;
+        return 2;
+    }
+    if (d_up >= 4096ULL && d_down < 16384ULL && d_up >= d_down * 2ULL) {
+        if (stall_streak && ++(*stall_streak) >= 2) {
+            *stall_streak = 0;
+            return 1;
+        }
+        return 0;
+    }
+    if (stall_streak && (d_down >= 32768ULL || d_up == 0ULL)) {
+        *stall_streak = 0;
+    }
+    return 0;
+}
+
+static void carrier_penalize_h2_anomaly(CarrierRuntime *rt, const char *ip, int anomaly_kind,
+                                        uint64_t d_up, uint64_t d_down) {
+    if (!rt || !ip || !*ip) return;
+    int ips_type = rt->spec.prof.ips_type > 0 ? rt->spec.prof.ips_type : g_cfg.ips_type;
+    if (net_is_frozen(ips_type)) return;
+
+    if (!network_sentinel_ok(ips_type, 1500)) {
+        net_set_frozen(ips_type, 1);
+        atomic_store(&rt->candidates.cache_valid, 0);
+        warn_msg("[TCP/H2] [%s] 疑似全连接%s，但本机 IPv%d 哨兵 (%s:443) 无响应（可能断网或校园网掉线），已冻结热库免扣分并等待恢复",
+                 carrier_display_name(rt->spec.mode),
+                 anomaly_kind == 2 ? "黑洞断流" : "窒息低速",
+                 ips_type, network_sentinel_ip(ips_type));
+        return;
+    }
+
+    atomic_store(&rt->candidates.cache_valid, 0);
+    pthread_mutex_lock(&rt->candidates.mu);
+    for (size_t i = 0; i < rt->candidates.len; i++) {
+        if (strcmp(rt->candidates.items[i].ip, ip) == 0) {
+            Result *it = &rt->candidates.items[i];
+            it->consecutive_fail++;
+            it->last_fail_ms = now_ms();
+            int ref_lat = it->latency_ms > 0 ? it->latency_ms : 100;
+            int base = it->ewma_latency > 0 ? it->ewma_latency : ref_lat;
+            int cap = ref_lat + 150;
+            it->ewma_latency = (base + 40 < cap) ? (base + 40) : cap;
+            atomic_store_explicit(&rt->candidates.has_node_fail, 1, memory_order_relaxed);
+            break;
+        }
+    }
+    pthread_mutex_unlock(&rt->candidates.mu);
+
+    hotpool_record_failure(ips_type, 0, ip, 3);
+    hotpool_flush_all();
+
+    warn_msg("[TCP/H2] [%s] 检测到全连接%s (IP %s, 6s 汇总上行 %llu B / 下行 %llu B)，已扣热库分并触发顺位切换",
+             carrier_display_name(rt->spec.mode),
+             anomaly_kind == 2 ? "黑洞断流" : "窒息低速",
+             ip, (unsigned long long)d_up, (unsigned long long)d_down);
+    carrier_trigger_maintenance(rt, MAINT_SWITCH_TCP);
+}
+
+/* P1-HC: 渐进式 TCP 健康检查线程（集成每 3s 一次的 H2 全连接综合黑洞/窒息零开销巡检） */
 static void *carrier_health_thread(void *arg) {
     CarrierRuntime *rt = (CarrierRuntime *)arg;
     int fail = 0;
-    long last = 0;
+    int64_t last = 0;
     int consecutive_success = 0;
+
+    char mon_ip[MAX_IP_LEN] = {0};
+    int64_t win_start_ms = 0;
+    uint64_t win_up0 = 0;
+    uint64_t win_down0 = 0;
+    int stall_streak = 0;
+    int64_t next_probe_ms = now_ms() + 20000LL;
+
     while (atomic_load(&g_running)) {
-        long long last_act = cf_a64_load(&rt->last_tcp_active_ms);
-        int is_active = (atomic_load_explicit(&rt->active_tcp_conns, memory_order_relaxed) > 0) ||
-                        (last_act > 0 && ((long long)now_ms() - last_act) < 30000LL);
-        int sleep_dur = (fail > 0) ? 10000 : (is_active ? 20000 : ((consecutive_success >= 5) ? 60000 : 30000));
-        if (sleep_interruptible_ms(sleep_dur) != 0) break;
-        if (net_is_frozen(rt->spec.prof.ips_type > 0 ? rt->spec.prof.ips_type : g_cfg.ips_type)) {
+        if (sleep_interruptible_ms(3000) != 0) break;
+        int ips_type = rt->spec.prof.ips_type > 0 ? rt->spec.prof.ips_type : g_cfg.ips_type;
+        if (net_is_frozen(ips_type)) {
             fail = 0;
+            stall_streak = 0;
+            win_start_ms = 0;
             continue;
         }
-        char ip[MAX_IP_LEN];
+
+        int64_t cur_ms = now_ms();
+        char ip[MAX_IP_LEN] = {0};
         carrier_get_current_ip(rt, ip, sizeof(ip));
+
+        /* 1. H2 全连接综合黑洞/窒息巡检（零额外发包，仅在有活跃 TCP 连接时每 6s 评估一次汇总字节增量） */
+        int act_conns = atomic_load_explicit(&rt->active_tcp_conns, memory_order_relaxed);
+        if (!ip[0] || act_conns <= 0 || strcmp(mon_ip, ip) != 0) {
+            snprintf(mon_ip, sizeof(mon_ip), "%s", ip);
+            win_start_ms = cur_ms;
+            win_up0 = cf_a64_load_acq(&rt->tcp_total_up_bytes);
+            win_down0 = cf_a64_load_acq(&rt->tcp_total_down_bytes);
+            stall_streak = 0;
+        } else if (cur_ms - win_start_ms >= 6000LL) {
+            uint64_t cur_up = cf_a64_load_acq(&rt->tcp_total_up_bytes);
+            uint64_t cur_down = cf_a64_load_acq(&rt->tcp_total_down_bytes);
+            uint64_t d_up = (cur_up >= win_up0) ? (cur_up - win_up0) : 0ULL;
+            uint64_t d_down = (cur_down >= win_down0) ? (cur_down - win_down0) : 0ULL;
+            win_start_ms = cur_ms;
+            win_up0 = cur_up;
+            win_down0 = cur_down;
+
+            int anomaly = h2_eval_aggregate_window(d_up, d_down, &stall_streak);
+            if (anomaly > 0) {
+                carrier_penalize_h2_anomaly(rt, ip, anomaly, d_up, d_down);
+                fail = 0;
+                consecutive_success = 0;
+                next_probe_ms = cur_ms + 15000LL;
+                continue;
+            }
+        }
+
+        /* 2. 周期性握手测活（保持原有活跃态 20s / 闲置态 30s~60s / 失败复检 10s 节奏） */
+        if (cur_ms < next_probe_ms) continue;
 
         HealthCheckLevel level;
         if (consecutive_success < 3) {
@@ -8318,23 +8540,48 @@ static void *carrier_health_thread(void *arg) {
             pthread_mutex_lock(&rt->candidates.mu);
             for (size_t i = 0; i < rt->candidates.len; i++) {
                 if (strcmp(rt->candidates.items[i].ip, ip) == 0) {
-                    rt->candidates.items[i].consecutive_fail = 0;
+                    Result *it = &rt->candidates.items[i];
+                    it->consecutive_fail = 0;
+                    if (latency > 0) {
+                        int prev = it->ewma_latency > 0 ? it->ewma_latency : latency;
+                        int diff = (latency > prev) ? (latency - prev) : (prev - latency);
+                        it->jitter_ms = (it->jitter_ms * 7 + diff) / 8;
+                        it->ewma_latency = (prev * 3 + latency) / 4;
+                    }
                     break;
                 }
             }
             pthread_mutex_unlock(&rt->candidates.mu);
-            long n = now_ms();
-            if (g_cfg.log_level >= LOG_DEBUG && g_cfg.health_log > 0 && n - last >= g_cfg.health_log * 1000L) {
+            int64_t n = now_ms();
+            if (g_cfg.log_level >= LOG_DEBUG && g_cfg.health_log > 0 && n - last >= (int64_t)g_cfg.health_log * 1000LL) {
                 debug_msg("[TCP/H2] [%s] 状态检查正常: 当前 IP %s 可用 (延迟 %d ms)",
                           carrier_display_name(rt->spec.mode), ip, latency);
                 last = n;
             }
         }
         if (fail >= 2) {
+            if (!network_sentinel_ok(ips_type, 1500)) {
+                net_set_frozen(ips_type, 1);
+                atomic_store(&rt->candidates.cache_valid, 0);
+                warn_msg("[TCP/H2] [%s] 连续两次状态检查失败，但本机 IPv%d 哨兵 (%s:443) 无响应，已冻结热库免扣分并等待恢复",
+                         carrier_display_name(rt->spec.mode), ips_type, network_sentinel_ip(ips_type));
+                fail = 0;
+                continue;
+            }
             log_msg("[TCP/H2] [%s] 连续两次状态检查失败，顺位切换下一个候选 IP", carrier_display_name(rt->spec.mode));
+            if (ip[0]) {
+                hotpool_record_failure(ips_type, 0, ip, 2);
+                hotpool_flush_all();
+            }
             carrier_trigger_maintenance(rt, MAINT_SWITCH_TCP);
             fail = 0;
         }
+
+        long long last_act = cf_a64_load(&rt->last_tcp_active_ms);
+        int is_active = (atomic_load_explicit(&rt->active_tcp_conns, memory_order_relaxed) > 0) ||
+                        (last_act > 0 && ((long long)now_ms() - last_act) < 30000LL);
+        int sleep_dur = (fail > 0) ? 10000 : (is_active ? 20000 : ((consecutive_success >= 5) ? 60000 : 30000));
+        next_probe_ms = now_ms() + sleep_dur;
     }
     return nullptr;
 }
@@ -8579,6 +8826,15 @@ static void *carrier_udp_health_thread(void *arg) {
         }
 
         if (fail >= 2) {
+            int ips_type = rt->spec.prof.ips_type > 0 ? rt->spec.prof.ips_type : g_cfg.ips_type;
+            if (!network_sentinel_ok(ips_type, 1500)) {
+                net_set_frozen(ips_type, 1);
+                atomic_store(&rt->udp_candidates.cache_valid, 0);
+                warn_msg("[UDP/H3] [%s] 连续两次状态检查失败，但本机 IPv%d 哨兵 (%s:443) 无响应，已冻结热库免扣分并等待恢复",
+                         carrier_display_name(rt->spec.mode), ips_type, network_sentinel_ip(ips_type));
+                fail = 0;
+                continue;
+            }
             log_msg("[UDP/H3] [%s] 连续两次状态检查失败，顺位切换下一个候选 IP",
                     carrier_display_name(rt->spec.mode));
             carrier_trigger_maintenance(rt, MAINT_SWITCH_UDP);
