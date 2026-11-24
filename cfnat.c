@@ -1510,7 +1510,7 @@ static void cfg_defaults(Config *c) {
     c->random_mode = 1;
     c->v6_split = 54;
     c->task = 200;
-    c->health_log = 60;        /* 健康状态行 (debug 级) 输出间隔（秒），0 = 关闭；与运行指标无关 */
+    c->health_log = 15;        /* 健康状态行 (debug 级) 输出间隔（秒），0 = 关闭；与运行指标无关 */
     c->stats_interval = 300;   /* 三栈双协议运行指标输出间隔（秒），0 = 关闭（-stats-interval=0） */
     c->h3_client = 0;          /* 默认关闭真实 QUIC ClientHello 模拟，使用轻量 VN 探针 */
     c->enable_h2 = 1;          /* 默认双协议启用 */
@@ -6442,6 +6442,41 @@ static ResultList filter_udp_candidates_from_tcp_core(CarrierRuntime *rt, const 
     free(probe_items);
     free(tried_ips);
 
+    /* 对仍标为 UNK 的 H3 胜出节点（例如来自独立 UDP 热库的旧段）补采一次 :80 CF-RAY 机房标签 */
+    if (udp_res.len > 0 && atomic_load(&g_running)) {
+        int http_port = (rt->spec.prof.http_port > 0) ? rt->spec.prof.http_port : (g_cfg.http_port > 0 ? g_cfg.http_port : 80);
+        const char *dom = (rt->spec.prof.domain[0]) ? rt->spec.prof.domain : g_cfg.domain;
+        char phost[256] = {0}, ppath[256] = {0};
+        parse_domain_and_path(dom, phost, sizeof(phost), ppath, sizeof(ppath));
+        char hreq[512];
+        int hlen = snprintf(hreq, sizeof(hreq),
+                            "HEAD %s HTTP/1.1\r\nHost: %s\r\nUser-Agent: Mozilla/5.0\r\nConnection: close\r\n\r\n",
+                            ppath[0] ? ppath : "/", phost[0] ? phost : "cloudflaremirrors.com");
+        for (size_t ui = 0; ui < udp_res.len && atomic_load(&g_running); ui++) {
+            if (udp_res.items[ui].data_center[0] && strcmp(udp_res.items[ui].data_center, "UNK") != 0) continue;
+            socket_t mfd = dial_target_with_proxy_sa(udp_res.items[ui].ip, &udp_res.items[ui].addr,
+                                                     udp_res.items[ui].addr_len, http_port, 600,
+                                                     rt->spec.use_baidu_proxy == 1 ? rt->proxy_pool : nullptr, nullptr);
+            if (cfnat_socket_valid(mfd)) {
+                char mhdr[2048];
+                int mn = -1;
+                if (hlen > 0 && send_all_timeout(mfd, hreq, (size_t)hlen, 600)) {
+                    mn = recv_headers(mfd, mhdr, sizeof(mhdr), 600);
+                }
+                close(mfd);
+                char colo[MAX_COLO_LEN] = {0};
+                if (mn > 0 && extract_cfray(mhdr, colo, sizeof(colo)) == 0 && colo[0]) {
+                    snprintf(udp_res.items[ui].data_center, sizeof(udp_res.items[ui].data_center), "%s", colo);
+                    Location *loc = find_location(colo);
+                    if (loc) {
+                        snprintf(udp_res.items[ui].region, sizeof(udp_res.items[ui].region), "%s", loc->region);
+                        snprintf(udp_res.items[ui].city, sizeof(udp_res.items[ui].city), "%s", loc->city);
+                    }
+                }
+            }
+        }
+    }
+
     if (udp_res.len > 0) {
         qsort(udp_res.items, udp_res.len, sizeof(Result), cmp_result);
         if (udp_res.len > desired_count) udp_res.len = desired_count;
@@ -8566,7 +8601,12 @@ static void *carrier_health_thread(void *arg) {
             }
         }
 
-        /* 2. 周期性握手测活（保持原有活跃态 20s / 闲置态 30s~60s / 失败复检 10s 节奏） */
+        /* 2. 周期性握手测活（活跃态 15s 与 H3 对齐 / 闲置态 30s~60s / 失败复检 10s） */
+        long long last_act_now = cf_a64_load(&rt->last_tcp_active_ms);
+        int active_now_tc = (act_conns > 0) || (last_act_now > 0 && ((long long)cur_ms - last_act_now) < 30000LL);
+        if (active_now_tc && next_probe_ms > cur_ms + 15000LL) {
+            next_probe_ms = cur_ms + 15000LL; /* 从闲置刚切到活跃时立即收紧下一次测活时刻 */
+        }
         if (cur_ms < next_probe_ms) continue;
 
         HealthCheckLevel level;
@@ -8641,7 +8681,7 @@ static void *carrier_health_thread(void *arg) {
         long long last_act = cf_a64_load(&rt->last_tcp_active_ms);
         int is_active = (atomic_load_explicit(&rt->active_tcp_conns, memory_order_relaxed) > 0) ||
                         (last_act > 0 && ((long long)now_ms() - last_act) < 30000LL);
-        int sleep_dur = (fail > 0) ? 10000 : (is_active ? 20000 : ((consecutive_success >= 5) ? 60000 : 30000));
+        int sleep_dur = (fail > 0) ? 10000 : (is_active ? 15000 : ((consecutive_success >= 5) ? 60000 : 30000));
         next_probe_ms = now_ms() + sleep_dur;
     }
     return nullptr;
