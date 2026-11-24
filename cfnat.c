@@ -7363,7 +7363,7 @@ static void *connection_thread(void *arg) {
     tune_socket_buffers(upstream, 0);
     int had_data = relay_bidirectional(client, upstream, &up_bytes, &down_bytes, cc->runtime);
     int64_t conn_dur_ms = now_ms() - conn_start_ms;
-    is_short_flash = (up_bytes > 0 && conn_dur_ms <= 2500 && down_bytes < 4096ULL);
+    is_short_flash = (up_bytes > 0 && conn_dur_ms <= 3000 && down_bytes < 8192ULL);
     if (had_data == -2) {
         upstream_failed = 1; /* 客户端正常发包但上游无应答或异常中断，判定上游故障 */
     } else if ((had_data > 0 && !is_short_flash) || conn_dur_ms >= 3000) {
@@ -7421,7 +7421,7 @@ out:
                 atomic_store_explicit(&cc->runtime->tcp_short_fail_streak, 1, memory_order_relaxed);
             } else {
                 int st = atomic_fetch_add_explicit(&cc->runtime->tcp_short_fail_streak, 1, memory_order_relaxed) + 1;
-                if (st >= 6) {
+                if (st >= 5) {
                     atomic_store_explicit(&cc->runtime->tcp_short_fail_streak, 0, memory_order_relaxed);
                     cf_a64_store(&cc->runtime->tcp_short_fail_win_ms, 0);
                     carrier_penalize_h2_anomaly(cc->runtime, cc->ip, 3, up_bytes, down_bytes);
@@ -8451,7 +8451,7 @@ static void *carrier_maintenance_thread(void *arg) {
  * 返回 1 = 窒息低速（6s 内上行 >= 4KB、总下行 < 16KB 且上行 >= 2×下行，连续 2 次）；
  * 返回 0 = 正常或观察中（仅下行 >= 32KB 或无上行静默时清零窒息计数，防抖动误清零）。 */
 static int h2_eval_aggregate_window(uint64_t d_up, uint64_t d_down, int *stall_streak) {
-    if (d_up >= 2048ULL && d_down == 0ULL) {
+    if (d_up >= 1500ULL && d_down == 0ULL) {
         if (stall_streak) *stall_streak = 0;
         return 2;
     }
