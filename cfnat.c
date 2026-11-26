@@ -8050,6 +8050,71 @@ static void carrier_get_current_udp_ip_sa(CarrierRuntime *rt, char *out, size_t 
     pthread_mutex_unlock(&rt->udp_candidates.mu);
 }
 
+static void cfd_ip_prefix_key(const char *ip, char *out, size_t sz) {
+    if (!ip || !out || sz == 0) return;
+    out[0] = '\0';
+    if (strchr(ip, ':')) {
+        /* IPv6: 取前 3 段 /48 (例如 2606:4700:a9) 作为去重键 */
+        int colons = 0;
+        size_t i = 0;
+        while (ip[i] && i + 1 < sz) {
+            if (ip[i] == ':') {
+                colons++;
+                if (colons >= 3) break;
+            }
+            out[i] = ip[i];
+            i++;
+        }
+        out[i] = '\0';
+    } else {
+        /* IPv4: 取前 3 段 /24 (例如 198.41.219) 作为去重键 */
+        const char *last_dot = strrchr(ip, '.');
+        if (last_dot) {
+            size_t n = (size_t)(last_dot - ip);
+            if (n >= sz) n = sz - 1;
+            memcpy(out, ip, n);
+            out[n] = '\0';
+        } else {
+            snprintf(out, sz, "%.*s", (int)(sz - 1), ip);
+        }
+    }
+}
+
+static size_t cfd_pick_diverse_slot_idx(const Result *items, size_t len, size_t base, int slot) {
+    if (!items || len == 0) return 0;
+    if (base >= len) base = 0;
+    if (slot <= 0) return base;
+    size_t chosen[4];
+    char keys[4][48];
+    chosen[0] = base;
+    cfd_ip_prefix_key(items[base].ip, keys[0], sizeof(keys[0]));
+    int lim = (slot < 4) ? slot : 3;
+    for (int s = 1; s <= lim; s++) {
+        size_t pick = (base + (size_t)s) % len;
+        for (size_t off = 1; off < len; off++) {
+            size_t cand = (base + off) % len;
+            int dup_idx = 0;
+            for (int prev = 0; prev < s; prev++) {
+                if (chosen[prev] == cand) { dup_idx = 1; break; }
+            }
+            if (dup_idx) continue;
+            char k[48];
+            cfd_ip_prefix_key(items[cand].ip, k, sizeof(k));
+            int dup_pfx = 0;
+            for (int prev = 0; prev < s; prev++) {
+                if (strcmp(keys[prev], k) == 0) { dup_pfx = 1; break; }
+            }
+            if (!dup_pfx) {
+                pick = cand;
+                break;
+            }
+        }
+        chosen[s] = pick;
+        cfd_ip_prefix_key(items[pick].ip, keys[s], sizeof(keys[s]));
+    }
+    return chosen[lim];
+}
+
 static void carrier_get_current_udp_ip_slot_sa(CarrierRuntime *rt, int slot, char *out, size_t sz, struct sockaddr_storage *out_sa, socklen_t *out_salen) {
     if (!rt || !out || sz == 0) return;
     if (slot <= 0 || !rt->spec.is_cfd) {
@@ -8060,7 +8125,7 @@ static void carrier_get_current_udp_ip_slot_sa(CarrierRuntime *rt, int slot, cha
     pthread_mutex_lock(&rt->udp_candidates.mu);
     if (rt->udp_candidates.items && rt->udp_candidates.len > 0) {
         size_t base = (rt->udp_candidates.current_index < rt->udp_candidates.len) ? rt->udp_candidates.current_index : 0;
-        size_t idx = (base + (size_t)slot) % rt->udp_candidates.len;
+        size_t idx = cfd_pick_diverse_slot_idx(rt->udp_candidates.items, rt->udp_candidates.len, base, slot);
         const Result *r = &rt->udp_candidates.items[idx];
         snprintf(out, sz, "%s", r->ip);
         if (out_sa && out_salen) {
@@ -8339,7 +8404,7 @@ CFNAT_NODISCARD static int carrier_choose_ip_for_connection_slot(CarrierRuntime 
     pthread_mutex_lock(&rt->candidates.mu);
     if (rt->candidates.items && rt->candidates.len > 0) {
         size_t base = (rt->candidates.current_index < rt->candidates.len) ? rt->candidates.current_index : 0;
-        size_t idx = (base + (size_t)slot) % rt->candidates.len;
+        size_t idx = cfd_pick_diverse_slot_idx(rt->candidates.items, rt->candidates.len, base, slot);
         const Result *r = &rt->candidates.items[idx];
         snprintf(out, sz, "%s", r->ip);
         if (out_sa && out_salen) {
