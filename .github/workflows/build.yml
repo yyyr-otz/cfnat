@@ -6,6 +6,13 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
+      edition:
+        description: '编译版本（cfd=默认全功能版 0.3.0 含 -cfd；pure=纯 cfnat 版 0.2.x，剔除 -cfd）'
+        type: choice
+        options:
+          - cfd
+          - pure
+        default: cfd
       targets:
         description: '构建目标（逗号/空格分隔，all=全量；分组: linux/linux-static/musl/windows/macos/android/freebsd；或具体名如 windows-amd64,linux-mipsel-musl）'
         required: false
@@ -98,6 +105,7 @@ jobs:
         shell: bash
         env:
           TARGETS_RAW: ${{ github.event_name == 'workflow_dispatch' && inputs.targets || 'all' }}
+          EDITION: ${{ github.event_name == 'workflow_dispatch' && inputs.edition || 'cfd' }}
         run: |
           set -euo pipefail
           mkdir -p release /tmp/build-logs
@@ -121,6 +129,12 @@ jobs:
             -fno-unwind-tables -fno-asynchronous-unwind-tables
             -Wall -Wextra -Wno-unused-parameter
           )
+          if [ "${EDITION:-cfd}" = "pure" ]; then
+            echo "Building pure cfnat edition (-DCFNAT_ENABLE_CFD=0)"
+            COMMON_SIZE_FLAGS+=(-DCFNAT_ENABLE_CFD=0)
+          else
+            echo "Building cfd full edition (CFNAT_ENABLE_CFD=1)"
+          fi
 
           names=()
           pids=()
@@ -187,6 +201,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag_name }}
           PRERELEASE: ${{ inputs.prerelease || false }}
+          EDITION: ${{ github.event_name == 'workflow_dispatch' && inputs.edition || 'cfd' }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -201,7 +216,11 @@ jobs:
           elif [ -n "$INPUT_TAG" ]; then
             tag="$INPUT_TAG"
           else
-            ver=$(grep -E '^#define[[:space:]]+CFNAT_VERSION[[:space:]]+"' "$SOURCE_FILE" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+            if [ "${EDITION:-cfd}" = "pure" ]; then
+              ver=$(grep -E '^#define[[:space:]]+CFNAT_VERSION[[:space:]]+"' "$SOURCE_FILE" | tail -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+            else
+              ver=$(grep -E '^#define[[:space:]]+CFNAT_VERSION[[:space:]]+"' "$SOURCE_FILE" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+            fi
             tag="${ver:+v${ver}}"
             tag="${tag:-continuous}"
           fi
@@ -272,6 +291,7 @@ jobs:
         shell: bash
         env:
           TARGETS_RAW: ${{ github.event_name == 'workflow_dispatch' && inputs.targets || 'all' }}
+          EDITION: ${{ github.event_name == 'workflow_dispatch' && inputs.edition || 'cfd' }}
         run: |
           set -euo pipefail
           TARGETS=" $(echo "${TARGETS_RAW:-all}" | tr '[:upper:],' '[:lower:] ') "
@@ -379,6 +399,7 @@ jobs:
         shell: bash
         env:
           TARGETS_RAW: ${{ github.event_name == 'workflow_dispatch' && inputs.targets || 'all' }}
+          EDITION: ${{ github.event_name == 'workflow_dispatch' && inputs.edition || 'cfd' }}
         run: |
           set -euo pipefail
           zig version
@@ -406,6 +427,12 @@ jobs:
             -fno-unwind-tables -fno-asynchronous-unwind-tables
             -Wall -Wextra -Wno-unused-parameter
           )
+          if [ "${EDITION:-cfd}" = "pure" ]; then
+            echo "Building pure cfnat edition (-DCFNAT_ENABLE_CFD=0)"
+            COMMON_SIZE_FLAGS+=(-DCFNAT_ENABLE_CFD=0)
+          else
+            echo "Building cfd full edition (CFNAT_ENABLE_CFD=1)"
+          fi
 
           names=()
           pids=()
@@ -547,6 +574,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           INPUT_TAG: ${{ inputs.tag_name }}
           PRERELEASE: ${{ inputs.prerelease || false }}
+          EDITION: ${{ github.event_name == 'workflow_dispatch' && inputs.edition || 'cfd' }}
         run: |
           set -euo pipefail
           shopt -s nullglob
@@ -561,7 +589,11 @@ jobs:
           elif [ -n "$INPUT_TAG" ]; then
             tag="$INPUT_TAG"
           else
-            ver=$(grep -E '^#define[[:space:]]+CFNAT_VERSION[[:space:]]+"' "$SOURCE_FILE" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+            if [ "${EDITION:-cfd}" = "pure" ]; then
+              ver=$(grep -E '^#define[[:space:]]+CFNAT_VERSION[[:space:]]+"' "$SOURCE_FILE" | tail -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+            else
+              ver=$(grep -E '^#define[[:space:]]+CFNAT_VERSION[[:space:]]+"' "$SOURCE_FILE" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
+            fi
             tag="${ver:+v${ver}}"
             tag="${tag:-continuous}"
           fi
