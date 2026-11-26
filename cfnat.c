@@ -8050,6 +8050,33 @@ static void carrier_get_current_udp_ip_sa(CarrierRuntime *rt, char *out, size_t 
     pthread_mutex_unlock(&rt->udp_candidates.mu);
 }
 
+static void carrier_get_current_udp_ip_slot_sa(CarrierRuntime *rt, int slot, char *out, size_t sz, struct sockaddr_storage *out_sa, socklen_t *out_salen) {
+    if (!rt || !out || sz == 0) return;
+    if (slot <= 0 || !rt->spec.is_cfd) {
+        carrier_get_current_udp_ip_sa(rt, out, sz, out_sa, out_salen);
+        return;
+    }
+    out[0] = '\0';
+    pthread_mutex_lock(&rt->udp_candidates.mu);
+    if (rt->udp_candidates.items && rt->udp_candidates.len > 0) {
+        size_t base = (rt->udp_candidates.current_index < rt->udp_candidates.len) ? rt->udp_candidates.current_index : 0;
+        size_t idx = (base + (size_t)slot) % rt->udp_candidates.len;
+        const Result *r = &rt->udp_candidates.items[idx];
+        snprintf(out, sz, "%s", r->ip);
+        if (out_sa && out_salen) {
+            *out_sa = r->addr;
+            *out_salen = r->addr_len;
+        }
+    } else if (rt->udp_candidates.current_ip[0]) {
+        snprintf(out, sz, "%s", rt->udp_candidates.current_ip);
+        if (out_sa && out_salen) {
+            *out_sa = rt->udp_candidates.current_addr;
+            *out_salen = rt->udp_candidates.current_addr_len;
+        }
+    }
+    pthread_mutex_unlock(&rt->udp_candidates.mu);
+}
+
 static void carrier_get_current_udp_ip(CarrierRuntime *rt, char *out, size_t sz) {
     carrier_get_current_udp_ip_sa(rt, out, sz, nullptr, nullptr);
 }
@@ -8301,6 +8328,28 @@ CFNAT_NODISCARD static int carrier_choose_ip_for_connection(CarrierRuntime *rt, 
     }
     pthread_mutex_unlock(&rt->candidates.mu);
     return out[0] ? 1 : 0;
+}
+
+CFNAT_NODISCARD static int carrier_choose_ip_for_connection_slot(CarrierRuntime *rt, int slot, char *out, size_t sz, struct sockaddr_storage *out_sa, socklen_t *out_salen) {
+    if (!rt || !out || sz == 0) return 0;
+    if (slot <= 0 || !rt->spec.is_cfd) {
+        return carrier_choose_ip_for_connection(rt, out, sz, out_sa, out_salen);
+    }
+    out[0] = '\0';
+    pthread_mutex_lock(&rt->candidates.mu);
+    if (rt->candidates.items && rt->candidates.len > 0) {
+        size_t base = (rt->candidates.current_index < rt->candidates.len) ? rt->candidates.current_index : 0;
+        size_t idx = (base + (size_t)slot) % rt->candidates.len;
+        const Result *r = &rt->candidates.items[idx];
+        snprintf(out, sz, "%s", r->ip);
+        if (out_sa && out_salen) {
+            *out_sa = r->addr;
+            *out_salen = r->addr_len;
+        }
+    }
+    pthread_mutex_unlock(&rt->candidates.mu);
+    if (out[0]) return 1;
+    return carrier_choose_ip_for_connection(rt, out, sz, out_sa, out_salen);
 }
 
 /* 双轨协同自愈与补充扫描引擎：
@@ -9198,6 +9247,7 @@ static void *carrier_accept_thread(void *arg) {
     CarrierRuntime *rt = (CarrierRuntime *)arg;
     while (atomic_load(&g_running)) {
         socket_t cfd = INVALID_SOCKET;
+        int listen_slot = 0;
         struct sockaddr_storage ss;
 #ifdef _WIN32
         int slen = (int)sizeof(ss);
@@ -9241,7 +9291,15 @@ static void *carrier_accept_thread(void *arg) {
                 if (apfds[ai].revents & POLLIN) {
                     slen = sizeof(ss);
                     cfd = accept(apfds[ai].fd, (struct sockaddr *)&ss, &slen);
-                    if (cfnat_socket_valid(cfd)) break;
+                    if (cfnat_socket_valid(cfd)) {
+                        for (int ei = 0; ei < rt->extra_listen_count && ei < 3; ei++) {
+                            if (apfds[ai].fd == rt->extra_listen_fds[ei]) {
+                                listen_slot = ei + 1;
+                                break;
+                            }
+                        }
+                        break;
+                    }
                 }
             }
             if (cfnat_socket_invalid(cfd)) continue;
@@ -9264,7 +9322,7 @@ static void *carrier_accept_thread(void *arg) {
         char ip[MAX_IP_LEN];
         struct sockaddr_storage ip_sa = {0};
         socklen_t ip_salen = 0;
-        if (!carrier_choose_ip_for_connection(rt, ip, sizeof(ip), &ip_sa, &ip_salen)) {
+        if (!carrier_choose_ip_for_connection_slot(rt, listen_slot, ip, sizeof(ip), &ip_sa, &ip_salen)) {
             close(cfd);
             continue;
         }
@@ -9814,7 +9872,7 @@ static int prune_udp_sessions(CarrierRuntime *rt, int64_t cur_ms) {
             }
 
             /* 2. 上行型窒息检测：覆盖握手黑洞与上行重传型卡死 */
-            if (d_up >= UDP_STALL_MIN_UP_BYTES && d_down < UDP_STALL_MAX_DOWN_BYTES && d_up >= d_down * 2) {
+            if (!rt->spec.is_cfd && d_up >= UDP_STALL_MIN_UP_BYTES && d_down < UDP_STALL_MAX_DOWN_BYTES && d_up >= d_down * 2) {
                 s->stall_count++;
                 if (s->stall_count >= UDP_STALL_MAX_STRIKES) {
                     is_stalled = 1;
@@ -10033,10 +10091,13 @@ static void *carrier_udp_thread(void *arg) {
     size_t udp_listen_n = 1;
     rt->udp_dirty = 1;
     int64_t last_prune_ms = now_ms();
-    char cur_target_ip[MAX_IP_LEN] = {0};
-    struct sockaddr_storage cur_target_sa = {0};
-    socklen_t cur_target_salen = 0;
-    unsigned long long cached_udp_epoch = (unsigned long long)-1;
+    char slot_target_ip[4][MAX_IP_LEN] = {{0}};
+    struct sockaddr_storage slot_target_sa[4] = {{0}};
+    socklen_t slot_target_salen[4] = {0};
+    unsigned long long slot_udp_epoch[4] = {
+        (unsigned long long)-1, (unsigned long long)-1,
+        (unsigned long long)-1, (unsigned long long)-1
+    };
     int target_port = (rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
     if (target_port <= 0) target_port = 443;
 
@@ -10204,11 +10265,21 @@ static void *carrier_udp_thread(void *arg) {
         for (size_t li = 0; li < udp_listen_n; li++) {
             if (!(pfds[li].revents & POLLIN)) continue;
             socket_t in_lfd = pfds[li].fd;
+            int udp_slot = 0;
+            for (int ei = 0; ei < rt->extra_udp_listen_count && ei < 3; ei++) {
+                if (in_lfd == rt->extra_udp_listen_fds[ei]) {
+                    udp_slot = ei + 1;
+                    break;
+                }
+            }
+            char *cur_target_ip = slot_target_ip[udp_slot];
+            struct sockaddr_storage *p_target_sa = &slot_target_sa[udp_slot];
+            socklen_t *p_target_salen = &slot_target_salen[udp_slot];
             cf_a64_store(&rt->last_udp_active_ms, cur_ms);
             unsigned long long cur_epoch = cf_a64_load_acq(&rt->udp_candidates.epoch);
-            if (cur_epoch != cached_udp_epoch || !cur_target_ip[0]) {
-                carrier_get_current_udp_ip_sa(rt, cur_target_ip, sizeof(cur_target_ip), &cur_target_sa, &cur_target_salen);
-                cached_udp_epoch = cur_epoch;
+            if (cur_epoch != slot_udp_epoch[udp_slot] || !cur_target_ip[0]) {
+                carrier_get_current_udp_ip_slot_sa(rt, udp_slot, cur_target_ip, MAX_IP_LEN, p_target_sa, p_target_salen);
+                slot_udp_epoch[udp_slot] = cur_epoch;
             }
 
 #ifdef __linux__
@@ -10237,7 +10308,7 @@ static void *carrier_udp_thread(void *arg) {
                     UdpSession *sess = rt->last_udp_sess;
                     if (!sess || !sockaddr_equal(&sess->client_addr, c_ss) || cfnat_socket_invalid(sess->upstream_fd) || strcmp(sess->target_ip, cur_target_ip) != 0) {
                         if (cur_target_ip[0]) {
-                            sess = find_or_create_udp_session_sa(rt, c_ss, c_len, cur_target_ip, &cur_target_sa, cur_target_salen, target_port, (uint8_t)batch_bufs[m][0]);
+                            sess = find_or_create_udp_session_sa(rt, c_ss, c_len, cur_target_ip, p_target_sa, *p_target_salen, target_port, (uint8_t)batch_bufs[m][0]);
                         } else {
                             sess = nullptr;
                         }
@@ -10301,7 +10372,7 @@ static void *carrier_udp_thread(void *arg) {
                 UdpSession *sess = rt->last_udp_sess;
                 if (!sess || !sockaddr_equal(&sess->client_addr, &client_ss) || cfnat_socket_invalid(sess->upstream_fd) || strcmp(sess->target_ip, cur_target_ip) != 0) {
                     if (cur_target_ip[0]) {
-                        sess = find_or_create_udp_session_sa(rt, &client_ss, (socklen_t)client_len, cur_target_ip, &cur_target_sa, cur_target_salen, target_port, (uint8_t)buf[0]);
+                        sess = find_or_create_udp_session_sa(rt, &client_ss, (socklen_t)client_len, cur_target_ip, p_target_sa, *p_target_salen, target_port, (uint8_t)buf[0]);
                     } else {
                         sess = nullptr;
                     }
