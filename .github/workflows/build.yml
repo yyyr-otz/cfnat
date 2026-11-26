@@ -57,7 +57,7 @@ jobs:
           github.event_name != 'workflow_dispatch' ||
           inputs.targets == '' ||
           contains(inputs.targets, 'all') ||
-          contains(inputs.targets, 'android')
+          (contains(inputs.targets, 'android') || contains(inputs.targets, 'arm64') || contains(inputs.targets, 'amd64'))
         uses: actions/cache@v4
         with:
           path: /tmp/android-ndk-r27c
@@ -68,7 +68,7 @@ jobs:
           (github.event_name != 'workflow_dispatch' ||
           inputs.targets == '' ||
           contains(inputs.targets, 'all') ||
-          contains(inputs.targets, 'android')) &&
+          (contains(inputs.targets, 'android') || contains(inputs.targets, 'arm64') || contains(inputs.targets, 'amd64'))) &&
           steps.cache-ndk.outputs.cache-hit != 'true'
         uses: nttld/setup-ndk@v1
         with:
@@ -80,7 +80,7 @@ jobs:
           github.event_name != 'workflow_dispatch' ||
           inputs.targets == '' ||
           contains(inputs.targets, 'all') ||
-          contains(inputs.targets, 'android')
+          (contains(inputs.targets, 'android') || contains(inputs.targets, 'arm64') || contains(inputs.targets, 'amd64'))
         shell: bash
         run: |
           set -euo pipefail
@@ -109,7 +109,7 @@ jobs:
           github.event_name != 'workflow_dispatch' ||
           inputs.targets == '' ||
           contains(inputs.targets, 'all') ||
-          contains(inputs.targets, 'freebsd')
+          (contains(inputs.targets, 'freebsd') || contains(inputs.targets, 'arm64') || contains(inputs.targets, 'amd64'))
         uses: actions/cache@v4
         with:
           path: /tmp/freebsd-sysroot
@@ -236,15 +236,24 @@ jobs:
           fi
           mkdir -p release /tmp/build-logs /tmp/zig-cache/global
 
-          TARGETS=" $(echo "${TARGETS_RAW:-all}" | tr '[:upper:],' '[:lower:] ') "
-          echo "Selected targets filter:${TARGETS}"
+          TARGETS_LIST="$(echo "${TARGETS_RAW:-all}" | tr '[:upper:],' '[:lower:] ')"
+          echo "Selected targets filter: ${TARGETS_LIST}"
 
           want() {
-            local key
-            for key in "$@"; do
-              if [[ "$TARGETS" == *" ${key} "* ]]; then
-                return 0
-              fi
+            local tags=" $* "
+            local tok sub ok
+            for tok in $TARGETS_LIST; do
+              [ "$tok" = "all" ] && return 0
+              ok=1
+              IFS='-' read -r -a subs <<< "$tok"
+              for sub in "${subs[@]}"; do
+                [ -z "$sub" ] && continue
+                if [[ "$tags" != *" ${sub} "* ]]; then
+                  ok=0
+                  break
+                fi
+              done
+              [ "$ok" -eq 1 ] && return 0
             done
             return 1
           }
@@ -322,7 +331,7 @@ jobs:
             local name="$1" target="$2" out="$3"
             ZIG_LOCAL_CACHE_DIR="/tmp/zig-cache/${name}/local" \
             ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/global" \
-            zig cc -target "$target" "${COMMON_SIZE_FLAGS[@]}" \
+            zig cc -target "$target" "${COMMON_SIZE_FLAGS[@]}" -fno-lto \
               "$SOURCE_FILE" -o "release/${out}" \
               -Wl,-dead_strip -Wl,-s -pthread
           }
@@ -340,20 +349,20 @@ jobs:
           }
 
           # macOS / Darwin (2, cross-compiled via Zig)
-          want all macos darwin darwin-amd64 && launch darwin-amd64 build_zig_darwin darwin-amd64 x86_64-macos  cfnat-darwin-amd64
-          want all macos darwin darwin-arm64 && launch darwin-arm64 build_zig_darwin darwin-arm64 aarch64-macos cfnat-darwin-arm64
+          want macos darwin amd64 && launch darwin-amd64 build_zig_darwin darwin-amd64 x86_64-macos  cfnat-darwin-amd64
+          want macos darwin arm64 && launch darwin-arm64 build_zig_darwin darwin-arm64 aarch64-macos cfnat-darwin-arm64
 
           # Android (2, NDK r27c)
-          want all android android-arm64     && launch android-arm64 build_android aarch64-linux-android 24 cfnat-android-arm64
-          want all android android-amd64     && launch android-amd64 build_android x86_64-linux-android  24 cfnat-android-amd64
+          want android arm64      && launch android-arm64 build_android aarch64-linux-android 24 cfnat-android-arm64
+          want android amd64      && launch android-amd64 build_android x86_64-linux-android  24 cfnat-android-amd64
 
           # FreeBSD (2)
-          want all freebsd freebsd-amd64 && launch freebsd-amd64 build_zig_freebsd freebsd-amd64 x86_64-freebsd  amd64 cfnat-freebsd-amd64
-          want all freebsd freebsd-arm64 && launch freebsd-arm64 build_zig_freebsd freebsd-arm64 aarch64-freebsd arm64 cfnat-freebsd-arm64
+          want freebsd amd64      && launch freebsd-amd64 build_zig_freebsd freebsd-amd64 x86_64-freebsd  amd64 cfnat-freebsd-amd64
+          want freebsd arm64      && launch freebsd-arm64 build_zig_freebsd freebsd-arm64 aarch64-freebsd arm64 cfnat-freebsd-arm64
 
           # Windows (2)
-          want all windows windows-amd64 && launch windows-amd64 build_zig_windows windows-amd64 x86_64-windows-gnu  cfnat-windows-amd64.exe
-          want all windows windows-arm64 && launch windows-arm64 build_zig_windows windows-arm64 aarch64-windows-gnu cfnat-windows-arm64.exe
+          want windows amd64      && launch windows-amd64 build_zig_windows windows-amd64 x86_64-windows-gnu  cfnat-windows-amd64.exe
+          want windows arm64      && launch windows-arm64 build_zig_windows windows-arm64 aarch64-windows-gnu cfnat-windows-arm64.exe
 
           # Linux 14 架构（同时支持静态版与 -musl 动态版）
           LINUX_SPECS=(
@@ -375,11 +384,16 @@ jobs:
 
           for spec in "${LINUX_SPECS[@]}"; do
             IFS='|' read -r name target extra <<< "$spec"
+            arch_part="${name#linux-}"
+            upx_tag=""
+            if [ "$arch_part" = "mips" ] || [ "$arch_part" = "mipsel" ]; then
+              upx_tag="upx"
+            fi
             read -r -a extra_arr <<< "$extra"
-            if want all linux linux-static "$name"; then
+            if want linux static "$arch_part" $upx_tag; then
               launch "$name" build_zig_linux_static "$name" "$target" "cfnat-${name}" "${extra_arr[@]}"
             fi
-            if want all linux musl linux-musl "${name}-musl"; then
+            if want linux musl "$arch_part" $upx_tag; then
               launch "${name}-musl" build_zig_linux_musl "${name}-musl" "$target" "cfnat-${name}-musl" "${extra_arr[@]}"
             fi
           done
