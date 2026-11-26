@@ -1,4 +1,13 @@
+#ifndef CFNAT_ENABLE_CFD
+#define CFNAT_ENABLE_CFD 1
+#endif
+#ifndef CFNAT_VERSION
+#if CFNAT_ENABLE_CFD
+#define CFNAT_VERSION "0.3.0"
+#else
 #define CFNAT_VERSION "0.2.2"
+#endif
+#endif
 
 /* =========================================================================
  * C23 (ISO/IEC 9899:2024) Standard Compatibility & Polyfill Layer
@@ -283,6 +292,33 @@ static const char *LOC_URLS[] = {
     "https://raw.githubusercontent.com/fscarmen/cfnat/main/locations.json",
     nullptr
 };
+
+#if CFNAT_ENABLE_CFD
+/* Cloudflare Tunnel (Argo / cloudflared) 官方固定 80 个边缘节点 IP (:7844) */
+static const char *CFD_BUILTIN_V4_IPS[] = {
+    "198.41.192.7", "198.41.192.27", "198.41.192.37", "198.41.192.47", "198.41.192.57",
+    "198.41.192.67", "198.41.192.77", "198.41.192.107", "198.41.192.167", "198.41.192.227",
+    "198.41.200.13", "198.41.200.23", "198.41.200.33", "198.41.200.43", "198.41.200.53",
+    "198.41.200.63", "198.41.200.73", "198.41.200.113", "198.41.200.193", "198.41.200.233",
+    "198.41.218.1", "198.41.218.2", "198.41.218.3", "198.41.218.4", "198.41.218.5",
+    "198.41.218.6", "198.41.218.7", "198.41.218.8", "198.41.218.9", "198.41.218.10",
+    "198.41.219.1", "198.41.219.2", "198.41.219.3", "198.41.219.4", "198.41.219.5",
+    "198.41.219.6", "198.41.219.7", "198.41.219.8", "198.41.219.9", "198.41.219.10",
+    nullptr
+};
+
+static const char *CFD_BUILTIN_V6_IPS[] = {
+    "2606:4700:a0::1", "2606:4700:a0::2", "2606:4700:a0::3", "2606:4700:a0::4", "2606:4700:a0::5",
+    "2606:4700:a0::6", "2606:4700:a0::7", "2606:4700:a0::8", "2606:4700:a0::9", "2606:4700:a0::10",
+    "2606:4700:a8::1", "2606:4700:a8::2", "2606:4700:a8::3", "2606:4700:a8::4", "2606:4700:a8::5",
+    "2606:4700:a8::6", "2606:4700:a8::7", "2606:4700:a8::8", "2606:4700:a8::9", "2606:4700:a8::10",
+    "2606:4700:a1::1", "2606:4700:a1::2", "2606:4700:a1::3", "2606:4700:a1::4", "2606:4700:a1::5",
+    "2606:4700:a1::6", "2606:4700:a1::7", "2606:4700:a1::8", "2606:4700:a1::9", "2606:4700:a1::10",
+    "2606:4700:a9::1", "2606:4700:a9::2", "2606:4700:a9::3", "2606:4700:a9::4", "2606:4700:a9::5",
+    "2606:4700:a9::6", "2606:4700:a9::7", "2606:4700:a9::8", "2606:4700:a9::9", "2606:4700:a9::10",
+    nullptr
+};
+#endif
 #if CFNAT_IS_C23
 typedef enum : uint8_t {
     LOG_SILENT = 0,
@@ -320,6 +356,9 @@ typedef struct {
     int use_baidu_proxy;      /* 0: 直连, 1: 百度前置, 2: 混合 */
     int enable_h2;            /* 1=启用 TCP/H2 监听与测活, 0=关闭 (纯 H3 模式) */
     int enable_h3;            /* 1=启用 UDP/H3 测优与转发, 0=关闭 (纯 H2 模式) */
+    int is_cfd;               /* 1=Cloudflare Tunnel (Argo :7844) 优选模式 */
+    int cfd_ips;              /* 4 / 6 / 46 (双栈) */
+    char cfd_file[256];       /* 自定义 Argo IP 列表文件 */
 } ProfileConfig;
 
 typedef struct {
@@ -347,10 +386,14 @@ typedef struct {
     int ips_v4_to_cidr;             /* 0=关闭, 8..31=将单 IPv4 转为该前缀 CIDR (默认开启=24) */
     int ips_v6_to_cidr;             /* 0=关闭, 1..127=将单 IPv6 转为该前缀 CIDR (默认开启=64) */
     LogLevel log_level;
+    int cfd_mode;             /* scan_ips 内部标志: 1=纯 TCPing :7844 (跳过 :80 / TLS SNI) */
+    int cfd_ips;              /* -cfd-ips=4|6|46 (默认 46) */
+    char cfd_file[256];       /* -cfd-file=FILE */
     ProfileConfig prof_v4;
     ProfileConfig prof_v6;
     ProfileConfig prof_baidu;
-    int listen_order[3];      /* 命令行传参顺序: 1=v4, 2=v6, 3=baidu (baidu 强制排在 v4 之后) */
+    ProfileConfig prof_cfd;
+    int listen_order[4];      /* 命令行传参顺序: 1=v4, 2=v6, 3=baidu (baidu 强制排在 v4 之后), 4=cfd */
     int listen_order_len;
 } Config;
 
@@ -736,6 +779,7 @@ typedef struct {
     char mode[MAX_NAME_LEN];
     char addr[MAX_ADDR_LEN];
     int use_baidu_proxy;
+    int is_cfd;
     ProfileConfig prof;
 } CarrierListenSpec;
 
@@ -1392,6 +1436,11 @@ static void usage(const char *p) {
     printf("  -v4-listen[=addr]         开启 IPv4 本地监听地址 (默认 0.0.0.0:4443)\n");
     printf("  -v6-listen[=addr]         开启 IPv6 本地监听地址 (默认 [::]:6443)\n");
     printf("  -baidu-listen[=addr]      开启百度前置本地监听地址 (默认 0.0.0.0:5444)\n");
+#if CFNAT_ENABLE_CFD
+    printf("  -cfd[=addr], -argo[=addr] 开启 Cloudflare Tunnel (Argo :7844) 优选监听 (默认 127.0.0.1:7844)\n");
+    printf("  -cfd-ips=4|6|46           Argo 优选 IP 协议栈筛选 (default 46: 双栈 80 个官方节点)\n");
+    printf("  -cfd-file=FILE            自定义 Argo IP 列表文件 (覆盖内置 80 个官方节点)\n");
+#endif
     printf("  -direct-listen=value      兼容旧参数: 直连优选监听地址 (默认 IPv4: 4443，指定 -ips=6 为 6443)\n");
     printf("  -baidu-resolver=value     Fake-IP 时百度域名解析器: auto | udp://IP | doh://IP/path?host=HOST\n");
     printf("  -colo=value               数据中心筛选 (支持反选: -HKG, ^HKG, !HKG)\n");
@@ -1525,6 +1574,8 @@ static void cfg_defaults(Config *c) {
     c->baidu_port = DEFAULT_BAIDU_PORT;
     c->baidu_ipnum = DEFAULT_BAIDU_IPNUM;
     c->cli_mode = 0;
+    c->cfd_mode = 0;
+    c->cfd_ips = 46;
     c->log_level = LOG_INFO;
 }
 
@@ -1535,11 +1586,16 @@ static void parse_args(Config *c, int argc, char **argv) {
     char v6_exclude_colo_buf[256] = {0};
 
     /* 标记哪些专属参数被显式指定了 */
-    int has_v4_listen = 0, has_v6_listen = 0, has_baidu_listen = 0;
+    int has_v4_listen = 0, has_v6_listen = 0, has_baidu_listen = 0, has_cfd_listen = 0;
     c->listen_order_len = 0;
     char v4_listen_val[MAX_ADDR_LEN] = {0};
     char v6_listen_val[MAX_ADDR_LEN] = {0};
     char baidu_listen_val[MAX_ADDR_LEN] = {0};
+    char cfd_listen_val[MAX_ADDR_LEN] = {0};
+    int cfd_port = 0, cfd_delay = 0, cfd_task = 0, cfd_ipnum = 0, cfd_num = 0;
+    int cfd_h2 = -1, cfd_h3 = -1;
+    (void)cfd_port; (void)cfd_delay; (void)cfd_task; (void)cfd_ipnum; (void)cfd_num;
+    (void)cfd_h2; (void)cfd_h3; (void)cfd_listen_val;
 
     int v4_port = 0, v6_port = 0;
     int v4_http_port = 0, v6_http_port = 0;
@@ -1612,6 +1668,35 @@ static void parse_args(Config *c, int argc, char **argv) {
             format_listen_endpoint(val, 5444, "0.0.0.0", baidu_listen_val, sizeof(baidu_listen_val));
             int dup = 0; for (int k = 0; k < c->listen_order_len; k++) if (c->listen_order[k] == 3) dup = 1;
             if (!dup && c->listen_order_len < 3) c->listen_order[c->listen_order_len++] = 3;
+#if CFNAT_ENABLE_CFD
+        } else if (!strcmp(key, "cfd") || !strcmp(key, "argo") || !strcmp(key, "cfd-listen")) {
+            has_cfd_listen = 1;
+            format_listen_endpoint(val, 7844, "127.0.0.1", cfd_listen_val, sizeof(cfd_listen_val));
+            int dup = 0; for (int k = 0; k < c->listen_order_len; k++) if (c->listen_order[k] == 4) dup = 1;
+            if (!dup && c->listen_order_len < 4) c->listen_order[c->listen_order_len++] = 4;
+        } else if (!strcmp(key, "cfd-ips")) {
+            if (val) {
+                int v = atoi(val);
+                if (v == 4 || v == 6 || v == 46) c->cfd_ips = v;
+                else if (strcasecmp(val, "all") == 0 || strcasecmp(val, "both") == 0 || strcasecmp(val, "dual") == 0) c->cfd_ips = 46;
+            }
+        } else if (!strcmp(key, "cfd-file")) {
+            if (val && *val) snprintf(c->cfd_file, sizeof(c->cfd_file), "%s", val);
+        } else if (!strcmp(key, "cfd-port")) {
+            if (val) cfd_port = atoi(val);
+        } else if (!strcmp(key, "cfd-delay")) {
+            if (val) cfd_delay = atoi(val);
+        } else if (!strcmp(key, "cfd-task")) {
+            if (val) cfd_task = atoi(val);
+        } else if (!strcmp(key, "cfd-ipnum")) {
+            if (val) cfd_ipnum = atoi(val);
+        } else if (!strcmp(key, "cfd-num")) {
+            if (val) cfd_num = atoi(val);
+        } else if (!strcmp(key, "cfd-h2")) {
+            cfd_h2 = parse_bool(val);
+        } else if (!strcmp(key, "cfd-h3")) {
+            cfd_h3 = parse_bool(val);
+#endif
         } else if (!strcmp(key, "direct-listen") && val) {
             snprintf(c->direct_listen, sizeof(c->direct_listen), "%s", val);
             int kind = (c->ips_type == 6) ? 2 : 1;
@@ -1780,7 +1865,7 @@ static void parse_args(Config *c, int argc, char **argv) {
        2. 若用户指定了旧的 -direct-listen 或 -baidu-listen，则兼容旧逻辑；
        3. 若用户全都没指定，则默认仅开启 IPv4，监听 0.0.0.0:4443。
     */
-    int any_explicit_listen = (has_v4_listen || has_v6_listen || has_baidu_listen || c->direct_listen[0]);
+    int any_explicit_listen = (has_v4_listen || has_v6_listen || has_baidu_listen || has_cfd_listen || c->direct_listen[0]);
     if (!any_explicit_listen && !c->cli_mode) {
         has_v4_listen = 1;
         snprintf(v4_listen_val, sizeof(v4_listen_val), "0.0.0.0:4443");
@@ -1800,15 +1885,19 @@ static void parse_args(Config *c, int argc, char **argv) {
     /* 补齐未在循环中入队的启用项并强制保证: 若同时启用 v4 与 baidu，v4 必须在 baidu 之前 */
     if (has_v4_listen) {
         int dup = 0; for (int k = 0; k < c->listen_order_len; k++) if (c->listen_order[k] == 1) dup = 1;
-        if (!dup && c->listen_order_len < 3) c->listen_order[c->listen_order_len++] = 1;
+        if (!dup && c->listen_order_len < 4) c->listen_order[c->listen_order_len++] = 1;
     }
     if (has_v6_listen) {
         int dup = 0; for (int k = 0; k < c->listen_order_len; k++) if (c->listen_order[k] == 2) dup = 1;
-        if (!dup && c->listen_order_len < 3) c->listen_order[c->listen_order_len++] = 2;
+        if (!dup && c->listen_order_len < 4) c->listen_order[c->listen_order_len++] = 2;
     }
     if (has_baidu_listen) {
         int dup = 0; for (int k = 0; k < c->listen_order_len; k++) if (c->listen_order[k] == 3) dup = 1;
-        if (!dup && c->listen_order_len < 3) c->listen_order[c->listen_order_len++] = 3;
+        if (!dup && c->listen_order_len < 4) c->listen_order[c->listen_order_len++] = 3;
+    }
+    if (has_cfd_listen) {
+        int dup = 0; for (int k = 0; k < c->listen_order_len; k++) if (c->listen_order[k] == 4) dup = 1;
+        if (!dup && c->listen_order_len < 4) c->listen_order[c->listen_order_len++] = 4;
     }
     int pos_v4 = -1, pos_bd = -1;
     for (int k = 0; k < c->listen_order_len; k++) {
@@ -1912,10 +2001,31 @@ static void parse_args(Config *c, int argc, char **argv) {
     c->prof_baidu.use_baidu_proxy = 1;
     c->prof_baidu.enable_h2 = (baidu_h2 >= 0) ? baidu_h2 : c->enable_h2;
     c->prof_baidu.enable_h3 = (baidu_h3 >= 0) ? baidu_h3 : c->enable_h3;
+    /* 初始化 prof_cfd (Cloudflare Tunnel / Argo :7844 优选) */
+    c->prof_cfd.enabled = has_cfd_listen;
+    c->prof_cfd.is_cfd = 1;
+    c->prof_cfd.cfd_ips = c->cfd_ips ? c->cfd_ips : 46;
+    c->prof_cfd.ips_type = (c->prof_cfd.cfd_ips == 6) ? 6 : 4;
+    snprintf(c->prof_cfd.name, sizeof(c->prof_cfd.name), "cfd");
+    snprintf(c->prof_cfd.listen_addr, sizeof(c->prof_cfd.listen_addr), "%s", cfd_listen_val[0] ? cfd_listen_val : "127.0.0.1:7844");
+    snprintf(c->prof_cfd.cfd_file, sizeof(c->prof_cfd.cfd_file), "%s", c->cfd_file);
+    c->prof_cfd.port = cfd_port > 0 ? cfd_port : 7844;
+    c->prof_cfd.http_port = c->prof_cfd.port;
+    c->prof_cfd.delay_ms = cfd_delay > 0 ? cfd_delay : c->delay_ms;
+    c->prof_cfd.task = cfd_task > 0 ? cfd_task : c->task;
+    c->prof_cfd.ipnum = cfd_ipnum > 0 ? cfd_ipnum : c->ipnum;
+    c->prof_cfd.num = cfd_num > 0 ? cfd_num : (c->num > 0 ? c->num : 3);
+    c->prof_cfd.code = 0;
+    c->prof_cfd.random_mode = 0;
+    c->prof_cfd.use_baidu_proxy = 0;
+    c->prof_cfd.enable_h2 = (cfd_h2 >= 0) ? cfd_h2 : c->enable_h2;
+    c->prof_cfd.enable_h3 = (cfd_h3 >= 0) ? cfd_h3 : c->enable_h3;
+
     if (has_baidu_listen) c->use_baidu_proxy = 1;
     if ((c->prof_v4.enabled && !c->prof_v4.enable_h2 && !c->prof_v4.enable_h3) ||
         (c->prof_v6.enabled && !c->prof_v6.enable_h2 && !c->prof_v6.enable_h3) ||
-        (c->prof_baidu.enabled && !c->prof_baidu.enable_h2 && !c->prof_baidu.enable_h3)) {
+        (c->prof_baidu.enabled && !c->prof_baidu.enable_h2 && !c->prof_baidu.enable_h3) ||
+        (c->prof_cfd.enabled && !c->prof_cfd.enable_h2 && !c->prof_cfd.enable_h3)) {
         fprintf(stderr, "配置错误: 已启用的监听实例不能同时关闭 H2 与 H3 (-h2=0 -h3=0)\n");
         exit(1);
     }
@@ -1959,6 +2069,20 @@ static void log_current_config(const Config *c) {
     } else {
         log_msg("  [百度前置实例] 未启用");
     }
+
+#if CFNAT_ENABLE_CFD
+    if (c->prof_cfd.enabled) {
+        log_msg("  [Argo优选实例 (cfd)] 监听地址: %s | 协议: %s", c->prof_cfd.listen_addr,
+                (c->prof_cfd.enable_h2 && c->prof_cfd.enable_h3) ? "H2+H3" : (c->prof_cfd.enable_h2 ? "仅H2" : "仅H3"));
+        log_msg("    Argo目标端口: %d | 协议栈 (-cfd-ips): %s | 数据源: %s",
+                c->prof_cfd.port,
+                c->prof_cfd.cfd_ips == 4 ? "IPv4 (40)" : (c->prof_cfd.cfd_ips == 6 ? "IPv6 (40)" : "双栈 IPv4+IPv6 (80)"),
+                c->prof_cfd.cfd_file[0] ? c->prof_cfd.cfd_file : "内置官方 Tunnel 节点");
+        log_msg("    并发扫描线程: %d | 延迟上限: %d ms | 候选IP保留: %d", c->prof_cfd.task, c->prof_cfd.delay_ms, c->prof_cfd.ipnum);
+    } else {
+        log_msg("  [Argo优选实例 (cfd)] 未启用");
+    }
+#endif
 
     if (!c->prof_v4.enabled && !c->prof_v6.enabled && !c->prof_baidu.enabled) {
         log_msg("  [CLI 单次测速模式] IP 类型: IPv%d | 端口: %d | 并发线程: %d | 延迟上限: %d ms",
@@ -2933,7 +3057,7 @@ static void hotpool_upsert_locked(HotPool *hp, const char *net, uint8_t prefix, 
 }
 
 static void hotpool_record_success(int ips_type, int is_udp, const char *ip, int lat_ms, int from_traffic) {
-    if (!ip || !*ip) return;
+    if (ips_type <= 0 || !ip || !*ip) return;
     HotPool *hp = hotpool_get(ips_type, is_udp);
     char net[MAX_IP_LEN];
     int pfx = (ips_type == 6) ? 64 : 24;
@@ -2953,7 +3077,7 @@ static void hotpool_record_success(int ips_type, int is_udp, const char *ip, int
 }
 
 static void hotpool_record_failure(int ips_type, int is_udp, const char *ip, int penalty) {
-    if (!ip || !*ip || penalty <= 0 || net_is_frozen(ips_type)) return;
+    if (ips_type <= 0 || !ip || !*ip || penalty <= 0 || net_is_frozen(ips_type)) return;
     HotPool *hp = hotpool_get(ips_type, is_udp);
     char net[MAX_IP_LEN];
     int pfx = (ips_type == 6) ? 64 : 24;
@@ -4290,6 +4414,7 @@ static const char *carrier_display_name(const char *mode) {
     if (str_eq_ci(mode, "direct") || str_eq_ci(mode, "direct-v4")) return "IPv4直连优选";
     if (str_eq_ci(mode, "direct-v6")) return "IPv6直连优选";
     if (str_eq_ci(mode, "baidu")) return "百度前置优选";
+    if (str_eq_ci(mode, "cfd")) return "Argo优选(cfd)";
     if (str_eq_ci(mode, "mixed")) return "混合优选";
     return mode ? mode : "unknown";
 }
@@ -4509,10 +4634,10 @@ CFNAT_NODISCARD static int parse_listen_modes(const Config *cfg, CarrierListenSp
     if (!specs) return -1;
 
     /* 按命令行传参顺序（且 baidu 强制排在 v4 之后）依次激活分协议 profile */
-    int fallback_order[3] = {1, 2, 3};
+    int fallback_order[4] = {1, 2, 3, 4};
     const int *order = (cfg->listen_order_len > 0) ? cfg->listen_order : fallback_order;
-    int order_len = (cfg->listen_order_len > 0) ? cfg->listen_order_len : 3;
-    for (int oi = 0; oi < order_len && len < 3; oi++) {
+    int order_len = (cfg->listen_order_len > 0) ? cfg->listen_order_len : 4;
+    for (int oi = 0; oi < order_len && len < 4; oi++) {
         int kind = order[oi];
         if (kind == 1 && cfg->prof_v4.enabled) {
             snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "direct-v4");
@@ -4531,6 +4656,13 @@ CFNAT_NODISCARD static int parse_listen_modes(const Config *cfg, CarrierListenSp
             snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->prof_baidu.listen_addr);
             specs[len].use_baidu_proxy = 1;
             specs[len].prof = cfg->prof_baidu;
+            len++;
+        } else if (kind == 4 && cfg->prof_cfd.enabled) {
+            snprintf(specs[len].mode, sizeof(specs[len].mode), "%s", "cfd");
+            snprintf(specs[len].addr, sizeof(specs[len].addr), "%s", cfg->prof_cfd.listen_addr);
+            specs[len].use_baidu_proxy = 0;
+            specs[len].is_cfd = 1;
+            specs[len].prof = cfg->prof_cfd;
             len++;
         }
     }
@@ -5231,7 +5363,20 @@ static void *scan_worker(void *arg) {
             int cur_latency = 0;
             char cur_colo[MAX_COLO_LEN] = {0};
 
-            if (is_tls) {
+            if (ctx->cfg->cfd_mode) {
+                /* ── Argo/cfd 模式：仅对目标端口(:7844)做纯 TCPing 探测与延迟采样 ── */
+                int t_lat = 0;
+                socket_t tfd = dial_target_with_proxy_sa(ip, &target_sa, target_salen, target_port,
+                                                         ctx->cfg->delay_ms, ctx->proxy_pool, &t_lat);
+                if (cfnat_socket_invalid(tfd)) {
+                    atomic_fetch_add(&ctx->connect_fail, 1);
+                    if (attempt == 0) break;
+                    continue;
+                }
+                close(tfd);
+                cur_latency = t_lat > 0 ? t_lat : 1;
+                snprintf(cur_colo, sizeof(cur_colo), "ARGO");
+            } else if (is_tls) {
                 /* ── 主路径：目标端口 TLS 握手，既是存活门槛也是延迟样本 ── */
                 int tls_conn_lat = 0;
                 socket_t tls_fd = dial_target_with_proxy_sa(ip, &target_sa, target_salen, target_port,
@@ -5605,6 +5750,7 @@ CFNAT_NODISCARD static inline int udp_probe_timeout_ms(int cfg_delay_ms) {
 #define CACHE_QUICK_CHECK_COUNT 5
 
 static const char *candidate_cache_file_for_profile(const char *mode, int ips_type) {
+    if (mode && strcmp(mode, "cfd") == 0) return "cfd-cache.txt";
     if (mode && strcmp(mode, "baidu") == 0) {
         return ips_type == 6 ? "baidu-cache-v6.txt" : "baidu-cache-v4.txt";
     }
@@ -5615,6 +5761,7 @@ static const char *candidate_cache_file_for_profile(const char *mode, int ips_ty
 }
 
 static const char *candidate_cache_file_for_profile_udp(const char *mode, int ips_type) {
+    if (mode && strcmp(mode, "cfd") == 0) return "cfd-cache-udp.txt";
     if (mode && strcmp(mode, "baidu") == 0) {
         return ips_type == 6 ? "baidu-cache-v6-udp.txt" : "baidu-cache-v4-udp.txt";
     }
@@ -5623,6 +5770,71 @@ static const char *candidate_cache_file_for_profile_udp(const char *mode, int ip
     }
     return ips_type == 6 ? "direct-cache-v6-udp.txt" : "direct-cache-v4-udp.txt";
 }
+
+#if CFNAT_ENABLE_CFD
+static StringList load_cfd_ip_list(int ips_filter, const char *custom_file) {
+    StringList list = {0};
+    if (custom_file && *custom_file) {
+        FILE *fp = fopen(custom_file, "rb");
+        if (fp) {
+            char line[512];
+            while (fgets(line, sizeof(line), fp)) {
+                char *hash = strchr(line, '#');
+                if (hash) *hash = '\0';
+                trim_line(line);
+                if (!line[0]) continue;
+                char host[MAX_IP_LEN] = {0};
+                if (line[0] == '[') {
+                    char *rb = strchr(line, ']');
+                    if (rb) {
+                        size_t n = (size_t)(rb - (line + 1));
+                        if (n > 0 && n < sizeof(host)) {
+                            memcpy(host, line + 1, n);
+                            host[n] = '\0';
+                        }
+                    }
+                } else {
+                    char *first_colon = strchr(line, ':');
+                    char *last_colon = strrchr(line, ':');
+                    if (first_colon && first_colon == last_colon) {
+                        size_t n = (size_t)(first_colon - line);
+                        if (n > 0 && n < sizeof(host)) {
+                            memcpy(host, line, n);
+                            host[n] = '\0';
+                        }
+                    } else {
+                        snprintf(host, sizeof(host), "%.*s", (int)(sizeof(host) - 1), line);
+                    }
+                }
+                if (!host[0]) continue;
+                int is_v6 = (strchr(host, ':') != nullptr);
+                if (ips_filter == 4 && is_v6) continue;
+                if (ips_filter == 6 && !is_v6) continue;
+                struct in_addr a4;
+                struct in6_addr a6;
+                if ((is_v6 && inet_pton(AF_INET6, host, &a6) == 1) ||
+                    (!is_v6 && inet_pton(AF_INET, host, &a4) == 1)) {
+                    append_unique_addr(&list, host);
+                }
+            }
+            fclose(fp);
+            if (list.len > 0) return list;
+        }
+        warn_msg("[Argo优选(cfd)] 自定义列表 %s 为空或不可读，回退使用内置官方 Tunnel 节点", custom_file);
+    }
+    if (ips_filter != 6) {
+        for (size_t i = 0; CFD_BUILTIN_V4_IPS[i]; i++) {
+            strlist_add(&list, CFD_BUILTIN_V4_IPS[i]);
+        }
+    }
+    if (ips_filter != 4) {
+        for (size_t i = 0; CFD_BUILTIN_V6_IPS[i]; i++) {
+            strlist_add(&list, CFD_BUILTIN_V6_IPS[i]);
+        }
+    }
+    return list;
+}
+#endif
 
 static const char *candidate_cache_file(const char *mode) {
     return candidate_cache_file_for_profile(mode, g_cfg.ips_type);
@@ -6448,7 +6660,7 @@ static ResultList filter_udp_candidates_from_tcp_core(CarrierRuntime *rt, const 
     free(tried_ips);
 
     /* 对仍标为 UNK 的 H3 胜出节点（例如来自独立 UDP 热库的旧段）补采一次 :80 CF-RAY 机房标签 */
-    if (udp_res.len > 0 && atomic_load(&g_running)) {
+    if (udp_res.len > 0 && !rt->spec.is_cfd && atomic_load(&g_running)) {
         int http_port = (rt->spec.prof.http_port > 0) ? rt->spec.prof.http_port : (g_cfg.http_port > 0 ? g_cfg.http_port : 80);
         const char *dom = (rt->spec.prof.domain[0]) ? rt->spec.prof.domain : g_cfg.domain;
         char phost[256] = {0}, ppath[256] = {0};
@@ -6506,6 +6718,9 @@ static ResultList filter_udp_candidates_from_tcp(CarrierRuntime *rt, const Resul
     if (!rt || target_ipnum == 0) {
         ResultList empty = {0};
         return empty;
+    }
+    if (rt->spec.is_cfd) {
+        return filter_udp_candidates_from_tcp_core(rt, tcp_results, count, target_ipnum);
     }
     int ips_type = rt->spec.prof.ips_type > 0 ? rt->spec.prof.ips_type : g_cfg.ips_type;
     size_t hp_quota = target_ipnum;
@@ -6623,7 +6838,8 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
     const char *udp_path = candidate_cache_file_for_profile_udp(rt->spec.mode, ips_type);
     const char *primary_cache = (!use_h2 && use_h3) ? udp_path : tcp_path;
     int primary_is_udp = (!use_h2 && use_h3);
-    int need_bg_refresh = (hotpool_has_fresh_cloud(ips_type, primary_is_udp) ||
+    int need_bg_refresh = (!rt->spec.is_cfd) &&
+                          (hotpool_has_fresh_cloud(ips_type, primary_is_udp) ||
                            ips_file_newer_than_cache(ips_type, primary_cache));
     if (need_bg_refresh) {
         hotpool_clear_fresh_cloud(ips_type, primary_is_udp);
@@ -6674,11 +6890,14 @@ static int carrier_try_use_candidate_caches(CarrierRuntime *rt) {
         free(cached_udp.items);
 
         /* 纯 H3 优先尝试独立 UDP 热库直接精筛（免跑多余 TCP 扫描） */
-        HotPool *udp_hp = hotpool_get(ips_type, 1);
-        pthread_mutex_lock(&udp_hp->mu);
-        hotpool_load_locked(udp_hp);
-        size_t udp_hp_len = udp_hp->len;
-        pthread_mutex_unlock(&udp_hp->mu);
+        HotPool *udp_hp = rt->spec.is_cfd ? nullptr : hotpool_get(ips_type, 1);
+        size_t udp_hp_len = 0;
+        if (udp_hp) {
+            pthread_mutex_lock(&udp_hp->mu);
+            hotpool_load_locked(udp_hp);
+            udp_hp_len = udp_hp->len;
+            pthread_mutex_unlock(&udp_hp->mu);
+        }
         if (udp_hp_len > 0) {
             StringList u_seeds = build_smart_ip_list(ips_type, 1, 1, rt->spec.prof.v6_split > 0 ? rt->spec.prof.v6_split : g_cfg.v6_split, target_ipnum);
             if (u_seeds.len > 0) {
@@ -7305,6 +7524,7 @@ static void *connection_thread(void *arg) {
     /* P1-2: 仅用 MSG_PEEK 嗅探首字节识别 TLS (0x16) 或 HTTP，绝不从内核缓冲区消费或重组 ClientHello：
      * 1. 缩短等待首字节超时至 15s，杜绝空闲探测连接长时间占满工作线程；
      * 2. Linux 下首包直接走 splice 内核零拷贝，Windows/Android 下直接走大缓冲直通转发并保留分片特征。 */
+    int best = 0;
     ssize_t n = recv_flags_timeout(client, (char *)&first, 1, 15000, MSG_PEEK);
     if (n <= 0) goto out;
     int is_tls = (first == 0x16);
@@ -7312,7 +7532,6 @@ static void *connection_thread(void *arg) {
     conn_msg("[TCP/H2] #%llu [%s] 识别客户端协议: %s，转发到 IP: %s 端口: %d",
              cc->conn_id, carrier_name,
              is_tls ? "TLS" : "非TLS", cc->ip, target_port);
-    int best = 0;
 
     if (cc->use_mixed) {
         for (int i = 0; i < cc->num; i++) {
@@ -7432,7 +7651,7 @@ static void *connection_thread(void *arg) {
                 }
             }
             pthread_mutex_unlock(&cc->runtime->candidates.mu);
-            hotpool_record_failure(cc->runtime->spec.prof.ips_type, 0, cc->ip, 1);
+            if (!cc->runtime->spec.is_cfd) hotpool_record_failure(cc->runtime->spec.prof.ips_type, 0, cc->ip, 1);
         }
     }
 #endif
@@ -7446,13 +7665,14 @@ out:
             if ((close_ms - conn_start_ms) >= 5000 || down_bytes >= 16384ULL) {
                 atomic_store_explicit(&cc->runtime->tcp_short_fail_streak, 0, memory_order_relaxed);
             }
-            if ((close_ms - conn_start_ms) >= 60000 || up_bytes >= 65536ULL || down_bytes >= 131072ULL) {
+            if (!cc->runtime->spec.is_cfd &&
+                ((close_ms - conn_start_ms) >= 60000 || up_bytes >= 65536ULL || down_bytes >= 131072ULL)) {
                 hotpool_record_success(cc->runtime->spec.prof.ips_type, 0, cc->ip, best, 1);
             }
         } else if (upstream_failed) {
             /* 严格排除客户端首字节前挂断或取消预连接的误判，仅在上游拨号失败或上游异常中断时惩罚节点 */
             carrier_note_connection_failed(cc->runtime, cc->ip);
-            hotpool_record_failure(cc->runtime->spec.prof.ips_type, 0, cc->ip, 3);
+            if (!cc->runtime->spec.is_cfd) hotpool_record_failure(cc->runtime->spec.prof.ips_type, 0, cc->ip, 3);
         } else if (is_short_flash) {
             /* 短命闪断风暴检测（<=2.5s 且下行 <4KB，常见于 TLS 握手被拒/RST/403 错页导致客户端疯狂重连） */
             long long win0 = cf_a64_load(&cc->runtime->tcp_short_fail_win_ms);
@@ -7498,6 +7718,10 @@ typedef enum {
 #endif
 
 static int carrier_probe_and_check(CarrierRuntime *rt, socket_t fd, int timeout_ms) {
+    if (rt && rt->spec.is_cfd) {
+        close(fd);
+        return 1;
+    }
     int target_port = (rt && rt->spec.prof.port > 0) ? rt->spec.prof.port : g_cfg.port;
     if (target_port <= 0) target_port = 443;
     int is_cleartext = is_cleartext_port(target_port);
@@ -8089,6 +8313,7 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
     const char *ipfile = cfg_ips_file_for_type(rt->spec.prof.ips_type);
 
     Config scan_cfg = g_cfg;
+    scan_cfg.cfd_mode = rt->spec.is_cfd ? 1 : 0;
     scan_cfg.ips_type = rt->spec.prof.ips_type;
     if (rt->spec.prof.enabled) {
         scan_cfg.ips_type = rt->spec.prof.ips_type;
@@ -8242,17 +8467,25 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
 
         int cur_v6_split = (rt->spec.prof.enabled && rt->spec.prof.v6_split > 0) ? rt->spec.prof.v6_split : g_cfg.v6_split;
         int cur_random = rt->spec.prof.enabled ? rt->spec.prof.random_mode : g_cfg.random_mode;
-        int use_cidr = (rt->spec.prof.ips_type == 4 && !cur_random);
+        int use_cidr = (!rt->spec.is_cfd && rt->spec.prof.ips_type == 4 && !cur_random);
         CidrList fresh_cidrs = {0};
         StringList ips = {0};
         uint64_t cand_count = 0;
-        ensure_ips_and_hotpool(rt->spec.prof.ips_type, rt->spec.prof.enable_h3, 0);
-        if (use_cidr) {
-            fresh_cidrs = load_cidr_list(ipfile, 0, g_cfg.ips_v4_to_cidr);
-            cand_count = fresh_cidrs.len;
-        } else {
-            ips = build_smart_ip_list(rt->spec.prof.ips_type, 0, cur_random, cur_v6_split, target_ipnum);
+#if CFNAT_ENABLE_CFD
+        if (rt->spec.is_cfd) {
+            ips = load_cfd_ip_list(rt->spec.prof.cfd_ips, rt->spec.prof.cfd_file);
             cand_count = ips.len;
+        } else
+#endif
+        {
+            ensure_ips_and_hotpool(rt->spec.prof.ips_type, rt->spec.prof.enable_h3, 0);
+            if (use_cidr) {
+                fresh_cidrs = load_cidr_list(ipfile, 0, g_cfg.ips_v4_to_cidr);
+                cand_count = fresh_cidrs.len;
+            } else {
+                ips = build_smart_ip_list(rt->spec.prof.ips_type, 0, cur_random, cur_v6_split, target_ipnum);
+                cand_count = ips.len;
+            }
         }
         if (cand_count > 0) {
             ResultList fresh_results = {0};
@@ -8352,16 +8585,17 @@ static int carrier_rescan_dual_pools(CarrierRuntime *rt) {
     free(all_candidates.items);
 
     /* 内存结构与旧指针已纯粹就绪并安全释放，最后异步/脱锁落盘候选文件，杜绝磁盘 I/O 阻塞内存清理 */
+    int hp_ips_type = rt->spec.is_cfd ? 0 : rt->spec.prof.ips_type;
     if (new_tcp_items) {
         save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), new_tcp_items, tcp_count);
         for (size_t hi = 0; hi < tcp_count && hi < 5; hi++) {
-            hotpool_record_success(rt->spec.prof.ips_type, 0, new_tcp_items[hi].ip, new_tcp_items[hi].latency_ms, 0);
+            hotpool_record_success(hp_ips_type, 0, new_tcp_items[hi].ip, new_tcp_items[hi].latency_ms, 0);
         }
     }
     if (udp_res.len > 0) {
         save_candidate_cache(candidate_cache_file_for_profile_udp(rt->spec.mode, rt->spec.prof.ips_type), udp_res.items, udp_res.len);
         for (size_t hi = 0; hi < udp_res.len && hi < 5; hi++) {
-            hotpool_record_success(rt->spec.prof.ips_type, 1, udp_res.items[hi].ip, udp_res.items[hi].latency_ms, 0);
+            hotpool_record_success(hp_ips_type, 1, udp_res.items[hi].ip, udp_res.items[hi].latency_ms, 0);
         }
     }
     hotpool_flush_all();
@@ -8541,8 +8775,10 @@ static void carrier_penalize_h2_anomaly(CarrierRuntime *rt, const char *ip, int 
     }
     pthread_mutex_unlock(&rt->candidates.mu);
 
-    hotpool_record_failure(ips_type, 0, ip, 3);
-    hotpool_flush_all();
+    if (!rt->spec.is_cfd) {
+        hotpool_record_failure(ips_type, 0, ip, 3);
+        hotpool_flush_all();
+    }
 
     warn_msg("[TCP/H2] [%s] 检测到全连接%s (IP %s, 6s 汇总上行 %llu B / 下行 %llu B)，已扣热库分并触发顺位切换",
              carrier_display_name(rt->spec.mode),
@@ -8675,7 +8911,7 @@ static void *carrier_health_thread(void *arg) {
                 continue;
             }
             log_msg("[TCP/H2] [%s] 连续两次状态检查失败，顺位切换下一个候选 IP", carrier_display_name(rt->spec.mode));
-            if (ip[0]) {
+            if (ip[0] && !rt->spec.is_cfd) {
                 hotpool_record_failure(ips_type, 0, ip, 2);
                 hotpool_flush_all();
             }
@@ -9520,7 +9756,7 @@ static int prune_udp_sessions(CarrierRuntime *rt, int64_t cur_ms) {
             }
             if (d_down >= H3_RECOVER_DOWN_BYTES) {
                 window_down_ok = 1;
-                hotpool_record_success(rt->spec.prof.ips_type, 1, s->target_ip, 0, 1);
+                if (!rt->spec.is_cfd) hotpool_record_success(rt->spec.prof.ips_type, 1, s->target_ip, 0, 1);
             }
 
             /* 2. 上行型窒息检测：覆盖握手黑洞与上行重传型卡死 */
@@ -9645,7 +9881,7 @@ static int prune_udp_sessions(CarrierRuntime *rt, int64_t cur_ms) {
                 }
             }
             pthread_mutex_unlock(&rt->udp_candidates.mu);
-            hotpool_record_failure(rt->spec.prof.ips_type, 1, s->target_ip, is_blackhole || is_stalled ? 3 : 2);
+            if (!rt->spec.is_cfd) hotpool_record_failure(rt->spec.prof.ips_type, 1, s->target_ip, is_blackhole || is_stalled ? 3 : 2);
         }
 
         if (is_blackhole || is_stalled || cur_ms - s->last_active_ms > UDP_SESSION_TIMEOUT_MS) {
@@ -10247,6 +10483,7 @@ int main(int argc, char **argv) {
     int need_v4 = 0, need_v6 = 0;
     if (carrier_spec_len > 0) {
         for (size_t i = 0; i < carrier_spec_len; i++) {
+            if (carrier_specs[i].is_cfd) continue;
             if (carrier_specs[i].prof.ips_type == 6) need_v6 = 1;
             else need_v4 = 1;
         }
@@ -10259,6 +10496,7 @@ int main(int argc, char **argv) {
     if (carrier_spec_len > 0) {
         need_v4_h3 = 0; need_v6_h3 = 0;
         for (size_t i = 0; i < carrier_spec_len; i++) {
+            if (carrier_specs[i].is_cfd) continue;
             if (carrier_specs[i].prof.ips_type == 6 && carrier_specs[i].prof.enable_h3) need_v6_h3 = 1;
             if (carrier_specs[i].prof.ips_type != 6 && carrier_specs[i].prof.enable_h3) need_v4_h3 = 1;
         }
@@ -10404,9 +10642,18 @@ int main(int argc, char **argv) {
 
             const char *cur_ipfile = cfg_ips_file_for_type(rt->spec.prof.ips_type);
             int cur_v6_split = (rt->spec.prof.v6_split > 0) ? rt->spec.prof.v6_split : g_cfg.v6_split;
-            int use_cidr = (rt->spec.prof.ips_type == 4 && !rt->spec.prof.random_mode);
+            int use_cidr = (!rt->spec.is_cfd && rt->spec.prof.ips_type == 4 && !rt->spec.prof.random_mode);
             CidrList profile_cidrs = {0};
             StringList profile_ips = {0};
+#if CFNAT_ENABLE_CFD
+            if (rt->spec.is_cfd) {
+                profile_ips = load_cfd_ip_list(rt->spec.prof.cfd_ips, rt->spec.prof.cfd_file);
+                if (profile_ips.len == 0) {
+                    warn_msg("[%s] 没有可扫描的 Argo IP", carrier_display_name(rt->spec.mode));
+                    continue;
+                }
+            } else
+#endif
             if (use_cidr) {
                 profile_cidrs = load_cidr_list(cur_ipfile, 0, g_cfg.ips_v4_to_cidr);
                 if (profile_cidrs.len == 0) {
@@ -10438,6 +10685,7 @@ int main(int argc, char **argv) {
             }
 
             Config scan_cfg = g_cfg;
+            scan_cfg.cfd_mode = rt->spec.is_cfd ? 1 : 0;
             scan_cfg.ips_type = rt->spec.prof.ips_type;
             scan_cfg.port = rt->spec.prof.port;
             scan_cfg.http_port = rt->spec.prof.http_port;
@@ -10504,8 +10752,10 @@ int main(int argc, char **argv) {
                 carrier_set_current_candidate(rt, 0);
                 atomic_store(&rt->candidates.cache_valid, 1);
                 save_candidate_cache(candidate_cache_file_for_profile(rt->spec.mode, rt->spec.prof.ips_type), rt->candidates.items, rt->candidates.len);
-                for (size_t hi = 0; hi < rt->candidates.len && hi < 5; hi++) {
-                    hotpool_record_success(rt->spec.prof.ips_type, 0, rt->candidates.items[hi].ip, rt->candidates.items[hi].latency_ms, 0);
+                if (!rt->spec.is_cfd) {
+                    for (size_t hi = 0; hi < rt->candidates.len && hi < 5; hi++) {
+                        hotpool_record_success(rt->spec.prof.ips_type, 0, rt->candidates.items[hi].ip, rt->candidates.items[hi].latency_ms, 0);
+                    }
                 }
             }
 
@@ -10518,8 +10768,10 @@ int main(int argc, char **argv) {
                     carrier_set_current_udp_candidate(rt, 0);
                     atomic_store(&rt->udp_candidates.cache_valid, 1);
                     save_candidate_cache(candidate_cache_file_for_profile_udp(rt->spec.mode, rt->spec.prof.ips_type), udp_res.items, udp_res.len);
-                    for (size_t hi = 0; hi < udp_res.len && hi < 5; hi++) {
-                        hotpool_record_success(rt->spec.prof.ips_type, 1, udp_res.items[hi].ip, udp_res.items[hi].latency_ms, 0);
+                    if (!rt->spec.is_cfd) {
+                        for (size_t hi = 0; hi < udp_res.len && hi < 5; hi++) {
+                            hotpool_record_success(rt->spec.prof.ips_type, 1, udp_res.items[hi].ip, udp_res.items[hi].latency_ms, 0);
+                        }
                     }
                 } else {
                     warn_msg("[%s] 经过多轮滑动检验，未捕获到有效 UDP/QUIC 节点（当地网络可能阻断境外 UDP 443），绝不使用假节点降级，等待自愈重扫",
