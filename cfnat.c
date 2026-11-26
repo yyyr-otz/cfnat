@@ -846,6 +846,10 @@ typedef struct UdpSession UdpSession;
 struct CarrierRuntime {
     socket_t listen_fd;
     socket_t udp_listen_fd;
+    socket_t extra_listen_fds[3];
+    socket_t extra_udp_listen_fds[3];
+    int extra_listen_count;
+    int extra_udp_listen_count;
     CarrierListenSpec spec;
     CandidatePool candidates;      /* TCP 候选池 (供 H2 / TCP 转发使用) */
     CandidatePool udp_candidates;  /* UDP 候选池 (供 H3 / QUIC 转发使用) */
@@ -9193,25 +9197,69 @@ static void *carrier_udp_health_thread(void *arg) {
 static void *carrier_accept_thread(void *arg) {
     CarrierRuntime *rt = (CarrierRuntime *)arg;
     while (atomic_load(&g_running)) {
+        socket_t cfd = INVALID_SOCKET;
         struct sockaddr_storage ss;
 #ifdef _WIN32
         int slen = (int)sizeof(ss);
 #else
         socklen_t slen = sizeof(ss);
 #endif
-        socket_t cfd = accept_interruptible(rt->listen_fd, (struct sockaddr *)&ss, &slen);
-        if (cfnat_socket_invalid(cfd)) {
-            if (!atomic_load(&g_running)) break;
+        if (rt->extra_listen_count > 0) {
 #ifdef _WIN32
-            {
-                int e = WSAGetLastError();
-                if (e == WSAEINTR || e == WSAENOTSOCK) break;
-            }
+            WSAPOLLFD apfds[4];
 #else
-            if (errno == EINTR || errno == EBADF) break;
+            struct pollfd apfds[4];
 #endif
-            if (sleep_interruptible_ms(1000) != 0) break;
-            continue;
+            int anfds = 0;
+            if (cfnat_socket_valid(rt->listen_fd)) {
+                apfds[anfds].fd = rt->listen_fd;
+                apfds[anfds].events = POLLIN;
+                apfds[anfds].revents = 0;
+                anfds++;
+            }
+            for (int ei = 0; ei < rt->extra_listen_count && anfds < 4; ei++) {
+                if (cfnat_socket_valid(rt->extra_listen_fds[ei])) {
+                    apfds[anfds].fd = rt->extra_listen_fds[ei];
+                    apfds[anfds].events = POLLIN;
+                    apfds[anfds].revents = 0;
+                    anfds++;
+                }
+            }
+            if (anfds == 0) break;
+#ifdef _WIN32
+            int arc = WSAPoll(apfds, (ULONG)anfds, 500);
+#else
+            int arc = poll(apfds, (nfds_t)anfds, 500);
+#endif
+            if (arc < 0) {
+                if (!atomic_load(&g_running)) break;
+                if (sleep_interruptible_ms(100) != 0) break;
+                continue;
+            }
+            if (arc == 0) continue;
+            for (int ai = 0; ai < anfds; ai++) {
+                if (apfds[ai].revents & POLLIN) {
+                    slen = sizeof(ss);
+                    cfd = accept(apfds[ai].fd, (struct sockaddr *)&ss, &slen);
+                    if (cfnat_socket_valid(cfd)) break;
+                }
+            }
+            if (cfnat_socket_invalid(cfd)) continue;
+        } else {
+            cfd = accept_interruptible(rt->listen_fd, (struct sockaddr *)&ss, &slen);
+            if (cfnat_socket_invalid(cfd)) {
+                if (!atomic_load(&g_running)) break;
+#ifdef _WIN32
+                {
+                    int e = WSAGetLastError();
+                    if (e == WSAEINTR || e == WSAENOTSOCK) break;
+                }
+#else
+                if (errno == EINTR || errno == EBADF) break;
+#endif
+                if (sleep_interruptible_ms(1000) != 0) break;
+                continue;
+            }
         }
         char ip[MAX_IP_LEN];
         struct sockaddr_storage ip_sa = {0};
@@ -9386,6 +9434,7 @@ static socket_t listen_tcp(const char *addr) {
 #define UDP_BUF_SIZE 65536
 
 struct UdpSession {
+    socket_t local_fd;
     struct sockaddr_storage client_addr;
     socklen_t client_addr_len;
     char client_addr_str[64];
@@ -9653,6 +9702,7 @@ static UdpSession *find_or_create_udp_session_sa(CarrierRuntime *rt, const struc
     // 创建新会话
     UdpSession *new_sess = (UdpSession *)calloc(1, sizeof(UdpSession));
     if (!new_sess) return nullptr;
+    new_sess->local_fd = INVALID_SOCKET;
     memcpy(&new_sess->client_addr, client_addr, client_len);
     new_sess->client_addr_len = client_len;
     format_endpoint_str(client_addr, new_sess->client_addr_str, sizeof(new_sess->client_addr_str));
@@ -9974,12 +10024,13 @@ static void *carrier_udp_thread(void *arg) {
     static thread_local char buf[UDP_BUF_SIZE];
 #endif
 #ifdef _WIN32
-    WSAPOLLFD pfds[UDP_MAX_SESSIONS + 1];
+    WSAPOLLFD pfds[UDP_MAX_SESSIONS + 4];
 #else
-    struct pollfd pfds[UDP_MAX_SESSIONS + 1];
+    struct pollfd pfds[UDP_MAX_SESSIONS + 4];
 #endif
-    UdpSession *p_sess[UDP_MAX_SESSIONS + 1];
+    UdpSession *p_sess[UDP_MAX_SESSIONS + 4];
     size_t npfd = 1;
+    size_t udp_listen_n = 1;
     rt->udp_dirty = 1;
     int64_t last_prune_ms = now_ms();
     char cur_target_ip[MAX_IP_LEN] = {0};
@@ -9996,9 +10047,19 @@ static void *carrier_udp_thread(void *arg) {
             pfds[0].revents = 0;
             p_sess[0] = nullptr;
             npfd = 1;
+            for (int ei = 0; ei < rt->extra_udp_listen_count && ei < 3; ei++) {
+                if (cfnat_socket_valid(rt->extra_udp_listen_fds[ei])) {
+                    pfds[npfd].fd = rt->extra_udp_listen_fds[ei];
+                    pfds[npfd].events = POLLIN;
+                    pfds[npfd].revents = 0;
+                    p_sess[npfd] = nullptr;
+                    npfd++;
+                }
+            }
+            udp_listen_n = npfd;
 
             UdpSession *s = rt->udp_sessions;
-            while (s && npfd <= UDP_MAX_SESSIONS) {
+            while (s && npfd < UDP_MAX_SESSIONS + 4) {
                 if (cfnat_socket_valid(s->upstream_fd)) {
                     pfds[npfd].fd = s->upstream_fd;
                     pfds[npfd].events = POLLIN;
@@ -10037,7 +10098,7 @@ static void *carrier_udp_thread(void *arg) {
         int should_switch_udp = 0;
 
         /* 1. 优先检查各 upstream_fd 是否有来自 Cloudflare 的 UDP 回包或网络错误事件 */
-        for (size_t i = 1; i < npfd; i++) {
+        for (size_t i = udp_listen_n; i < npfd; i++) {
             if (pfds[i].revents & (POLLIN | POLLERR | POLLHUP)) {
                 UdpSession *sess = p_sess[i];
                 if (sess && cfnat_socket_valid(sess->upstream_fd) && sess->upstream_fd == pfds[i].fd) {
@@ -10081,7 +10142,8 @@ static void *carrier_udp_thread(void *arg) {
                             out_cnt++;
                         }
                         if (out_cnt > 0) {
-                            int sent_n = sendmmsg(rt->udp_listen_fd, d_msgs, (unsigned int)out_cnt, 0);
+                            socket_t reply_fd = cfnat_socket_valid(sess->local_fd) ? sess->local_fd : rt->udp_listen_fd;
+                            int sent_n = sendmmsg(reply_fd, d_msgs, (unsigned int)out_cnt, 0);
                             if (sent_n > 0) {
                                 for (int s = 0; s < sent_n; s++) {
                                     sess->bytes_down += (uint64_t)d_msgs[s].msg_len;
@@ -10092,7 +10154,7 @@ static void *carrier_udp_thread(void *arg) {
                             if (sent_n < out_cnt) {
                                 int start_idx = (sent_n > 0) ? sent_n : 0;
                                 for (int s = start_idx; s < out_cnt; s++) {
-                                    ssize_t sent = sendto(rt->udp_listen_fd, d_iovs[s].iov_base, d_iovs[s].iov_len, 0,
+                                    ssize_t sent = sendto(reply_fd, d_iovs[s].iov_base, d_iovs[s].iov_len, 0,
                                                           (struct sockaddr *)&sess->client_addr, sess->client_addr_len);
                                     if (sent > 0) {
                                         sess->bytes_down += (uint64_t)sent;
@@ -10117,7 +10179,8 @@ static void *carrier_udp_thread(void *arg) {
                             atomic_store_explicit(&rt->udp_candidates.fast_fail_count, 0, memory_order_relaxed);
                         }
                         sess->last_active_ms = cur_ms;
-                        ssize_t sent = sendto(rt->udp_listen_fd, buf, (size_t)n, 0, (struct sockaddr *)&sess->client_addr, sess->client_addr_len);
+                        socket_t reply_fd2 = cfnat_socket_valid(sess->local_fd) ? sess->local_fd : rt->udp_listen_fd;
+                        ssize_t sent = sendto(reply_fd2, buf, (size_t)n, 0, (struct sockaddr *)&sess->client_addr, sess->client_addr_len);
                         if (sent > 0) {
                             sess->bytes_down += (uint64_t)sent;
                             sess->last_down_ms = cur_ms;
@@ -10137,8 +10200,10 @@ static void *carrier_udp_thread(void *arg) {
             carrier_trigger_maintenance(rt, MAINT_SWITCH_UDP);
         }
 
-        /* 2. 监听端口接收客户端 (如 Xray) 发来的 UDP / QUIC 报文 */
-        if (pfds[0].revents & POLLIN) {
+        /* 2. 监听端口接收客户端发来的 UDP / QUIC 报文 */
+        for (size_t li = 0; li < udp_listen_n; li++) {
+            if (!(pfds[li].revents & POLLIN)) continue;
+            socket_t in_lfd = pfds[li].fd;
             cf_a64_store(&rt->last_udp_active_ms, cur_ms);
             unsigned long long cur_epoch = cf_a64_load_acq(&rt->udp_candidates.epoch);
             if (cur_epoch != cached_udp_epoch || !cur_target_ip[0]) {
@@ -10154,7 +10219,7 @@ static void *carrier_udp_thread(void *arg) {
                     msgs[b].msg_hdr.msg_name = &client_addrs[b];
                     msgs[b].msg_hdr.msg_namelen = sizeof(struct sockaddr_storage);
                 }
-                int nmsg = recvmmsg(rt->udp_listen_fd, msgs, UDP_BATCH_SZ, MSG_DONTWAIT, nullptr);
+                int nmsg = recvmmsg(in_lfd, msgs, UDP_BATCH_SZ, MSG_DONTWAIT, nullptr);
                 for (int b = 0; b < UDP_BATCH_SZ; b++) {
                     client_lens[b] = (b < nmsg) ? (socklen_t)msgs[b].msg_hdr.msg_namelen : 0;
                     msgs[b].msg_hdr.msg_name = nullptr;
@@ -10178,6 +10243,7 @@ static void *carrier_udp_thread(void *arg) {
                         }
                     }
                     if (sess && cfnat_socket_valid(sess->upstream_fd)) {
+                        sess->local_fd = in_lfd;
                         sess->last_active_ms = cur_ms;
                         /* B4: 严格排除内核截断报文，连续收集同一客户端/XMUX 会话数据报 */
                         int run_end = m + 1;
@@ -10229,7 +10295,7 @@ static void *carrier_udp_thread(void *arg) {
             while (1) {
                 struct sockaddr_storage client_ss;
                 socklen_t client_len = sizeof(client_ss);
-                ssize_t n = recvfrom(rt->udp_listen_fd, buf, UDP_BUF_SIZE, 0, (struct sockaddr *)&client_ss, &client_len);
+                ssize_t n = recvfrom(in_lfd, buf, UDP_BUF_SIZE, 0, (struct sockaddr *)&client_ss, &client_len);
                 if (n <= 0) break;
 
                 UdpSession *sess = rt->last_udp_sess;
@@ -10241,6 +10307,7 @@ static void *carrier_udp_thread(void *arg) {
                     }
                 }
                 if (sess && cfnat_socket_valid(sess->upstream_fd)) {
+                    sess->local_fd = in_lfd;
                     sess->last_active_ms = cur_ms;
                     ssize_t sent = send(sess->upstream_fd, buf, (size_t)n, 0);
                     if (sent > 0) sess->bytes_up += (uint64_t)sent;
@@ -10448,6 +10515,56 @@ static void log_runtime_stats(void) {
     log_msg("%s", buf);
 }
 
+#if CFNAT_ENABLE_CFD
+static void carrier_try_bind_cfd_multi(CarrierRuntime *rt, int use_h2, int use_h3) {
+    if (!rt || !rt->spec.is_cfd) return;
+    char host[MAX_ADDR_LEN] = {0};
+    int port = 0;
+    if (parse_addr(rt->spec.addr, host, sizeof(host), &port) != 0 || port <= 0) return;
+    if (strcmp(host, "127.0.0.1") != 0) return;
+
+    int bound_ok = 1;
+    int bound_ips = 1;
+    for (int k = 2; k <= 4; k++) {
+        char eaddr[64];
+        snprintf(eaddr, sizeof(eaddr), "127.0.0.%d:%d", k, port);
+        socket_t tfd = INVALID_SOCKET;
+        socket_t ufd = INVALID_SOCKET;
+        if (use_h2) {
+            tfd = listen_tcp(eaddr);
+            if (cfnat_socket_invalid(tfd)) { bound_ok = 0; }
+        }
+        if (bound_ok && use_h3) {
+            ufd = listen_udp(eaddr);
+            if (cfnat_socket_invalid(ufd)) { bound_ok = 0; }
+        }
+        if (!bound_ok) {
+            if (cfnat_socket_valid(tfd)) close(tfd);
+            if (cfnat_socket_valid(ufd)) close(ufd);
+#ifdef __APPLE__
+            warn_msg("[%s] macOS 未配置 %s 回环别名，已自动回退至 %d 个已绑定回环地址继续运行 (如需 4 路 HA 可执行: sudo ifconfig lo0 alias 127.0.0.2 up 等)",
+                     carrier_display_name(rt->spec.mode), eaddr, bound_ips);
+#else
+            warn_msg("[%s] 无法绑定 %s，已自动回退至 %d 个已绑定回环地址继续运行",
+                     carrier_display_name(rt->spec.mode), eaddr, bound_ips);
+#endif
+            break;
+        }
+        if (use_h2 && rt->extra_listen_count < 3) {
+            rt->extra_listen_fds[rt->extra_listen_count++] = tfd;
+        }
+        if (use_h3 && rt->extra_udp_listen_count < 3) {
+            rt->extra_udp_listen_fds[rt->extra_udp_listen_count++] = ufd;
+        }
+        bound_ips++;
+    }
+    if (bound_ips == 4) {
+        log_msg("[%s] 已开启 4 路回环多址监听: 127.0.0.1~4:%d (支持 cloudflared 4 路 HA)",
+                carrier_display_name(rt->spec.mode), port);
+    }
+}
+#endif
+
 int main(int argc, char **argv) {
 #ifdef _WIN32
     init_windows_console_utf8();
@@ -10534,6 +10651,12 @@ int main(int argc, char **argv) {
             CarrierRuntime *rt = &g_carrier_runtimes[i];
             rt->listen_fd = INVALID_SOCKET;
             rt->udp_listen_fd = INVALID_SOCKET;
+            for (int ei = 0; ei < 3; ei++) {
+                rt->extra_listen_fds[ei] = INVALID_SOCKET;
+                rt->extra_udp_listen_fds[ei] = INVALID_SOCKET;
+            }
+            rt->extra_listen_count = 0;
+            rt->extra_udp_listen_count = 0;
             rt->udp_sessions = nullptr;
             pthread_mutex_init(&rt->udp_mu, nullptr);
             rt->spec = carrier_specs[i];
@@ -10632,6 +10755,9 @@ int main(int argc, char **argv) {
                     rt->udp_candidates.len = 0;
                     continue;
                 }
+#if CFNAT_ENABLE_CFD
+                carrier_try_bind_cfd_multi(rt, use_h2, use_h3);
+#endif
                 log_msg("[%s] 正在监听 %s (%s)，TLS目标端口：%d，非TLS目标端口：%d",
                         carrier_display_name(rt->spec.mode), rt->spec.addr, proto_desc,
                         rt->spec.prof.port, rt->spec.prof.http_port);
@@ -10875,6 +11001,9 @@ int main(int argc, char **argv) {
                         rt->candidates.current_ip, tcp_lat, rt->candidates.len);
             }
 
+#if CFNAT_ENABLE_CFD
+            carrier_try_bind_cfd_multi(rt, use_h2, use_h3);
+#endif
             if (carrier_start_threads(rt) == 0) {
                 started_count++;
             } else {
@@ -10944,6 +11073,16 @@ int main(int argc, char **argv) {
             if (cfnat_socket_valid(rt->udp_listen_fd)) {
                 close(rt->udp_listen_fd);
                 rt->udp_listen_fd = INVALID_SOCKET;
+            }
+            for (int ei = 0; ei < 3; ei++) {
+                if (cfnat_socket_valid(rt->extra_listen_fds[ei])) {
+                    close(rt->extra_listen_fds[ei]);
+                    rt->extra_listen_fds[ei] = INVALID_SOCKET;
+                }
+                if (cfnat_socket_valid(rt->extra_udp_listen_fds[ei])) {
+                    close(rt->extra_udp_listen_fds[ei]);
+                    rt->extra_udp_listen_fds[ei] = INVALID_SOCKET;
+                }
             }
         }
         /* 4. 等待所有正在收尾的 TCP 活跃连接线程安全退出，覆盖最大超时时间 (5000ms)，杜绝 UAF */
