@@ -40,16 +40,9 @@ env:
   UPX_VERSION: 5.3.0
 
 jobs:
-  build-macos:
-    name: "Build macOS Pool (Darwin & Android)"
-    if: >-
-      github.event_name != 'workflow_dispatch' ||
-      inputs.targets == '' ||
-      contains(inputs.targets, 'all') ||
-      contains(inputs.targets, 'macos') ||
-      contains(inputs.targets, 'darwin') ||
-      contains(inputs.targets, 'android')
-    runs-on: macos-latest
+  build-all:
+    name: "Build All Platforms (Ubuntu Pool)"
+    runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
@@ -100,171 +93,6 @@ jobs:
             cp -a "${ANDROID_NDK_ROOT}/toolchains/llvm/prebuilt" /tmp/android-ndk-r27c/toolchains/llvm/
             echo "ANDROID_NDK_ROOT=/tmp/android-ndk-r27c" >> "$GITHUB_ENV"
           fi
-
-      - name: Build selected Darwin & Android binaries concurrently
-        shell: bash
-        env:
-          TARGETS_RAW: ${{ github.event_name == 'workflow_dispatch' && inputs.targets || 'all' }}
-          EDITION: ${{ github.event_name == 'workflow_dispatch' && inputs.edition || 'cfd' }}
-        run: |
-          set -euo pipefail
-          mkdir -p release /tmp/build-logs
-
-          TARGETS=" $(echo "${TARGETS_RAW:-all}" | tr '[:upper:],' '[:lower:] ') "
-          echo "Selected targets filter:${TARGETS}"
-
-          want() {
-            local key
-            for key in "$@"; do
-              if [[ "$TARGETS" == *" ${key} "* ]]; then
-                return 0
-              fi
-            done
-            return 1
-          }
-
-          COMMON_SIZE_FLAGS=(
-            -Os -flto -pipe -std=c23
-            -ffunction-sections -fdata-sections
-            -fno-unwind-tables -fno-asynchronous-unwind-tables
-            -Wall -Wextra -Wno-unused-parameter
-          )
-          if [ "${EDITION:-cfd}" = "pure" ]; then
-            echo "Building pure cfnat edition (-DCFNAT_ENABLE_CFD=0)"
-            COMMON_SIZE_FLAGS+=(-DCFNAT_ENABLE_CFD=0)
-          else
-            echo "Building cfd full edition (CFNAT_ENABLE_CFD=1)"
-          fi
-
-          names=()
-          pids=()
-
-          launch() {
-            local name="$1"
-            shift
-            names+=("$name")
-            (
-              set -euo pipefail
-              "$@"
-            ) >"/tmp/build-logs/${name}.log" 2>&1 &
-            pids+=("$!")
-          }
-
-          build_darwin() {
-            local arch="$1" out="$2"
-            clang -arch "$arch" "${COMMON_SIZE_FLAGS[@]}" \
-              "$SOURCE_FILE" -o "release/${out}" \
-              -Wl,-dead_strip -pthread
-            strip "release/${out}"
-          }
-
-          build_android() {
-            local target="$1" api="$2" out="$3"
-            local ndk_bin
-            ndk_bin="$(echo "${ANDROID_NDK_ROOT}"/toolchains/llvm/prebuilt/*/bin)"
-            "${ndk_bin}/${target}${api}-clang" \
-              "${COMMON_SIZE_FLAGS[@]}" \
-              -D__ANDROID__ \
-              "$SOURCE_FILE" -o "release/${out}" \
-              -Wl,--gc-sections -pthread -s
-            "${ndk_bin}/llvm-strip" --strip-all "release/${out}"
-          }
-
-          want all macos darwin darwin-amd64 && launch darwin-amd64 build_darwin  x86_64                cfnat-darwin-amd64
-          want all macos darwin darwin-arm64 && launch darwin-arm64 build_darwin  arm64                 cfnat-darwin-arm64
-          want all android android-arm64     && launch android-arm64 build_android aarch64-linux-android 24 cfnat-android-arm64
-          want all android android-amd64     && launch android-amd64 build_android x86_64-linux-android  24 cfnat-android-amd64
-
-          if [ "${#pids[@]}" -eq 0 ]; then
-            echo "ℹ️ No macOS pool targets matched; skipping build."
-            exit 0
-          fi
-
-          failed=0
-          for i in "${!pids[@]}"; do
-            name="${names[$i]}"
-            if wait "${pids[$i]}"; then
-              echo "✅ [${name}] build succeeded"
-            else
-              echo "❌ [${name}] build failed"
-              cat "/tmp/build-logs/${name}.log"
-              failed=1
-            fi
-          done
-          [ "$failed" -eq 0 ]
-          ls -lh release/
-
-      - name: Create Release (if needed) & Upload macOS Pool binaries
-        if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish_release)
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          INPUT_TAG: ${{ inputs.tag_name }}
-          PRERELEASE: ${{ inputs.prerelease || false }}
-          EDITION: ${{ github.event_name == 'workflow_dispatch' && inputs.edition || 'cfd' }}
-        run: |
-          set -euo pipefail
-          shopt -s nullglob
-          files=(release/cfnat-*)
-          if [ "${#files[@]}" -eq 0 ]; then
-            echo "ℹ️ No binaries to upload."
-            exit 0
-          fi
-
-          if [[ "${GITHUB_REF}" == refs/tags/* ]]; then
-            tag="${GITHUB_REF#refs/tags/}"
-          elif [ -n "$INPUT_TAG" ]; then
-            tag="$INPUT_TAG"
-          else
-            if [ "${EDITION:-cfd}" = "pure" ]; then
-              ver=$(grep -E '^#define[[:space:]]+CFNAT_VERSION[[:space:]]+"' "$SOURCE_FILE" | tail -n1 | sed -E 's/.*"([^"]+)".*/\1/')
-            else
-              ver=$(grep -E '^#define[[:space:]]+CFNAT_VERSION[[:space:]]+"' "$SOURCE_FILE" | head -n1 | sed -E 's/.*"([^"]+)".*/\1/')
-            fi
-            tag="${ver:+v${ver}}"
-            tag="${tag:-continuous}"
-          fi
-
-          echo "Publishing to release tag: $tag"
-          if ! gh release view "$tag" >/dev/null 2>&1; then
-            extra_args=()
-            if [ "$PRERELEASE" = "true" ]; then
-              extra_args+=(--prerelease)
-            else
-              extra_args+=(--latest)
-            fi
-            gh release create "$tag" --title "Release $tag" --generate-notes "${extra_args[@]}" \
-              || gh release view "$tag" >/dev/null 2>&1
-          fi
-          gh release upload "$tag" "${files[@]}" --clobber
-
-      - name: Upload test artifacts (when publish_release is false)
-        if: github.event_name == 'workflow_dispatch' && !inputs.publish_release
-        uses: actions/upload-artifact@v4
-        with:
-          name: binaries-macos
-          path: release/cfnat-*
-          if-no-files-found: ignore
-          retention-days: 3
-
-  build-ubuntu:
-    name: "Build Ubuntu Pool (Linux static/musl, Windows & FreeBSD)"
-    if: >-
-      github.event_name != 'workflow_dispatch' ||
-      inputs.targets == '' ||
-      contains(inputs.targets, 'all') ||
-      contains(inputs.targets, 'linux') ||
-      contains(inputs.targets, 'musl') ||
-      contains(inputs.targets, 'windows') ||
-      contains(inputs.targets, 'freebsd')
-    runs-on: ubuntu-latest
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 1
-          token: ${{ github.token }}
 
       - name: Cache Zig & UPX toolchains
         id: cache-zig
@@ -490,6 +318,35 @@ jobs:
               -Wl,--gc-sections -pthread -s
           }
 
+          build_zig_darwin() {
+            local name="$1" target="$2" out="$3"
+            ZIG_LOCAL_CACHE_DIR="/tmp/zig-cache/${name}/local" \
+            ZIG_GLOBAL_CACHE_DIR="/tmp/zig-cache/global" \
+            zig cc -target "$target" "${COMMON_SIZE_FLAGS[@]}" \
+              "$SOURCE_FILE" -o "release/${out}" \
+              -Wl,-dead_strip -Wl,-s -pthread
+          }
+
+          build_android() {
+            local target="$1" api="$2" out="$3"
+            local ndk_bin
+            ndk_bin="$(echo "${ANDROID_NDK_ROOT}"/toolchains/llvm/prebuilt/*/bin)"
+            "${ndk_bin}/${target}${api}-clang" \
+              "${COMMON_SIZE_FLAGS[@]}" \
+              -D__ANDROID__ \
+              "$SOURCE_FILE" -o "release/${out}" \
+              -Wl,--gc-sections -pthread -s
+            "${ndk_bin}/llvm-strip" --strip-all "release/${out}"
+          }
+
+          # macOS / Darwin (2, cross-compiled via Zig)
+          want all macos darwin darwin-amd64 && launch darwin-amd64 build_zig_darwin darwin-amd64 x86_64-macos  cfnat-darwin-amd64
+          want all macos darwin darwin-arm64 && launch darwin-arm64 build_zig_darwin darwin-arm64 aarch64-macos cfnat-darwin-arm64
+
+          # Android (2, NDK r27c)
+          want all android android-arm64     && launch android-arm64 build_android aarch64-linux-android 24 cfnat-android-arm64
+          want all android android-amd64     && launch android-amd64 build_android x86_64-linux-android  24 cfnat-android-amd64
+
           # FreeBSD (2)
           want all freebsd freebsd-amd64 && launch freebsd-amd64 build_zig_freebsd freebsd-amd64 x86_64-freebsd  amd64 cfnat-freebsd-amd64
           want all freebsd freebsd-arm64 && launch freebsd-arm64 build_zig_freebsd freebsd-arm64 aarch64-freebsd arm64 cfnat-freebsd-arm64
@@ -567,7 +424,7 @@ jobs:
 
           ls -lh release/
 
-      - name: Upload Ubuntu Pool binaries to Release
+      - name: Upload All Platform binaries to Release
         if: startsWith(github.ref, 'refs/tags/') || (github.event_name == 'workflow_dispatch' && inputs.publish_release)
         shell: bash
         env:
@@ -615,7 +472,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch' && !inputs.publish_release
         uses: actions/upload-artifact@v4
         with:
-          name: binaries-ubuntu
+          name: binaries-all
           path: release/cfnat-*
           if-no-files-found: ignore
           retention-days: 3
