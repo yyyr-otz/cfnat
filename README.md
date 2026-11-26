@@ -68,7 +68,7 @@
 
 cfnat C 版做四件事：
 1. **智能扫描与抗 QoS 子网裂变优选**：扫描 Cloudflare IP，筛选精准 TCP (H2) 候选池，并按低突发抗 QoS 节拍与同网段裂变引擎多轮测速生成 UDP (H3) 专用候选池。
-2. **三栈灵活次序 + 单/双协议按需监听**：支持 IPv4（`-v4-listen`）、IPv6（`-v6-listen`）与百度前置（`-baidu-listen`）按命令行传参次序依次启动，并可按栈自由指定 **H2+H3 双轨 / 仅 H2 / 仅 H3**。
+2. **四栈灵活次序 + 单/双协议按需监听**：支持 IPv4（`-v4-listen`）、IPv6（`-v6-listen`）、百度前置（`-baidu-listen`）与 **Cloudflare Tunnel / Argo（`-cfd`）** 按命令行传参次序依次启动，均支持 **H2+H3 双轨 / 仅 H2 / 仅 H3** 独立指定。
 3. **精准双轨独立路由转发**：
    - TCP 连接（H2/TLS）转发至当前 **TCP 优选 IP**（通过首字节 `0x16` `MSG_PEEK` 自动分流 443 或 80 端口，80 失败自动回退 443）；
    - UDP 报文（H3/QUIC）转发至当前 **UDP 优选 IP:443**，自动执行黑洞剔除、窒息低速检测与空闲回收。
@@ -90,10 +90,11 @@ cfnat C 版做四件事：
 ### 1. 全面遵循 C23 现代语言标准与零开销契约
 - 核心源码遵循 ISO/IEC 9899:2024 (C23) 标准，使用 `nullptr`、`constexpr`、`thread_local`、标称类型枚举（`enum : uint8_t`）与 `[[nodiscard]]` 属性（内置 C11/C17 回退层），且严格避免 `__DATE__`/`__TIME__` 以满足可复现构建要求。
 
-### 2. 三栈独立判定口径与按传参顺序启动
+### 2. 四栈独立判定口径与按传参顺序启动
 - **直连栈（IPv4 / IPv6）**：统一以目标端口（默认 443）的 TLS 握手作为**唯一存活与延迟门槛**；首轮以短超时「尽力而为」地探测 80 端口 HTTP HEAD 提取 `CF-RAY` 机房标签，采集失败仅记为 `UNK` 而绝不淘汰 IP，避免 IPv6（:80 常被 ISP 过滤）被整批误杀。
 - **百度前置栈**：`HTTP CONNECT` 隧道本身是两跳（耗时约 `90~1200ms`），因此隧道内沿用 `80` 端口 HTTP HEAD（`CONNECT` 独立保底 `1500ms` 预算，单节点失败自动换节点重试一次），全部无果时自动回退 443 TLS 兜底；443 真实可用性由健康检查（`HC_FULL`）复验。
-- **按传参顺序初始化**：`-v4-listen`、`-v6-listen`、`-baidu-listen` 按命令行中出现的先后顺序依次完成扫描与监听；若同时启用 `v4` 与 `baidu` 且百度开启了 H3，只要 `-baidu-listen` 排在 `-v4-listen` 之前，程序会自动将 `v4` 提前到 `baidu` 之前，确保直连 H3 缓存已生成供百度兜底复用。
+- **按传参顺序初始化**：`-v4-listen`、`-v6-listen`、`-baidu-listen`、`-cfd` 按命令行中出现的先后顺序依次完成扫描与监听；若同时启用 `v4` 与 `baidu` 且百度开启了 H3，只要 `-baidu-listen` 排在 `-v4-listen` 之前，程序会自动将 `v4` 提前到 `baidu` 之前，确保直连 H3 缓存已生成供百度兜底复用。
+- **Argo 优选第四栈（`-cfd`）**：内置 Cloudflare Tunnel 官方 **80 个 `:7844` 节点**（40 个 IPv4 + 40 个 IPv6），不依赖 `ips-v*.txt` 与 `:80` HTTP 校验；默认自动尝试绑定 `127.0.0.1`～`127.0.0.4:7844`（macOS 未配回环别名时自动优雅回退），并按 `/24` 与 `/48` 前缀错位分发给不同边缘服务器，配合 `cloudflared` 跑满 4 路 HA；独占 `cfd-cache.txt` / `cfd-cache-udp.txt`，不读写 CDN 热库。
 
 ### 3. 分栈协议开关（`-h2` / `-h3`）与纯 H3 三级缓存快路径
 - 支持全局 `-h2` / `-h3` 及分栈 `-v4-h2` / `-v4-h3` / `-v6-h2` / `-v6-h3` / `-baidu-h2` / `-baidu-h3`（默认均为 `true`）；同一启用实例不能同时关闭 H2 与 H3。
@@ -278,6 +279,7 @@ journalctl --output cat -f -u cfnat
 | `-v4-listen[=addr]` | 开启 IPv4 转发本地监听（不带参数时默认 `0.0.0.0:4443`；若全部未指定，则默认开启此项） | 缺省未显式指定时默认 `0.0.0.0:4443` |
 | `-v6-listen[=addr]` | 开启 IPv6 转发本地监听（不带参数时默认 `[::]:6443`） | 留空不开启 |
 | `-baidu-listen[=addr]` | 开启百度前置优选本地监听（不带参数时默认 `0.0.0.0:5444`） | 留空不开启 |
+| `-cfd[=addr]`<br>（别名 `-argo`、`-cfd-listen`） | 开启 **Argo 优选第四栈** 本地监听（不带参数时默认 `127.0.0.1:7844`）。在 Linux/Windows 上监听 `127.0.0.1` 时自动绑定 `127.0.0.1~4:7844` 实现 4 路 HA 跨网段错位分流；macOS 未配别名时自动回退已绑定地址。 | 留空不开启 |
 | `-direct-listen[=addr]` | 兼容旧版参数：按 `-ips` 指定类型开启直连监听 | 留空不开启 |
 
 > [!TIP]
@@ -293,8 +295,8 @@ journalctl --output cat -f -u cfnat
 
 | 参数（通用 / 分栈专属） | 说明 | 默认值 |
 | :--- | :--- | :--- |
-| `-h2` / `-v4-h2` / `-v6-h2` / `-baidu-h2` | 启用或关闭 **TCP/H2** 监听、转发与测活（`1`/`true` 开启，`0`/`false` 关闭）。关闭时进入纯 H3 模式：不绑定 TCP 监听、不启 TCP 线程，冷启动按 `udpcache → tcpcache → 前置扫描` 三级流转。 | `true` |
-| `-h3` / `-v4-h3` / `-v6-h3` / `-baidu-h3` | 启用或关闭 **UDP/H3** 测优、监听、转发与测活（`1`/`true` 开启，`0`/`false` 关闭）。关闭时进入纯 H2 模式：跳过 QUIC 探测与 `-udp.txt` 缓存，不绑定 UDP 监听。**注：同一启用实例不能同时关闭 H2 与 H3。** | `true` |
+| `-h2` / `-v4-h2` / `-v6-h2` / `-baidu-h2` / `-cfd-h2` | 启用或关闭 **TCP/H2** 监听、转发与测活（`1`/`true` 开启，`0`/`false` 关闭）。关闭时进入纯 H3 模式：不绑定 TCP 监听、不启 TCP 线程，冷启动按 `udpcache → tcpcache → 前置扫描` 三级流转。 | `true` |
+| `-h3` / `-v4-h3` / `-v6-h3` / `-baidu-h3` / `-cfd-h3` | 启用或关闭 **UDP/H3** 测优、监听、转发与测活（`1`/`true` 开启，`0`/`false` 关闭）。关闭时进入纯 H2 模式：跳过 QUIC 探测与 `-udp.txt` 缓存，不绑定 UDP 监听。**注：同一启用实例不能同时关闭 H2 与 H3。** | `true` |
 | `-h3-client` | H3 探测是否启用 **真实 RFC 9001 QUIC v1 Initial (TLS 1.3 ClientHello)** 模拟（`0`/`false` 使用轻量全零 VN 探针；`1`/`true` 或裸传 `-h3-client` 发送含 SNI、`ALPN=h3` 的加密 Initial 包，零外部库依赖）。 | `false` |
 | `-ips` | 全局指定 IP 类型：`4` (IPv4) 或 `6` (IPv6) | `4` |
 | `-colo` / `-v4-colo` / `-v6-colo` | 匹配特定数据中心，支持反选 (前缀 `-` / `^` / `!`)，如 `HKG,SJC` 或 `-HKG,-SJC` | 留空全部匹配 |
@@ -316,7 +318,9 @@ journalctl --output cat -f -u cfnat
 | `-bind-if` | 绑定出站物理网卡 (如 `eth0`、`en0`) | 留空使用默认路由 |
 | `-health-log` | **健康状态行（`-log=debug` 级别明细）输出间隔**秒数，`0` = 关闭。只控制打印频率，**不影响健康检查本身的活跃态/闲置态自适应节奏**。 | `60` |
 | `-log` / `-log-level` | 日志级别：`silent` / `error` / `warn` / `info` / `debug`。<br>**`info`（默认）**：日常转发静默，仅输出启动/自愈树状日志、故障切换与周期运行指标；<br>**`debug`**：输出逐条探测明细、连接日志与完整候选表格（自动隐藏扫描百分比滚动进度日志，避免穿插刷屏）。 | `info` |
-| `-stats-interval`<br>（别名 `-log-interval`） | **三栈双协议运行指标汇报间隔（秒）**，`0` = 关闭。<br>每周期用**一次原子写入**输出树状摘要，汇总全局活跃 TCP 连接与 UDP 会话数，并展示各栈 H2/H3 的当前最优 IP、机房（colo）、延迟、候选池数、活跃 UDP 会话数、累计切换次数（含首包超时实时回退）与本周期 UDP 上行/下行丢包计数（主动关闭的协议明确显示 `已禁用`）。 | `300` |
+| `-cfd-ips` | 指定 `cfd` 优选协议栈：`4`（40 个官方 IPv4）、`6`（40 个官方 IPv6）或 `46`（双栈 80 节点） | `46` |
+| `-cfd-file` | 指定自定义 Argo 节点列表文件（覆盖内置 80 个官方节点，支持 `#` 注释与 `:port` 自动剥离） | 留空使用内置节点 |
+| `-stats-interval`<br>（别名 `-log-interval`） | **四栈双协议运行指标汇报间隔（秒）**，`0` = 关闭。<br>每周期用**一次原子写入**输出树状摘要，汇总全局活跃 TCP 连接与 UDP 会话数，并展示各栈 H2/H3 的当前最优 IP、机房（colo）、延迟、候选池数、活跃 UDP 会话数、累计切换次数（含首包超时实时回退）与本周期 UDP 上行/下行丢包计数（主动关闭的协议明确显示 `已禁用`）。 | `300` |
 
 ## 常用示例
 
@@ -350,6 +354,25 @@ journalctl --output cat -f -u cfnat
 - **服务器地址 (Address)**: `127.0.0.1`
 - **端口 (Port)**: `4443`
 - **协议说明**：客户端连接 `127.0.0.1:4443`。cfnat 自动在底层将 TCP 流量导入 TCP 优选节点，将 UDP/QUIC 流量导入 H3 优选节点。
+
+### 6. 纯 Argo Tunnel (`cfd`) 优选与 `cfnat + cfd` 同进程双开
+```bash
+# 1) 仅开启 Argo 优选（跳过 ips-v4/v6.txt，自动绑定 127.0.0.1~4:7844 错位分流）
+./cfnat -cfd
+
+# 2) 仅开启 Argo QUIC（关闭 TCP/H2）或指定仅 IPv6
+./cfnat -cfd -cfd-h2=0 -cfd-ips=6
+
+# 3) cfnat + cfd 同进程共存（同时服务 Xray 代理出站与 cloudflared 隧道入站）
+./cfnat -v4-listen=0.0.0.0:4443 -v6-listen=[::]:6443 -cfd
+```
+配合 `cloudflared`（Linux/Armbian `/etc/hosts` 示例，注释掉 `::1` 行即可跑满 4 路 HA）：
+```text
+127.0.0.1 region1.v2.argotunnel.com region2.v2.argotunnel.com us-region1.v2.argotunnel.com us-region2.v2.argotunnel.com
+127.0.0.2 region1.v2.argotunnel.com region2.v2.argotunnel.com us-region1.v2.argotunnel.com us-region2.v2.argotunnel.com
+127.0.0.3 region1.v2.argotunnel.com region2.v2.argotunnel.com us-region1.v2.argotunnel.com us-region2.v2.argotunnel.com
+127.0.0.4 region1.v2.argotunnel.com region2.v2.argotunnel.com us-region1.v2.argotunnel.com us-region2.v2.argotunnel.com
+```
 
 ## 构建与 GitHub Actions 发布
 
