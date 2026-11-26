@@ -2084,7 +2084,7 @@ static void log_current_config(const Config *c) {
     }
 #endif
 
-    if (!c->prof_v4.enabled && !c->prof_v6.enabled && !c->prof_baidu.enabled) {
+    if (!c->prof_v4.enabled && !c->prof_v6.enabled && !c->prof_baidu.enabled && !c->prof_cfd.enabled) {
         log_msg("  [CLI 单次测速模式] IP 类型: IPv%d | 端口: %d | 并发线程: %d | 延迟上限: %d ms",
                 c->ips_type, c->port, c->task, c->delay_ms);
         if (c->ips_type == 6) {
@@ -6595,7 +6595,7 @@ static ResultList filter_udp_candidates_from_tcp_core(CarrierRuntime *rt, const 
     }
 
     /* 阶段二：若合格 H3 节点不足 ipnum 个，从原 ipnum 个 IP 的 IPv6 /64 或 IPv4 /24 子网循环裂变补齐 */
-    if (!gentle_mode && stage1_any_resp > 0 && udp_res.len < desired_count && atomic_load(&g_running)) {
+    if (!rt->spec.is_cfd && !gentle_mode && stage1_any_resp > 0 && udp_res.len < desired_count && atomic_load(&g_running)) {
         size_t base_count = (count < desired_count) ? count : desired_count;
         size_t max_derived = base_count * 2;
         QuicProbeItem *derived_items = calloc(max_derived, sizeof(QuicProbeItem));
@@ -8833,6 +8833,10 @@ static void *carrier_health_thread(void *arg) {
             win_down0 = cur_down;
 
             int anomaly = h2_eval_aggregate_window(d_up, d_down, &stall_streak);
+            if (rt->spec.is_cfd && anomaly == 1) {
+                anomaly = 0; /* Argo Tunnel 属于服务端上行推送模型，上行远大于下行属正常业务流量 */
+                stall_streak = 0;
+            }
             if (anomaly > 0) {
                 carrier_penalize_h2_anomaly(rt, ip, anomaly, d_up, d_down);
                 fail = 0;
